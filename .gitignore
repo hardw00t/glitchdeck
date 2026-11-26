@@ -1,0 +1,4 @@
+/glitchdeck
+/dist-bin/
+*.test
+*.out
