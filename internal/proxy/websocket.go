@@ -76,7 +76,13 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 		_, _ = io.Copy(w, resp.Body)
 		return
 	}
-	selected := resp.Header.Get("Sec-WebSocket-Protocol")
+	selections := resp.Header.Values("Sec-WebSocket-Protocol")
+	selected := ""
+	validSelection := len(selections) <= 1
+	if len(selections) == 1 {
+		selected = strings.TrimSpace(selections[0])
+		validSelection = selected != "" && !strings.Contains(selected, ",")
+	}
 	offered := selected == ""
 	for _, offer := range r.Header.Values("Sec-WebSocket-Protocol") {
 		for _, item := range strings.Split(offer, ",") {
@@ -85,7 +91,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 			}
 		}
 	}
-	if !headerToken(resp.Header, "Connection", "upgrade") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") || resp.Header.Get("Sec-WebSocket-Accept") != wsframe.AcceptKey(key) || resp.Header.Get("Sec-WebSocket-Extensions") != "" || !offered {
+	if !headerToken(resp.Header, "Connection", "upgrade") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") || resp.Header.Get("Sec-WebSocket-Accept") != wsframe.AcceptKey(key) || resp.Header.Get("Sec-WebSocket-Extensions") != "" || !validSelection || !offered {
 		err := fmt.Errorf("unsupported upstream websocket handshake")
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		w.Header().Set(TransportErrorHeader, "1")
@@ -117,25 +123,27 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 		return
 	}
 	_ = client.SetWriteDeadline(time.Time{})
+	stop()
 	done := make(chan struct{})
 	var once sync.Once
-	closeBoth := func(abnormal bool) {
+	closeBoth := func(action string) {
 		once.Do(func() {
-			cancel()
-			if abnormal {
+			if action != "" {
+				p.outcome(gen, Outcome{Seq: seq, WSAction: action})
 				rst(client)
 				rst(up)
 			} else {
 				client.Close()
 				up.Close()
 			}
+			cancel()
 			close(done)
 		})
 	}
 	go func() {
 		select {
 		case <-ctx.Done():
-			closeBoth(false)
+			closeBoth("")
 		case <-done:
 		}
 	}()
@@ -145,7 +153,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 		closing.Do(func() {
 			_ = client.SetDeadline(time.Now().Add(time.Second))
 			_ = up.SetDeadline(time.Now().Add(time.Second))
-			timer := time.AfterFunc(time.Second, func() { closeBoth(false) })
+			timer := time.AfterFunc(time.Second, func() { closeBoth("") })
 			context.AfterFunc(ctx, func() { timer.Stop() })
 		})
 	}
@@ -159,16 +167,17 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 		p.pump(ctx, reader, client, false, "s2c", seq, gen, r.URL.Path, closeBoth, beginClose)
 	}()
 	wg.Wait()
-	closeBoth(false)
+	closeBoth("")
 }
-func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bool, dir string, seq, gen uint64, path string, closeBoth func(bool), beginClose func()) {
+func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bool, dir string, seq, gen uint64, path string, closeBoth func(string), beginClose func()) {
 	normalClose := false
 	defer func() {
 		if !normalClose {
-			closeBoth(false)
+			closeBoth("")
 		}
 	}()
 	var frameSeq uint64
+	var messageSeq uint64
 	fragmented := false
 	for {
 		f, err := wsframe.Read(src, masked)
@@ -222,22 +231,30 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			}
 		}
 		p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "frame_seq": frameSeq, "ts_ms": time.Now().UnixMilli(), "dir": dir, "opcode": f.Opcode, "bytes": len(f.Payload), "fault": action, "preview": preview})
-		if action != "" {
-			p.outcome(gen, Outcome{Seq: seq, WSFault: true})
-		}
+		data := f.Opcode == 0 || f.Opcode == 1 || f.Opcode == 2
 		switch action {
 		case "drop":
+			if dir == "s2c" && data {
+				p.outcome(gen, Outcome{Seq: seq, WSAction: action, WSMessage: messageSeq + 1})
+			}
 			continue
 		case "delay":
-			if !wait(ctx, time.Duration(fault.Int(params, "delay_ms", 0))*time.Millisecond) {
+			delay := time.Duration(fault.Int(params, "delay_ms", 0)) * time.Millisecond
+			if dir == "s2c" && data && delay > 0 {
+				p.outcome(gen, Outcome{Seq: seq, WSAction: action, WSMessage: messageSeq + 1, WSUntil: time.Now().Add(delay)})
+			}
+			if !wait(ctx, delay) {
 				return
 			}
 		case "corrupt":
 			if len(f.Payload) > 0 {
 				f.Payload[0] ^= byte((cfg.Seed+frameSeq)%255 + 1)
+				if dir == "s2c" && data {
+					p.outcome(gen, Outcome{Seq: seq, WSAction: action, WSMessage: messageSeq + 1})
+				}
 			}
 		case "close_1006":
-			closeBoth(true)
+			closeBoth(action)
 			return
 		case "truncate":
 			var b bytes.Buffer
@@ -251,15 +268,18 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 				count = len(f.Payload)
 			}
 			_, _ = dst.Write(wire[:header+count])
-			closeBoth(true)
+			closeBoth(action)
 			return
 		}
 		if f.Opcode == 8 {
 			beginClose()
 		}
 		if wsframe.Write(dst, f, masked) != nil {
-			closeBoth(false)
+			closeBoth("")
 			return
+		}
+		if dir == "s2c" && data && f.Fin {
+			messageSeq++
 		}
 		if f.Opcode == 8 {
 			normalClose = true

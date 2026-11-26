@@ -719,20 +719,24 @@ select {
     display: none;
   }
   .preset-bar {
-    overflow-x: auto;
-    scroll-snap-type: x mandatory;
-    -webkit-overflow-scrolling: touch;
-    margin: 0 -12px;
-    padding: 0 12px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: stretch;
   }
   .preset-bar > span {
     display: none;
   }
   .preset-bar button {
-    min-height: 44px;
-    scroll-snap-align: start;
+    padding: 6px 4px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .preset-bar button b {
+    display: block;
+    margin-left: 0;
   }
   .preset-bar #bypass {
+    grid-column: 1 / -1;
     margin-left: 0;
   }
   .tabs {

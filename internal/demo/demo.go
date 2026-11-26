@@ -34,7 +34,7 @@ func New() http.Handler {
 	mux.HandleFunc("/api/reset", s.reset)
 	mux.HandleFunc("/ws/ticker", s.ticker)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && !localweb.Allowed(r, "") {
+		if (r.URL.Path == "/ws/ticker" || (r.Method != http.MethodGet && r.Method != http.MethodHead)) && !localweb.Allowed(r, "") {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

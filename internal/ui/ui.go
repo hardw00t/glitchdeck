@@ -71,6 +71,8 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 		mux.HandleFunc("POST /api/demo/checkout", c.trigger)
 		mux.HandleFunc("GET /api/demo/ticker", func(w http.ResponseWriter, r *http.Request) {
 			req := r.Clone(r.Context())
+			// The control listener has already checked the browser's origin.
+			req.Header.Del("Origin")
 			req.URL.Path, req.URL.RawPath, req.URL.RawQuery = "/ws/ticker", "", ""
 			req.RequestURI = req.URL.Path
 			c.p.ServeHTTP(w, req)

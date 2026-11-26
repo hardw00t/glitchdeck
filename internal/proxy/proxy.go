@@ -25,10 +25,12 @@ const maxBody = 4 << 20
 const TransportErrorHeader = "X-Glitchdeck-Transport-Error"
 
 type Outcome struct {
-	Seq     uint64
-	Reset   bool
-	WSFault bool
-	Err     error
+	Seq       uint64
+	Reset     bool
+	Err       error
+	WSAction  string
+	WSMessage uint64
+	WSUntil   time.Time
 }
 
 type Record struct {
@@ -203,7 +205,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	seq := p.seq.Add(1)
 	cfg := *p.cfg.Load()
-	ws := strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
+	ws := r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
 	if ws {
 		p.activeWS++
 	}
@@ -232,12 +234,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	status, n := 0, int64(0)
 	var body []byte
+	var streamedBytes atomic.Int64
 	var upstreamHeaders http.Header
 	if !ws {
 		defer func() {
 			p.publish(gen, "http_req", map[string]any{
 				"seq": seq, "ts_ms": start.UnixMilli(), "method": r.Method, "path": r.URL.RequestURI(),
-				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n,
+				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": int64(len(body)) + streamedBytes.Load(), "resp_bytes": n,
 				"fault": kind, "replay_index": 0, "request_headers": inspectorHeaders(r.Header),
 				"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": string(body[:min(len(body), 256)]),
 			})
@@ -259,6 +262,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil || len(body) > maxBody {
 			body = nil
 			status = http.StatusRequestEntityTooLarge
+			p.outcome(gen, Outcome{Seq: seq, Err: errors.New("request body too large or unreadable")})
 			http.Error(w, "request body too large or unreadable", status)
 			return
 		}
@@ -283,11 +287,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if kind == "latency-wave" && !wait(ctx, time.Duration(fault.Latency(cfg.Seed, seq, params))*time.Millisecond) {
-		return
+		panic(http.ErrAbortHandler)
 	}
 	q := p.upstream(r, body, ctx)
-	if !buffered {
-		q.Body, q.ContentLength = r.Body, r.ContentLength
+	if !buffered && r.Body != nil && r.Body != http.NoBody {
+		q.Body, q.ContentLength = &countingBody{ReadCloser: r.Body, count: &streamedBytes}, r.ContentLength
 	}
 	resp, err := p.transport.RoundTrip(q)
 	if err != nil {
@@ -300,7 +304,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	resp.Header.Del(TransportErrorHeader)
 	status, upstreamHeaders = resp.StatusCode, resp.Header
-	if kind == "dup-webhook" {
+	if kind == "dup-webhook" && fault.Int(params, "count", 2) > 1 {
 		if buffered || r.Body == nil || r.Body == http.NoBody {
 			p.replays(r, body, seq, gen, params)
 		} else {
@@ -310,7 +314,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if kind == "tcp-rst" {
-		n = resetResponse(w, resp, fault.Int(params, "after_bytes", 0), cancel, func(err error) {
+		n = resetResponse(w, resp, r.Method, fault.Int(params, "after_bytes", 0), cancel, func(err error) {
 			p.outcome(gen, Outcome{Seq: seq, Reset: err == nil, Err: err})
 		})
 		return
@@ -319,6 +323,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stripHop(resp.Header)
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(status)
+	if stream {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
 	if kind == "byte-trickle" {
 		n, err = trickle(ctx, w, resp.Body, params)
 	} else if stream {
@@ -330,6 +339,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		panic(http.ErrAbortHandler)
 	}
+}
+
+type countingBody struct {
+	io.ReadCloser
+	count *atomic.Int64
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.count.Add(int64(n))
+	return n, err
 }
 
 type flushWriter struct{ http.ResponseWriter }
@@ -448,7 +468,7 @@ func resetWriter(w http.ResponseWriter, injected func()) {
 		rst(c)
 	}
 }
-func resetResponse(w http.ResponseWriter, resp *http.Response, n int, cancel context.CancelFunc, result func(error)) int64 {
+func resetResponse(w http.ResponseWriter, resp *http.Response, method string, n int, cancel context.CancelFunc, result func(error)) int64 {
 	h, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking unavailable", 500)
@@ -459,12 +479,17 @@ func resetResponse(w http.ResponseWriter, resp *http.Response, n int, cancel con
 		return 0
 	}
 	defer rst(c)
+	if method == http.MethodHead || resp.StatusCode < 200 || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		// These responses cannot be made incomplete by chunking.
+		result(nil)
+		return 0
+	}
 	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	timer := time.AfterFunc(2*time.Second, cancel)
 	defer timer.Stop()
 	stripHop(resp.Header)
 	var writer io.Writer = b
-	if resp.Body != http.NoBody && (resp.ContentLength < 0 || int64(n) >= resp.ContentLength) {
+	if resp.ContentLength < 0 || int64(n) >= resp.ContentLength {
 		resp.Header.Del("Content-Length")
 		resp.Header.Set("Transfer-Encoding", "chunked")
 		writer = httputil.NewChunkedWriter(b)
@@ -515,14 +540,11 @@ func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, params ma
 				}
 				p.mu.Unlock()
 			}()
-			replayCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-			if !wait(replayCtx, time.Duration(index)*time.Duration(delay)*time.Millisecond) {
-				if ctx.Err() == nil {
-					p.outcome(gen, Outcome{Seq: seq, Err: replayCtx.Err()})
-				}
+			if !wait(ctx, time.Duration(index)*time.Duration(delay)*time.Millisecond) {
 				return
 			}
+			replayCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
 			start := time.Now()
 			resp, err := p.transport.RoundTrip(q.WithContext(replayCtx))
 			status := 0

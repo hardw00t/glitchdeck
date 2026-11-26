@@ -37,7 +37,7 @@ glitchdeck test examples/clean.tape.yaml
 glitchdeck test examples/checkout-dup-webhook.tape.yaml
 ```
 
-The second command prints `duplicate_charges: expected 0, got 1`. A tape contains a seed, ordered rules, HTTP/WS actions and sleeps, and assertions on HTTP status, JSON paths, or latency. Exported demo tapes assert zero duplicate charges and a healthy ticker. The recorder keeps the latest 256 requests within an 8 MiB payload budget; it omits authorization and cookie headers. Review the tape before sharing it: bodies and URLs may contain sensitive data.
+The second command prints `duplicate_charges: expected 0, got 1`. A tape contains a seed, ordered rules, HTTP/WS actions and sleeps, and assertions on HTTP status, JSON paths, or latency. Exported demo tapes assert zero duplicate charges and a healthy ticker. The recorder keeps up to 256 requests in an 8 MiB budget shared with configuration snapshots; it omits authorization and cookie headers. Review the tape before sharing it: bodies and URLs may contain sensitive data.
 
 | Exit | Meaning |
 | --- | --- |
@@ -52,6 +52,12 @@ Use `--timeout`, `--target`, or `--json` to set the run deadline, override the t
 - HTTP request and response trailers are not forwarded.
 - Tape playback runs HTTP steps serially. It preserves sequence numbers and start offsets, but does not reproduce overlap between concurrent HTTP requests.
 - Full WebSocket UTF-8 validation across fragments is not implemented. Recordings that cannot be replayed faithfully, including binary or fragmented WebSocket traffic and connections already open at **REC**, show a warning and exit `2` in CI.
+- The demo proxy's browser guard does not accept non-loopback interface addresses on a wildcard bind; use the default loopback address.
+- Mixing timed WebSocket rule changes with sequence-based HTTP rule changes can replay those configurations out of order.
+- Rule edits after the last captured request may be absent from the export; a recording without traffic retains its starting configuration.
+- A truncated HTTP response rejecting a WebSocket upgrade can appear complete.
+- Tape playback ends a ticker connection at its watchdog deadline rather than waiting for the ticker to recover like the console does.
+- Use integer YAML expectations for large JSON integers; YAML decimals can lose precision before comparison.
 
 ## Console screenshots
 

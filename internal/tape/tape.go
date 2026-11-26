@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"glitchdeck/internal/demo"
@@ -220,19 +222,73 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 	}
 	p := proxy.New(u, fault.Config{Seed: t.Seed, Rules: t.Rules}, telemetry.New())
 	var outcomeMu sync.Mutex
-	outcomes := map[uint64]proxy.Outcome{}
+	type wsEvidence struct {
+		drop    time.Time
+		delay   time.Time
+		delayAt time.Time
+		corrupt time.Time
+	}
+	type outcome struct {
+		proxy.Outcome
+		messages map[uint64]wsEvidence
+		limit    uint64
+	}
+	outcomes := map[uint64]*outcome{}
 	p.OnOutcome = func(o proxy.Outcome) {
 		outcomeMu.Lock()
+		defer outcomeMu.Unlock()
 		prev := outcomes[o.Seq]
+		if prev == nil {
+			prev = &outcome{}
+			outcomes[o.Seq] = prev
+		}
 		prev.Reset = prev.Reset || o.Reset
-		prev.WSFault = prev.WSFault || o.WSFault
 		if o.Err != nil {
 			prev.Err = o.Err
 		}
-		outcomes[o.Seq] = prev
-		outcomeMu.Unlock()
+		switch o.WSAction {
+		case "close_1006", "truncate":
+			prev.WSAction = o.WSAction
+		case "drop", "delay", "corrupt":
+			if o.WSMessage == 0 || o.WSMessage > prev.limit {
+				break
+			}
+			if prev.messages == nil {
+				prev.messages = make(map[uint64]wsEvidence)
+			}
+			ev := prev.messages[o.WSMessage]
+			switch o.WSAction {
+			case "drop":
+				if ev.drop.IsZero() {
+					ev.drop = time.Now()
+				}
+			case "delay":
+				if o.WSUntil.After(ev.delay) {
+					ev.delay, ev.delayAt = o.WSUntil, time.Now()
+				}
+			case "corrupt":
+				if ev.corrupt.IsZero() {
+					ev.corrupt = time.Now()
+				}
+			}
+			prev.messages[o.WSMessage] = ev
+		}
 	}
-	getOutcome := func(seq uint64) proxy.Outcome { outcomeMu.Lock(); defer outcomeMu.Unlock(); return outcomes[seq] }
+	getOutcome := func(seq uint64) outcome {
+		outcomeMu.Lock()
+		defer outcomeMu.Unlock()
+		if o := outcomes[seq]; o != nil {
+			copy := *o
+			if o.messages != nil {
+				copy.messages = make(map[uint64]wsEvidence, len(o.messages))
+				for k, v := range o.messages {
+					copy.messages[k] = v
+				}
+			}
+			return copy
+		}
+		return outcome{}
+	}
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
 	server := httptest.NewServer(p)
@@ -344,11 +400,32 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 				return nil, fmt.Errorf("step %s: %w", s.Name, e)
 			}
 		case s.WS != nil:
-			stream, e := startWS(ctx, server.URL, *s.WS, isDemo)
-			if e != nil {
-				return nil, fmt.Errorf("step %s: %w", s.Name, e)
+			seq := p.Seq() + 1
+			count := s.WS.Frames
+			if count == 0 {
+				count = 3
 			}
-			streams = append(streams, streamResult{seq: p.Seq(), ticker: isDemo && strings.SplitN(s.WS.Path, "?", 2)[0] == "/ws/ticker", ch: stream})
+			outcomeMu.Lock()
+			outcomes[seq] = &outcome{limit: uint64(count)}
+			outcomeMu.Unlock()
+			stream, e := startWS(ctx, server.URL, *s.WS, isDemo, func(message uint64) {
+				outcomeMu.Lock()
+				delete(outcomes[seq].messages, message)
+				outcomeMu.Unlock()
+			})
+			if e != nil {
+				o := getOutcome(seq)
+				if o.Err != nil {
+					return nil, fmt.Errorf("step %s: %w", s.Name, o.Err)
+				}
+				if !abruptWS(o.WSAction, e) {
+					return nil, fmt.Errorf("step %s: %w", s.Name, e)
+				}
+				failed := make(chan error, 1)
+				failed <- e
+				stream = failed
+			}
+			streams = append(streams, streamResult{seq: seq, ticker: isDemo && strings.SplitN(s.WS.Path, "?", 2)[0] == "/ws/ticker", ch: stream})
 		}
 	}
 	for _, stream := range streams {
@@ -358,8 +435,22 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 			if o.Err != nil {
 				return nil, o.Err
 			}
-			if e != nil && !o.WSFault {
-				return nil, fmt.Errorf("websocket sequence %d: %w", stream.seq, e)
+			if e != nil && !abruptWS(o.WSAction, e) {
+				var failure *wsFailure
+				allowed := false
+				if errors.As(e, &failure) {
+					ev := o.messages[failure.message]
+					var ne net.Error
+					if errors.As(failure.err, &ne) && ne.Timeout() {
+						allowed = (!ev.drop.IsZero() && !ev.drop.After(failure.at)) ||
+							(!ev.delayAt.IsZero() && !ev.delayAt.After(failure.at) && failure.at.Before(ev.delay))
+					} else if failure.invalidTicker {
+						allowed = !ev.corrupt.IsZero() && !ev.corrupt.After(failure.at)
+					}
+				}
+				if !allowed {
+					return nil, fmt.Errorf("websocket sequence %d: %w", stream.seq, e)
+				}
 			}
 			if stream.ticker {
 				broken = e != nil
@@ -537,7 +628,25 @@ func jsonEqual(a, b any) bool {
 	}
 	return reflect.DeepEqual(a, b)
 }
-func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan error, error) {
+
+type wsFailure struct {
+	err           error
+	message       uint64
+	at            time.Time
+	invalidTicker bool
+}
+
+func (e *wsFailure) Error() string { return e.err.Error() }
+func (e *wsFailure) Unwrap() error { return e.err }
+
+func abruptWS(action string, err error) bool {
+	if action != "close_1006" && action != "truncate" {
+		return false
+	}
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+func startWS(ctx context.Context, base string, w WS, isDemo bool, progress ...func(uint64)) (<-chan error, error) {
 	u, err := url.Parse(base)
 	if err != nil {
 		return nil, err
@@ -551,10 +660,7 @@ func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan error,
 	fail := func(e error) (<-chan error, error) { stop(); conn.Close(); return nil, e }
 	timeout := time.Duration(w.TimeoutMS) * time.Millisecond
 	if timeout == 0 {
-		timeout = 2500 * time.Millisecond
-	}
-	if isDemo && strings.SplitN(w.Path, "?", 2)[0] == "/ws/ticker" && timeout > 2500*time.Millisecond {
-		timeout = 2500 * time.Millisecond
+		timeout = 3 * time.Second
 	}
 	setDeadline := func() {
 		deadline := time.Now().Add(timeout)
@@ -581,6 +687,10 @@ func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan error,
 	if resp.StatusCode != 101 || resp.Header.Get("Sec-WebSocket-Accept") != wsframe.AcceptKey(key) {
 		return fail(fmt.Errorf("websocket handshake returned %s", resp.Status))
 	}
+	if isDemo && strings.SplitN(w.Path, "?", 2)[0] == "/ws/ticker" && timeout > 2500*time.Millisecond {
+		timeout = 2500 * time.Millisecond
+	}
+	setDeadline()
 	for _, msg := range w.Messages {
 		if err = wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 1, Payload: []byte(msg)}, true); err != nil {
 			return fail(err)
@@ -603,7 +713,7 @@ func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan error,
 		for i := 0; i < count; {
 			frame, e := wsframe.Read(reader, false)
 			if e != nil {
-				failure = e
+				failure = &wsFailure{err: e, message: uint64(i + 1), at: time.Now()}
 				return
 			}
 			if frame.Opcode == 8 {
@@ -633,12 +743,15 @@ func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan error,
 					continue
 				}
 				if isTicker && (opcode != 1 || !json.Valid(message)) {
-					failure = fmt.Errorf("invalid ticker message")
+					failure = &wsFailure{err: fmt.Errorf("invalid ticker message"), message: uint64(i + 1), at: time.Now(), invalidTicker: true}
 					return
 				}
 				message = nil
 				opcode = 0
 				i++
+				if len(progress) != 0 {
+					progress[0](uint64(i))
+				}
 				setDeadline()
 			case 9:
 				if e := wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 10, Payload: frame.Payload}, true); e != nil {

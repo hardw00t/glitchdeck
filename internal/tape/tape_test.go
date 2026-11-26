@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"glitchdeck/internal/fault"
 	"glitchdeck/internal/wsframe"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,7 +41,7 @@ func TestRunnerAssertionDiff(t *testing.T) {
 }
 
 func TestRejectRemoteTarget(t *testing.T) {
-	_, err := Run(context.Background(), Tape{Version: 1, Target: "http://" + "0" + ":80"}, "")
+	_, err := Run(context.Background(), Tape{Version: 1, Target: "http://" + net.JoinHostPort("0", "80")}, "")
 	if err == nil {
 		t.Fatal("remote target accepted")
 	}
@@ -164,5 +165,134 @@ func TestUnexpectedWebSocketEndIsError(t *testing.T) {
 	_, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Script: []Step{{WS: &WS{Path: "/", Frames: 1}}}}, "")
 	if err == nil {
 		t.Fatal("unexpected websocket close accepted")
+	}
+}
+
+func TestUploadLimitDistinguishesUpstream413(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+	}))
+	defer s.Close()
+	for _, tc := range []struct {
+		name      string
+		body      string
+		wantError bool
+	}{
+		{"upstream", "small", false},
+		{"local", strings.Repeat("x", 4<<20+1), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Script: []Step{{HTTP: &HTTP{Method: "POST", Path: "/", Body: tc.body}}}}, "")
+			if (err != nil) != tc.wantError {
+				t.Fatalf("error = %v, want error %v", err, tc.wantError)
+			}
+		})
+	}
+}
+
+func TestWebSocketFaultDoesNotMaskLaterClose(t *testing.T) {
+	for _, tc := range []struct {
+		action string
+		delay  int
+	}{
+		{"delay", 0}, {"delay", 10}, {"drop", 0},
+	} {
+		t.Run(fmt.Sprintf("%s-%d", tc.action, tc.delay), func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c, rw, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
+				_ = rw.Flush()
+				_ = wsframe.Write(c, wsframe.Frame{Fin: true, Opcode: 1, Payload: []byte("one")}, false)
+				_ = wsframe.Write(c, wsframe.Frame{Fin: true, Opcode: 8}, false)
+			}))
+			defer s.Close()
+			rule := fault.Rule{ID: "fault", Enabled: true, Match: fault.Match{PathPrefix: "/"}, Fault: fault.Fault{Type: "ws-glitch", Params: map[string]any{"dir": "s2c", "action": tc.action, "after_frames": 1, "every": 100, "delay_ms": tc.delay}}}
+			_, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Rules: []fault.Rule{rule}, Script: []Step{{WS: &WS{Path: "/", Frames: 2}}}}, "")
+			if err == nil {
+				t.Fatal("unrelated close accepted")
+			}
+		})
+	}
+}
+
+func TestWebSocketDefaultDeadlineAndTickerWatchdog(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
+		_ = rw.Flush()
+		time.Sleep(2700 * time.Millisecond)
+		_ = wsframe.Write(c, wsframe.Frame{Fin: true, Opcode: 1, Payload: []byte(`{"tick":1}`)}, false)
+	}))
+	defer s.Close()
+	for _, tc := range []struct {
+		path            string
+		demo, wantError bool
+	}{
+		{"/other", false, false}, {"/ws/ticker", true, true},
+	} {
+		ch, err := startWS(context.Background(), s.URL, WS{Path: tc.path, Frames: 1}, tc.demo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = <-ch; (err != nil) != tc.wantError {
+			t.Fatalf("%s: %v", tc.path, err)
+		}
+	}
+}
+
+func TestInjectedWebSocketTimeoutsAreExpected(t *testing.T) {
+	for _, action := range []string{"drop", "delay"} {
+		t.Run(action, func(t *testing.T) {
+			rule := fault.Rule{ID: action, Enabled: true, Match: fault.Match{PathPrefix: "/ws/ticker"}, Fault: fault.Fault{Type: "ws-glitch", Params: map[string]any{"dir": "s2c", "action": action, "after_frames": 1, "delay_ms": 400}}}
+			_, err := Run(context.Background(), Tape{Version: 1, Target: "demo", Rules: []fault.Rule{rule}, Script: []Step{{WS: &WS{Path: "/ws/ticker", Frames: 1, TimeoutMS: 500}}}}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestInjectedCorruptTickerIsExpected(t *testing.T) {
+	rule := fault.Rule{ID: "corrupt", Enabled: true, Match: fault.Match{PathPrefix: "/ws/ticker"}, Fault: fault.Fault{Type: "ws-glitch", Params: map[string]any{"dir": "s2c", "action": "corrupt", "after_frames": 1}}}
+	_, err := Run(context.Background(), Tape{Version: 1, Target: "demo", Rules: []fault.Rule{rule}, Script: []Step{{WS: &WS{Path: "/ws/ticker", Frames: 1, TimeoutMS: 1000}}}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSocketFaultDoesNotMaskTimeoutOnLaterMessage(t *testing.T) {
+	for _, action := range []string{"drop", "delay", "corrupt"} {
+		t.Run(action, func(t *testing.T) {
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c, rw, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					return
+				}
+				defer c.Close()
+				fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
+				_ = rw.Flush()
+				_ = wsframe.Write(c, wsframe.Frame{Fin: true, Opcode: 1, Payload: []byte("first")}, false)
+				_ = wsframe.Write(c, wsframe.Frame{Fin: true, Opcode: 1, Payload: []byte("second")}, false)
+				time.Sleep(200 * time.Millisecond)
+			}))
+			defer s.Close()
+			rule := fault.Rule{ID: action, Enabled: true, Match: fault.Match{PathPrefix: "/"}, Fault: fault.Fault{Type: "ws-glitch", Params: map[string]any{"dir": "s2c", "action": action, "after_frames": 1, "every": 100, "delay_ms": 5}}}
+			frames := 3
+			if action == "drop" {
+				frames = 2
+			}
+			_, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Rules: []fault.Rule{rule}, Script: []Step{{WS: &WS{Path: "/", Frames: frames, TimeoutMS: 80}}}}, "")
+			if err == nil {
+				t.Fatal("later timeout accepted")
+			}
+		})
 	}
 }

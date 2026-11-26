@@ -56,12 +56,36 @@ func TestRejectCrossOriginMutations(t *testing.T) {
 
 func TestRejectInvalidWebSocketHandshake(t *testing.T) {
 	r := httptest.NewRequest("GET", "/ws/ticker", nil)
+	r.Host = "localhost"
 	r.Header.Set("Upgrade", "websocket")
 	r.Header.Set("Sec-WebSocket-Key", "invalid")
 	w := httptest.NewRecorder()
 	New().ServeHTTP(w, r)
 	if w.Code != 400 {
 		t.Fatalf("status %d", w.Code)
+	}
+}
+
+func TestTickerRejectsUntrustedUpgrade(t *testing.T) {
+	h := New()
+	for _, tc := range []struct{ host, origin string }{
+		{"127.0.0.1:3000", "http://localhost:8081"},
+		{net.JoinHostPort(strings.Repeat("x", 7), "3000"), ""},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/ws/ticker", nil)
+		req.Host = tc.host
+		if tc.origin != "" {
+			req.Header.Set("Origin", tc.origin)
+		}
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "websocket")
+		req.Header.Set("Sec-WebSocket-Version", "13")
+		req.Header.Set("Sec-WebSocket-Key", "MDEyMzQ1Njc4OWFiY2RlZg==")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("host %q origin %q: status %d, want 403", tc.host, tc.origin, rec.Code)
+		}
 	}
 }
 

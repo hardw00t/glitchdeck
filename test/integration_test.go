@@ -292,6 +292,225 @@ func TestStreamingFlushAndReadError(t *testing.T) {
 	}
 }
 
+func TestResetDuringLatencyDoesNotSucceed(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	s, p, _, _ := startProxy(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hit <- struct{}{} }),
+		rule("latency-wave", "/", map[string]any{"base_ms": 10000}))
+	done := make(chan error, 1)
+	go func() {
+		resp, err := client.Get(s.URL)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode < 500 {
+				err = fmt.Errorf("unexpected status %d", resp.StatusCode)
+			}
+		}
+		done <- err
+	}()
+	for p.Seq() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	p.Reset()
+	if err := <-done; err == nil {
+		t.Fatal("canceled latency returned success")
+	}
+	select {
+	case <-hit:
+		t.Fatal("upstream was contacted")
+	default:
+	}
+}
+
+func TestStreamedUploadCountOne(t *testing.T) {
+	s, p, bus, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(204)
+	}), rule("dup-webhook", "/", map[string]any{"count": 1}))
+	outcomes := make(chan proxy.Outcome, 1)
+	p.OnOutcome = func(o proxy.Outcome) { outcomes <- o }
+	req, _ := http.NewRequest("DELETE", s.URL, strings.NewReader("streamed"))
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	select {
+	case o := <-outcomes:
+		t.Fatalf("unexpected outcome: %+v", o)
+	default:
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		for _, event := range bus.History(0) {
+			var record struct {
+				ReqBytes int `json:"req_bytes"`
+			}
+			if event.Type == "http_req" && json.Unmarshal(event.Data, &record) == nil && record.ReqBytes == 8 {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("missing streamed byte count")
+}
+
+func TestStreamingHeadersFlushBeforeBody(t *testing.T) {
+	release := make(chan struct{})
+	s, _, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer close(release)
+	c := &http.Client{Timeout: time.Second}
+	resp, err := c.Get(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+}
+
+func TestDelayedReplayAfterFiveSeconds(t *testing.T) {
+	calls := make(chan struct{}, 2)
+	s, p, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls <- struct{}{}
+		w.WriteHeader(204)
+	}), rule("dup-webhook", "/", map[string]any{"count": 2, "delay_ms": 5100}))
+	resp, err := client.Post(s.URL, "text/plain", strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	if err := p.Wait(ctx); err != nil || len(calls) != 2 {
+		t.Fatalf("wait=%v calls=%d", err, len(calls))
+	}
+}
+
+func TestOversizeUpgradePostPublishesError(t *testing.T) {
+	s, p, bus, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("oversize request reached upstream")
+	}))
+	outcomes := make(chan proxy.Outcome, 1)
+	p.OnOutcome = func(o proxy.Outcome) { outcomes <- o }
+	req, _ := http.NewRequest("POST", s.URL, strings.NewReader(strings.Repeat("x", (4<<20)+1)))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	select {
+	case o := <-outcomes:
+		if o.Err == nil {
+			t.Fatalf("outcome %+v", o)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing error outcome")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		for _, event := range bus.History(0) {
+			var record struct {
+				Status int `json:"status"`
+			}
+			if event.Type == "http_req" && json.Unmarshal(event.Data, &record) == nil && record.Status == 413 {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("missing 413 telemetry")
+}
+
+func TestEmptyBodyResetUsesIncompleteFraming(t *testing.T) {
+	s, _, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "0")
+	}), rule("tcp-rst", "/", map[string]any{"after_bytes": 1}))
+	conn, err := net.Dial("tcp", s.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+	data, err := io.ReadAll(conn)
+	if !errors.Is(err, syscall.ECONNRESET) || !bytes.Contains(data, []byte("Transfer-Encoding: chunked")) || bytes.HasSuffix(data, []byte("0\r\n\r\n")) {
+		t.Fatalf("wire %q, err %v", data, err)
+	}
+}
+
+func TestWebSocketRejectsMultipleSelectedProtocols(t *testing.T) {
+	for _, selection := range []string{"one, two", "one\r\nSec-WebSocket-Protocol: two"} {
+		t.Run(selection, func(t *testing.T) {
+			s, _, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, b, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_, _ = fmt.Fprintf(b, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: %s\r\nSec-WebSocket-Protocol: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")), selection)
+				_ = b.Flush()
+			}))
+			req, _ := http.NewRequest("GET", s.URL, nil)
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Sec-WebSocket-Version", "13")
+			req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+			req.Header.Set("Sec-WebSocket-Protocol", "one, two")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 502 {
+				t.Fatalf("status %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestWebSocketInjectedResetReachesUpstream(t *testing.T) {
+	result := make(chan error, 1)
+	s, _, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, b, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			result <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = fmt.Fprintf(b, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
+		_ = b.Flush()
+		_ = wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 1, Payload: []byte("x")}, false)
+		_, err = b.ReadByte()
+		result <- err
+	}), rule("ws-glitch", "/", map[string]any{"dir": "s2c", "action": "close_1006"}))
+	conn, err := net.Dial("tcp", s.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+	r := bufio.NewReader(conn)
+	if _, err := http.ReadResponse(r, &http.Request{Method: "GET"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.ReadByte()
+	if !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("client: %v", err)
+	}
+	if err = <-result; !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("upstream: %v", err)
+	}
+}
+
 func TestTapeCIRunnerDeterministic(t *testing.T) {
 	for _, tc := range []struct{ name, diff string }{{"checkout-dup-webhook", "duplicate_charges: expected 0, got 1"}, {"clean", ""}} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -202,7 +202,7 @@ func serve(args []string, isDemo bool) int {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
-			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if r.Header.Get("Origin") != "" && (r.Header.Get("Upgrade") != "" || (r.Method != http.MethodGet && r.Method != http.MethodHead)) {
 				r = r.Clone(r.Context())
 				r.Header.Del("Origin")
 			}

@@ -58,3 +58,40 @@ func TestUnsupportedTrafficMarksTapeIncomplete(t *testing.T) {
 		})
 	}
 }
+
+func TestRecordingBudgetIncludesConfigSnapshots(t *testing.T) {
+	rule := func(seed uint64, size int) fault.Config {
+		return fault.Config{Seed: seed, Rules: []fault.Rule{{
+			ID: "limit", Fault: fault.Fault{Type: "rate-limit", Params: map[string]any{"body": strings.Repeat("a", size)}},
+		}}}
+	}
+	t.Run("changes and traffic share budget", func(t *testing.T) {
+		var r recorder
+		r.start(0, 0, rule(1, 2<<20))
+		now := time.Now()
+		r.request(proxy.Record{Seq: 1, Method: "POST", Path: "/one", At: now, Body: make([]byte, 1<<20)})
+		r.changed(2, rule(2, 2<<20))
+		r.changed(2, rule(3, 2<<20))
+		if status := r.status(); status.Incomplete {
+			t.Fatalf("replacement did not release its byte allowance: %+v", status)
+		}
+		r.request(proxy.Record{Seq: 2, Method: "GET", Path: "/two", At: now})
+		r.changed(3, rule(4, 3<<20))
+		r.request(proxy.Record{Seq: 3, Method: "GET", Path: "/three", At: now})
+		r.stop()
+		doc := r.tape(fault.Config{})
+		if !doc.Incomplete || !strings.Contains(doc.IncompleteReason, "budget") || len(doc.ConfigChanges) != 1 || doc.ConfigChanges[0].Seed != 3 || len(doc.Script) != 3 {
+			t.Fatalf("incomplete=%t reason=%q changes=%d steps=%d", doc.Incomplete, doc.IncompleteReason, len(doc.ConfigChanges), len(doc.Script))
+		}
+	})
+	t.Run("oversize initial snapshot is not retained", func(t *testing.T) {
+		var r recorder
+		status := r.start(0, 0, rule(1, maxRecordBytes))
+		if !status.Incomplete || !strings.Contains(status.IncompleteReason, "budget") {
+			t.Fatalf("recording status: %+v", status)
+		}
+		if doc := r.tape(fault.Config{}); len(doc.Rules) != 0 {
+			t.Fatal("recording retained an oversized initial configuration")
+		}
+	})
+}

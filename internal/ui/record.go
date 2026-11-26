@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"encoding/json"
 	"reflect"
 	"slices"
 	"strings"
@@ -36,7 +37,8 @@ type recorded struct {
 
 type recordedChange struct {
 	tape.ConfigChange
-	at time.Time
+	at    time.Time
+	bytes int
 }
 
 type recorder struct {
@@ -76,7 +78,11 @@ func (r *recorder) start(seq uint64, activeWS int, cfg fault.Config) recordingSt
 	if !r.running {
 		r.clear()
 		r.running, r.started, r.startSeq = true, time.Now(), seq
-		r.config = cfg
+		if size, ok := configSize(cfg); ok && size <= maxRecordBytes {
+			r.config, r.bytes = cfg, size
+		} else {
+			r.markIncomplete("initial configuration exceeded the recording byte budget")
+		}
 		r.streams = make(map[uint64]*recorded)
 		if activeWS != 0 {
 			r.markIncomplete("WebSocket connection already open when recording started")
@@ -134,13 +140,33 @@ func (r *recorder) changed(before uint64, cfg fault.Config) {
 			break
 		}
 	}
-	if n := len(r.changes); n != 0 && r.changes[n-1].BeforeSeq == before && change.at.IsZero() && r.changes[n-1].at.IsZero() {
-		r.changes[n-1] = change
-	} else if len(r.changes) == maxEntries {
+	last := len(r.changes) - 1
+	replace := last >= 0 && r.changes[last].BeforeSeq == before && change.at.IsZero() && r.changes[last].at.IsZero()
+	if !replace && len(r.changes) == maxEntries {
 		r.markIncomplete("configuration history exceeded the recording limit")
+		return
+	}
+	var previousSize int
+	if replace {
+		previousSize = r.changes[last].bytes
+	}
+	size, ok := configSize(cfg)
+	if !ok || size > maxRecordBytes-r.bytes+previousSize {
+		r.markIncomplete("configuration change exceeded the recording byte budget")
+		return
+	}
+	change.bytes = size
+	r.bytes += size - previousSize
+	if replace {
+		r.changes[last] = change
 	} else {
 		r.changes = append(r.changes, change)
 	}
+}
+
+func configSize(cfg fault.Config) (int, bool) {
+	data, err := json.Marshal(cfg)
+	return len(data), err == nil
 }
 
 func (r *recorder) markIncomplete(reason string) {
