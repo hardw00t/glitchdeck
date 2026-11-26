@@ -532,9 +532,14 @@ function reportTicker(broken) {
   );
   refreshDemo();
 }
+function setTickerStatus(state) {
+  const status = $("#ticker-status");
+  status.dataset.state = state;
+  status.textContent = state.toUpperCase();
+}
 $("#connect-ticker").onclick = () => {
   if (socket && socket.readyState < 2) return;
-  $("#ticker-status").textContent = "CONNECTING";
+  setTickerStatus("connecting");
   const url = new URL("/api/demo/ticker", location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
   socket = new WebSocket(url);
@@ -542,13 +547,13 @@ $("#connect-ticker").onclick = () => {
   const watch = () => {
     clearTimeout(stallTimer);
     stallTimer = setTimeout(() => {
-      $("#ticker-status").textContent = "STALLED";
+      setTickerStatus("stalled");
       $("#ticker-meta").textContent = "No ticker frames received";
       reportTicker(true);
     }, 2500);
   };
   socket.onopen = () => {
-    $("#ticker-status").textContent = "CONNECTED";
+    setTickerStatus("connected");
     $("#ticker-meta").textContent = "Awaiting tick";
     reportTicker(false);
     watch();
@@ -557,7 +562,7 @@ $("#connect-ticker").onclick = () => {
     try {
       const tick = JSON.parse(e.data);
       if (tickerBroken) {
-        $("#ticker-status").textContent = "CONNECTED";
+        setTickerStatus("connected");
         reportTicker(false);
       }
       watch();
@@ -569,7 +574,7 @@ $("#connect-ticker").onclick = () => {
         `seq #${tick.seq} · ${new Date().toLocaleTimeString()}`;
     } catch {
       clearTimeout(stallTimer);
-      $("#ticker-status").textContent = "STALLED";
+      setTickerStatus("stalled");
       $("#ticker-meta").textContent = "Invalid ticker frame";
       reportTicker(true);
       socket.close();
@@ -580,7 +585,7 @@ $("#connect-ticker").onclick = () => {
   };
   socket.onclose = (e) => {
     clearTimeout(stallTimer);
-    $("#ticker-status").textContent = "STALLED";
+    setTickerStatus("stalled");
     $("#ticker-meta").textContent = `Connection closed · code ${e.code}`;
     reportTicker(true);
   };
@@ -787,8 +792,11 @@ function draw(updateReadouts = false) {
     line(w / 2 - 2, (bottom * i) / 32, w / 2 + 2, (bottom * i) / 32);
   ctx.font = "10px monospace";
   ctx.fillStyle = "#91b3a1";
-  for (const ms of [0, maxMS / 4, maxMS / 2, maxMS])
-    ctx.fillText(ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`, w - 35, y(ms) + 3);
+  ctx.textBaseline = "bottom";
+  ctx.fillText("0ms", w - 35, y(0) - 5);
+  ctx.textBaseline = "alphabetic";
+  for (const ms of [maxMS / 4, maxMS / 2, maxMS])
+    ctx.fillText(ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`, w - 35, y(ms));
   ctx.fillText("WS FRAMES", 8, bottom + 13);
   ctx.strokeStyle = ctx.fillStyle = "#38f59c";
   ctx.lineWidth = 1.75;

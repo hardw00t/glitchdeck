@@ -257,6 +257,9 @@ main {
   display: flex;
   gap: 14px;
 }
+.readout-pair span {
+  white-space: nowrap;
+}
 .readout-pair b {
   display: block;
   margin-top: 8px;
@@ -463,6 +466,16 @@ select {
 }
 .micro span {
   color: var(--phosphor-green);
+}
+#ticker-status {
+  --ink-muted: #7c8696;
+  color: var(--ink-muted);
+}
+#ticker-status[data-state="connected"] {
+  color: var(--signal-cyan);
+}
+#ticker-status[data-state="stalled"] {
+  color: var(--signal-red);
 }
 #ledger {
   list-style: none;
@@ -796,6 +809,10 @@ select {
     grid-template-columns: 1fr;
   }
   .inspector .section-head {
+    height: auto;
+    min-height: 38px;
+    flex: none;
+    padding: 6px 12px;
     white-space: normal;
   }
   .inspector .section-head button {
