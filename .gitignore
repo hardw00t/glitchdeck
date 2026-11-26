@@ -2,3 +2,6 @@
 /dist-bin/
 *.test
 *.out
+
+!/internal/ui/dist/
+!/internal/ui/dist/*

@@ -1,0 +1,30 @@
+version: 1
+name: checkout-dup-webhook
+seed: 42
+target: demo
+rules:
+  - id: dup-pay
+    enabled: true
+    match:
+      method: POST
+      path_prefix: /webhooks/payment
+      seq: [1]
+    fault:
+      type: dup-webhook
+      params:
+        count: 2
+        delay_ms: 100
+script:
+  - name: trigger-payment-webhook
+    http:
+      method: POST
+      path: /webhooks/payment
+      headers: {Content-Type: application/json}
+      body: '{"order_id":"ord-101","amount_cents":4900}'
+assertions:
+  - name: no-duplicate-charges
+    http_get: /api/state
+    expect_status: 200
+    json_eq:
+      duplicate_charges: 0
+      total_charged_cents: 4900
