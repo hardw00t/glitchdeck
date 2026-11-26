@@ -11,14 +11,13 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"glitchdeck/internal/fault"
+	"glitchdeck/internal/localweb"
 	"glitchdeck/internal/proxy"
 	"glitchdeck/internal/tape"
 	"glitchdeck/internal/telemetry"
@@ -50,6 +49,7 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	p.OnRequest = c.rec.request
 	p.OnClientFrame = c.rec.clientFrame
 	p.OnServerFrame = c.rec.serverFrame
+	p.OnUnsupportedFrame = c.rec.unsupportedFrame
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		cfg := c.p.Config()
@@ -61,8 +61,8 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	mux.HandleFunc("PATCH /api/faults/{id}", c.patch)
 	mux.HandleFunc("POST /api/reset", c.reset)
 	mux.HandleFunc("GET /api/tape/status", func(w http.ResponseWriter, r *http.Request) { respond(w, c.rec.status()) })
-	mux.HandleFunc("POST /api/tape/record", func(w http.ResponseWriter, r *http.Request) { respond(w, c.rec.start(c.p.Seq)) })
-	mux.HandleFunc("POST /api/tape/stop", func(w http.ResponseWriter, r *http.Request) { respond(w, c.rec.stop()) })
+	mux.HandleFunc("POST /api/tape/record", c.startRecording)
+	mux.HandleFunc("POST /api/tape/stop", c.stopRecording)
 	mux.HandleFunc("GET /api/tape/export", c.export)
 	mux.HandleFunc("POST /api/tape/import", c.importTape)
 	if c.DemoURL != "" {
@@ -99,37 +99,33 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	}
 	mux.Handle("GET /", http.FileServer(http.FS(dist)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !trustedHost(r.Host, c.UI) {
-			http.Error(w, "invalid control host", 403)
+		if !localweb.Allowed(r, c.UI) {
+			http.Error(w, "untrusted control host or origin", http.StatusForbidden)
 			return
 		}
-		if origin := r.Header.Get("Origin"); origin != "" && (r.Method != "GET" || r.Header.Get("Upgrade") != "") {
-			u, err := url.Parse(origin)
-			if err != nil || u.Scheme != "http" || !strings.EqualFold(u.Host, r.Host) {
-				http.Error(w, "cross-origin control request", 403)
-				return
-			}
-		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws://"+r.Host+"; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+		w.Header().Set("X-Frame-Options", "DENY")
 		mux.ServeHTTP(w, r)
 	})
 }
 
-func hostOnly(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-	return host
+func (c *control) startRecording(w http.ResponseWriter, r *http.Request) {
+	c.cfgMu.Lock()
+	cfg := c.p.Config()
+	var status recordingStatus
+	c.p.CaptureBoundary(func(nextSeq uint64, activeWS int) {
+		status = c.rec.start(nextSeq-1, activeWS, cfg)
+	})
+	c.cfgMu.Unlock()
+	respond(w, status)
 }
 
-func trustedHost(addr, bind string) bool {
-	host := hostOnly(addr)
-	if strings.EqualFold(host, "localhost") || host == "127.0.0.1" {
-		return true
-	}
-	bound := hostOnly(bind)
-	return bound != "" && strings.EqualFold(host, bound)
+func (c *control) stopRecording(w http.ResponseWriter, r *http.Request) {
+	c.cfgMu.Lock()
+	status := c.rec.stop()
+	c.cfgMu.Unlock()
+	respond(w, status)
 }
 
 func respond(w http.ResponseWriter, value any) {
@@ -212,19 +208,27 @@ func (c *control) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (c *control) changed() {
-	cfg := c.p.Config()
-	c.bus.Publish("fault_state", map[string]any{"rules": rules(cfg), "seed": cfg.Seed, "seq": c.p.Seq()})
+func (c *control) changed(cfg fault.Config) map[string]any {
+	state := map[string]any{"rules": rules(cfg), "seed": cfg.Seed, "seq": c.p.Seq()}
+	c.bus.Publish("fault_state", state)
+	return state
 }
 
-func (c *control) set(w http.ResponseWriter, cfg fault.Config) {
+func (c *control) set(cfg fault.Config) (map[string]any, error) {
 	if err := fault.Validate(cfg); err != nil {
-		http.Error(w, err.Error(), 400)
+		return nil, err
+	}
+	before := c.p.SetConfigAt(cfg)
+	c.rec.changed(before, cfg)
+	return c.changed(cfg), nil
+}
+
+func respondConfig(w http.ResponseWriter, state map[string]any, err error) {
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	c.p.SetConfig(cfg)
-	c.changed()
-	respond(w, map[string]any{"rules": rules(cfg), "seed": cfg.Seed, "seq": c.p.Seq()})
+	respond(w, state)
 }
 
 func (c *control) replace(w http.ResponseWriter, r *http.Request) {
@@ -240,13 +244,14 @@ func (c *control) replace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.cfgMu.Lock()
-	defer c.cfgMu.Unlock()
 	cfg := c.p.Config()
 	cfg.Rules = req.Rules
 	if req.Seed != nil {
 		cfg.Seed = *req.Seed
 	}
-	c.set(w, cfg)
+	state, err := c.set(cfg)
+	c.cfgMu.Unlock()
+	respondConfig(w, state, err)
 }
 
 func (c *control) patch(w http.ResponseWriter, r *http.Request) {
@@ -259,69 +264,75 @@ func (c *control) patch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.cfgMu.Lock()
-	defer c.cfgMu.Unlock()
-	cfg := c.p.Config()
-	cfg.Rules = append([]fault.Rule(nil), cfg.Rules...)
-	for i := range cfg.Rules {
-		rule := &cfg.Rules[i]
-		if rule.ID != r.PathValue("id") {
-			continue
-		}
-		if patch.Enabled != nil {
-			rule.Enabled = *patch.Enabled
-		}
-		if len(patch.Match) != 0 {
-			rule.Match.Seq = append([]uint64(nil), rule.Match.Seq...)
-			d := json.NewDecoder(bytes.NewReader(patch.Match))
-			d.DisallowUnknownFields()
-			if err := d.Decode(&rule.Match); err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
-		}
-		if patch.Params != nil {
-			merged := make(map[string]any, len(rule.Fault.Params)+len(patch.Params))
-			for k, v := range rule.Fault.Params {
-				merged[k] = v
-			}
-			for k, v := range patch.Params {
-				merged[k] = v
-			}
-			rule.Fault.Params = merged
-		}
-		c.set(w, cfg)
+	state, err := c.patchConfig(r.PathValue("id"), patch.Enabled, patch.Match, patch.Params)
+	c.cfgMu.Unlock()
+	if errors.Is(err, errRuleNotFound) {
+		http.NotFound(w, r)
 		return
 	}
-	http.NotFound(w, r)
+	respondConfig(w, state, err)
+}
+
+var errRuleNotFound = errors.New("rule not found")
+
+func (c *control) patchConfig(id string, enabled *bool, match json.RawMessage, params map[string]any) (map[string]any, error) {
+	cfg := c.p.Config()
+	for i := range cfg.Rules {
+		rule := &cfg.Rules[i]
+		if rule.ID != id {
+			continue
+		}
+		if enabled != nil {
+			rule.Enabled = *enabled
+		}
+		if len(match) != 0 {
+			d := json.NewDecoder(bytes.NewReader(match))
+			d.DisallowUnknownFields()
+			if err := d.Decode(&rule.Match); err != nil {
+				return nil, err
+			}
+		}
+		for k, v := range params {
+			if rule.Fault.Params == nil {
+				rule.Fault.Params = make(map[string]any, len(params))
+			}
+			rule.Fault.Params[k] = v
+		}
+		return c.set(cfg)
+	}
+	return nil, errRuleNotFound
 }
 
 func (c *control) reset(w http.ResponseWriter, r *http.Request) {
 	c.cfgMu.Lock()
-	defer c.cfgMu.Unlock()
-	c.p.Reset()
-	c.bus.Clear()
-	c.rec.reset()
-	c.broken.Store(false)
-	if c.DemoURL != "" {
-		if status, _, err := c.call(r.Context(), http.MethodPost, c.DemoURL+"/api/reset", nil); err != nil || status >= 400 {
-			http.Error(w, "demo reset failed", 502)
-			return
+	var resetErr bool
+	c.p.ResetWith(func() {
+		c.bus.Clear()
+		c.rec.reset()
+		c.broken.Store(false)
+		if c.DemoURL != "" {
+			status, _, err := c.call(r.Context(), http.MethodPost, c.DemoURL+"/api/reset", nil)
+			resetErr = err != nil || status >= 400
 		}
+	})
+	c.changed(c.p.Config())
+	c.cfgMu.Unlock()
+	if resetErr {
+		http.Error(w, "demo reset failed", http.StatusBadGateway)
+		return
 	}
-	c.changed()
 	respond(w, map[string]bool{"ok": true})
 }
 
 func (c *control) export(w http.ResponseWriter, r *http.Request) {
-	cfg := c.p.Config()
-	target := c.Target
-	var assertions []tape.Assertion
+	c.cfgMu.Lock()
+	doc := c.rec.tape(c.p.Config())
+	c.cfgMu.Unlock()
+	doc.Version, doc.Name, doc.Target = 1, "glitchdeck-recording", c.Target
 	if c.DemoURL != "" {
-		target = "demo"
-		assertions = []tape.Assertion{{Name: "demo invariants", HTTPGet: "/api/state", Direct: true, ExpectStatus: 200, JSONEq: map[string]any{"duplicate_charges": 0, "ws_broken": false}}}
+		doc.Target = "demo"
+		doc.Assertions = []tape.Assertion{{Name: "demo invariants", HTTPGet: "/api/state", Direct: true, ExpectStatus: 200, JSONEq: map[string]any{"duplicate_charges": 0, "ws_broken": false}}}
 	}
-	script, start := c.rec.script()
-	doc := tape.Tape{Version: 1, Name: "glitchdeck-recording", Seed: cfg.Seed, Target: target, Rules: cfg.Rules, Script: script, Assertions: assertions, StartSeq: start}
 	var data bytes.Buffer
 	if err := tape.Encode(&data, doc); err != nil {
 		http.Error(w, err.Error(), 500)
@@ -340,8 +351,9 @@ func (c *control) importTape(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.cfgMu.Lock()
-	defer c.cfgMu.Unlock()
-	c.set(w, fault.Config{Seed: doc.Seed, Rules: doc.Rules})
+	state, err := c.set(fault.Config{Seed: doc.Seed, Rules: doc.Rules})
+	c.cfgMu.Unlock()
+	respondConfig(w, state, err)
 }
 
 func (c *control) call(ctx context.Context, method, endpoint string, body []byte) (int, []byte, error) {

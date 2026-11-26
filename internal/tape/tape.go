@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +18,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"glitchdeck/internal/demo"
@@ -26,17 +30,27 @@ import (
 )
 
 type Tape struct {
-	Version    int          `yaml:"version" json:"version"`
-	Name       string       `yaml:"name" json:"name"`
-	Seed       uint64       `yaml:"seed" json:"seed"`
-	StartSeq   uint64       `yaml:"start_seq,omitempty" json:"start_seq,omitempty"`
-	Target     string       `yaml:"target" json:"target"`
-	Rules      []fault.Rule `yaml:"rules" json:"rules"`
-	Script     []Step       `yaml:"script" json:"script"`
-	Assertions []Assertion  `yaml:"assertions" json:"assertions"`
+	Version          int            `yaml:"version" json:"version"`
+	Name             string         `yaml:"name" json:"name"`
+	Seed             uint64         `yaml:"seed" json:"seed"`
+	StartSeq         uint64         `yaml:"start_seq,omitempty" json:"start_seq,omitempty"`
+	Target           string         `yaml:"target" json:"target"`
+	Rules            []fault.Rule   `yaml:"rules" json:"rules"`
+	Script           []Step         `yaml:"script" json:"script"`
+	Incomplete       bool           `yaml:"incomplete,omitempty" json:"incomplete,omitempty"`
+	IncompleteReason string         `yaml:"incomplete_reason,omitempty" json:"incomplete_reason,omitempty"`
+	ConfigChanges    []ConfigChange `yaml:"config_changes,omitempty" json:"config_changes,omitempty"`
+	Assertions       []Assertion    `yaml:"assertions" json:"assertions"`
+}
+type ConfigChange struct {
+	BeforeSeq uint64       `yaml:"before_seq" json:"before_seq"`
+	AtMS      *int64       `yaml:"at_ms,omitempty" json:"at_ms,omitempty"`
+	Seed      uint64       `yaml:"seed" json:"seed"`
+	Rules     []fault.Rule `yaml:"rules" json:"rules"`
 }
 type Step struct {
 	Name    string `yaml:"name" json:"name"`
+	Seq     uint64 `yaml:"seq,omitempty" json:"seq,omitempty"`
 	HTTP    *HTTP  `yaml:"http,omitempty" json:"http,omitempty"`
 	WS      *WS    `yaml:"ws,omitempty" json:"ws,omitempty"`
 	SleepMS int    `yaml:"sleep_ms,omitempty" json:"sleep_ms,omitempty"`
@@ -94,6 +108,23 @@ func validate(t Tape) error {
 	if t.Version != 1 {
 		return fmt.Errorf("unsupported tape version %d", t.Version)
 	}
+	if t.Incomplete {
+		return fmt.Errorf("incomplete tape: %s", t.IncompleteReason)
+	}
+	if t.StartSeq == math.MaxUint64 {
+		return fmt.Errorf("invalid start sequence")
+	}
+	lastChange := t.StartSeq
+	for _, c := range t.ConfigChanges {
+		if c.BeforeSeq < lastChange || c.BeforeSeq == 0 || (c.AtMS != nil && (*c.AtMS < 0 || *c.AtMS > math.MaxInt64/int64(time.Millisecond))) {
+			return fmt.Errorf("invalid configuration timeline")
+		}
+		if err := fault.Validate(fault.Config{Seed: c.Seed, Rules: c.Rules}); err != nil {
+			return err
+		}
+		lastChange = c.BeforeSeq
+	}
+	seq := t.StartSeq
 	if err := fault.Validate(fault.Config{Seed: t.Seed, Rules: t.Rules}); err != nil {
 		return err
 	}
@@ -101,6 +132,24 @@ func validate(t Tape) error {
 		n := 0
 		if s.AtMS < 0 {
 			return fmt.Errorf("invalid step offset")
+		}
+		if s.AtMS > math.MaxInt64/int64(time.Millisecond) {
+			return fmt.Errorf("invalid step offset")
+		}
+		if s.HTTP != nil || s.WS != nil {
+			if s.Seq != 0 {
+				if s.Seq <= seq {
+					return fmt.Errorf("invalid step sequence")
+				}
+				seq = s.Seq
+			} else {
+				if seq == math.MaxUint64 {
+					return fmt.Errorf("sequence overflow")
+				}
+				seq++
+			}
+		} else if s.Seq != 0 {
+			return fmt.Errorf("sequence on non-request step")
 		}
 		if s.HTTP != nil {
 			n++
@@ -113,10 +162,13 @@ func validate(t Tape) error {
 			if !validPath(s.WS.Path) || s.WS.Frames < 0 || s.WS.TimeoutMS < 0 {
 				return fmt.Errorf("invalid WS step")
 			}
+			if int64(s.WS.TimeoutMS) > math.MaxInt64/int64(time.Millisecond) {
+				return fmt.Errorf("invalid WS timeout")
+			}
 		}
 		if s.SleepMS != 0 {
 			n++
-			if s.SleepMS < 0 {
+			if s.SleepMS < 0 || int64(s.SleepMS) > math.MaxInt64/int64(time.Millisecond) {
 				return fmt.Errorf("invalid sleep")
 			}
 		}
@@ -124,7 +176,18 @@ func validate(t Tape) error {
 			return fmt.Errorf("step %q must have exactly one action", s.Name)
 		}
 	}
+	for _, c := range t.ConfigChanges {
+		if c.AtMS == nil && c.BeforeSeq > seq && c.BeforeSeq-seq > 1 {
+			return fmt.Errorf("configuration change beyond final sequence")
+		}
+	}
 	for _, a := range t.Assertions {
+		if !a.Direct {
+			if seq == math.MaxUint64 {
+				return fmt.Errorf("sequence overflow")
+			}
+			seq++
+		}
 		if !validPath(a.HTTPGet) || a.MaxLatencyMS < 0 {
 			return fmt.Errorf("invalid assertion %q", a.Name)
 		}
@@ -156,16 +219,69 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 		return nil, err
 	}
 	p := proxy.New(u, fault.Config{Seed: t.Seed, Rules: t.Rules}, telemetry.New())
+	var outcomeMu sync.Mutex
+	outcomes := map[uint64]proxy.Outcome{}
+	p.OnOutcome = func(o proxy.Outcome) {
+		outcomeMu.Lock()
+		prev := outcomes[o.Seq]
+		prev.Reset = prev.Reset || o.Reset
+		prev.WSFault = prev.WSFault || o.WSFault
+		if o.Err != nil {
+			prev.Err = o.Err
+		}
+		outcomes[o.Seq] = prev
+		outcomeMu.Unlock()
+	}
+	getOutcome := func(seq uint64) proxy.Outcome { outcomeMu.Lock(); defer outcomeMu.Unlock(); return outcomes[seq] }
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
 	server := httptest.NewServer(p)
 	defer server.Close()
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	broken := false
-	var streams []<-chan bool
+	type streamResult struct {
+		seq    uint64
+		ticker bool
+		ch     <-chan error
+	}
+	var streams []streamResult
 	startRun := time.Now()
+	var configMu sync.Mutex
+	applied := make([]bool, len(t.ConfigChanges))
+	applyChanges := func(seq uint64) {
+		configMu.Lock()
+		defer configMu.Unlock()
+		for i, c := range t.ConfigChanges {
+			if applied[i] {
+				continue
+			}
+			due := c.AtMS != nil && time.Since(startRun) >= time.Duration(*c.AtMS)*time.Millisecond
+			if c.AtMS == nil {
+				due = seq >= c.BeforeSeq
+			}
+			if due {
+				p.SetConfig(fault.Config{Seed: c.Seed, Rules: c.Rules})
+				applied[i] = true
+			}
+		}
+	}
+	for _, c := range t.ConfigChanges {
+		if c.AtMS == nil {
+			continue
+		}
+		at := *c.AtMS
+		go func() {
+			timer := time.NewTimer(time.Until(startRun.Add(time.Duration(at) * time.Millisecond)))
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				applyChanges(0)
+			case <-ctx.Done():
+			}
+		}()
+	}
 	for _, s := range t.Script {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -178,6 +294,12 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 				return nil, ctx.Err()
 			case <-timer.C:
 			}
+		}
+		if s.HTTP != nil || s.WS != nil {
+			if s.Seq != 0 {
+				p.SetSeq(s.Seq - 1)
+			}
+			applyChanges(p.Seq() + 1)
 		}
 		switch {
 		case s.SleepMS > 0:
@@ -200,16 +322,25 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 			for k, v := range s.HTTP.Headers {
 				req.Header.Set(k, v)
 			}
-			rule := fault.MatchRule(fault.Config{Seed: t.Seed, Rules: t.Rules}, method, req.URL.Path, p.Seq()+1, false)
+			seq := p.Seq() + 1
 			resp, e := client.Do(req)
+			transportFailure := false
 			if e == nil {
+				transportFailure = resp.Header.Get(proxy.TransportErrorHeader) != ""
 				_, e = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
 			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			if e != nil && (rule == nil || rule.Fault.Type != "tcp-rst") {
+			o := getOutcome(seq)
+			if o.Err != nil {
+				return nil, fmt.Errorf("step %s: %w", s.Name, o.Err)
+			}
+			if transportFailure {
+				return nil, fmt.Errorf("step %s: proxy transport failure", s.Name)
+			}
+			if e != nil && !o.Reset {
 				return nil, fmt.Errorf("step %s: %w", s.Name, e)
 			}
 		case s.WS != nil:
@@ -217,14 +348,21 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 			if e != nil {
 				return nil, fmt.Errorf("step %s: %w", s.Name, e)
 			}
-			streams = append(streams, stream)
+			streams = append(streams, streamResult{seq: p.Seq(), ticker: isDemo && strings.SplitN(s.WS.Path, "?", 2)[0] == "/ws/ticker", ch: stream})
 		}
 	}
 	for _, stream := range streams {
 		select {
-		case healthy := <-stream:
-			if !healthy {
-				broken = true
+		case e := <-stream.ch:
+			o := getOutcome(stream.seq)
+			if o.Err != nil {
+				return nil, o.Err
+			}
+			if e != nil && !o.WSFault {
+				return nil, fmt.Errorf("websocket sequence %d: %w", stream.seq, e)
+			}
+			if stream.ticker {
+				broken = e != nil
 			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -233,6 +371,14 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 	if err := p.Wait(ctx); err != nil {
 		return nil, err
 	}
+	outcomeMu.Lock()
+	for _, o := range outcomes {
+		if o.Err != nil {
+			outcomeMu.Unlock()
+			return nil, o.Err
+		}
+	}
+	outcomeMu.Unlock()
 	results := make([]Result, 0, len(t.Assertions))
 	for _, a := range t.Assertions {
 		result := Result{Name: a.Name, Failures: []string{}}
@@ -241,6 +387,10 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 		if a.Direct {
 			base = app.URL
 		}
+		seq := p.Seq() + 1
+		if !a.Direct {
+			applyChanges(seq)
+		}
 		req, e := http.NewRequestWithContext(ctx, http.MethodGet, base+a.HTTPGet, nil)
 		if e != nil {
 			return nil, e
@@ -248,6 +398,10 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 		resp, e := client.Do(req)
 		if e != nil {
 			return nil, fmt.Errorf("assertion %s: %w", a.Name, e)
+		}
+		if !a.Direct && resp.Header.Get(proxy.TransportErrorHeader) != "" {
+			resp.Body.Close()
+			return nil, fmt.Errorf("assertion %s: proxy transport failure", a.Name)
 		}
 		var body []byte
 		if len(a.JSONEq) > 0 {
@@ -262,6 +416,11 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 		if e != nil {
 			return nil, e
 		}
+		if !a.Direct {
+			if o := getOutcome(seq); o.Err != nil {
+				return nil, fmt.Errorf("assertion %s: %w", a.Name, o.Err)
+			}
+		}
 		elapsed := time.Since(start)
 		if a.ExpectStatus != 0 && resp.StatusCode != a.ExpectStatus {
 			result.Failures = append(result.Failures, fmt.Sprintf("status: expected %d, got %d", a.ExpectStatus, resp.StatusCode))
@@ -273,7 +432,16 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 			var data map[string]any
 			decoder := json.NewDecoder(bytes.NewReader(body))
 			decoder.UseNumber()
-			if e := decoder.Decode(&data); e != nil {
+			e := decoder.Decode(&data)
+			if e == nil {
+				var extra any
+				if e = decoder.Decode(&extra); e == nil {
+					e = fmt.Errorf("multiple JSON documents")
+				} else if e == io.EOF {
+					e = nil
+				}
+			}
+			if e != nil {
 				result.Failures = append(result.Failures, "invalid JSON response: "+e.Error())
 			} else {
 				if _, ok := data["ws_broken"]; ok && broken && isDemo && a.HTTPGet == "/api/state" {
@@ -286,13 +454,17 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 				sort.Strings(keys)
 				for _, k := range keys {
 					var got any = data
+					present := true
 					for _, part := range strings.Split(k, ".") {
 						m, ok := got.(map[string]any)
 						if !ok {
-							got = nil
+							present = false
 							break
 						}
-						got = m[part]
+						got, present = m[part]
+						if !present {
+							break
+						}
 					}
 					expected := a.JSONEq[k]
 					eb, _ := json.Marshal(expected)
@@ -304,7 +476,10 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 					gd := json.NewDecoder(bytes.NewReader(gb))
 					gd.UseNumber()
 					gd.Decode(&gn)
-					if !reflect.DeepEqual(en, gn) {
+					if !present || !jsonEqual(en, gn) {
+						if !present {
+							gb = []byte("<missing>")
+						}
 						result.Failures = append(result.Failures, fmt.Sprintf("%s: expected %s, got %s", k, eb, gb))
 					}
 				}
@@ -312,9 +487,57 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 		}
 		results = append(results, result)
 	}
+	if err := p.Wait(ctx); err != nil {
+		return nil, err
+	}
+	outcomeMu.Lock()
+	for _, o := range outcomes {
+		if o.Err != nil {
+			outcomeMu.Unlock()
+			return nil, o.Err
+		}
+	}
+	outcomeMu.Unlock()
 	return results, nil
 }
-func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan bool, error) {
+func jsonEqual(a, b any) bool {
+	if x, ok := a.(json.Number); ok {
+		y, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		xr, xok := new(big.Rat).SetString(string(x))
+		yr, yok := new(big.Rat).SetString(string(y))
+		return xok && yok && xr.Cmp(yr) == 0
+	}
+	if x, ok := a.([]any); ok {
+		y, ok := b.([]any)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !jsonEqual(x[i], y[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	if x, ok := a.(map[string]any); ok {
+		y, ok := b.(map[string]any)
+		if !ok || len(x) != len(y) {
+			return false
+		}
+		for k, v := range x {
+			z, ok := y[k]
+			if !ok || !jsonEqual(v, z) {
+				return false
+			}
+		}
+		return true
+	}
+	return reflect.DeepEqual(a, b)
+}
+func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan error, error) {
 	u, err := url.Parse(base)
 	if err != nil {
 		return nil, err
@@ -325,10 +548,13 @@ func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan bool, 
 		return nil, err
 	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	fail := func(e error) (<-chan bool, error) { stop(); conn.Close(); return nil, e }
+	fail := func(e error) (<-chan error, error) { stop(); conn.Close(); return nil, e }
 	timeout := time.Duration(w.TimeoutMS) * time.Millisecond
 	if timeout == 0 {
-		timeout = 3 * time.Second
+		timeout = 2500 * time.Millisecond
+	}
+	if isDemo && strings.SplitN(w.Path, "?", 2)[0] == "/ws/ticker" && timeout > 2500*time.Millisecond {
+		timeout = 2500 * time.Millisecond
 	}
 	setDeadline := func() {
 		deadline := time.Now().Add(timeout)
@@ -338,7 +564,11 @@ func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan bool, 
 		conn.SetDeadline(deadline)
 	}
 	setDeadline()
-	key := base64.StdEncoding.EncodeToString([]byte("glitchdeck-wskey"))
+	var nonce [16]byte
+	if _, err = rand.Read(nonce[:]); err != nil {
+		return fail(err)
+	}
+	key := base64.StdEncoding.EncodeToString(nonce[:])
 	if _, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\n\r\n", w.Path, u.Host, key); err != nil {
 		return fail(err)
 	}
@@ -356,36 +586,67 @@ func startWS(ctx context.Context, base string, w WS, isDemo bool) (<-chan bool, 
 			return fail(err)
 		}
 	}
-	result := make(chan bool, 1)
+	result := make(chan error, 1)
 	go func() {
 		defer conn.Close()
 		defer stop()
-		healthy := false
-		defer func() { result <- healthy }()
+		var failure error
+		defer func() { result <- failure }()
 		count := w.Frames
 		if count == 0 {
 			count = 3
 		}
+		isTicker := isDemo && strings.SplitN(w.Path, "?", 2)[0] == "/ws/ticker"
 		setDeadline()
+		var message []byte
+		var opcode byte
 		for i := 0; i < count; {
 			frame, e := wsframe.Read(reader, false)
-			if e != nil || frame.Opcode == 8 {
+			if e != nil {
+				failure = e
+				return
+			}
+			if frame.Opcode == 8 {
+				failure = fmt.Errorf("websocket closed before requested messages")
 				return
 			}
 			switch frame.Opcode {
-			case 1, 2:
-				if isDemo && strings.SplitN(w.Path, "?", 2)[0] == "/ws/ticker" && (frame.Opcode != 1 || !json.Valid(frame.Payload)) {
+			case 1, 2, 0:
+				if frame.Opcode != 0 {
+					if opcode != 0 {
+						failure = fmt.Errorf("interleaved websocket messages")
+						return
+					}
+					opcode = frame.Opcode
+				} else if opcode == 0 {
+					failure = fmt.Errorf("unexpected continuation")
 					return
 				}
+				if len(message)+len(frame.Payload) > wsframe.MaxPayload {
+					failure = fmt.Errorf("websocket message too large")
+					return
+				}
+				if isTicker {
+					message = append(message, frame.Payload...)
+				}
+				if !frame.Fin {
+					continue
+				}
+				if isTicker && (opcode != 1 || !json.Valid(message)) {
+					failure = fmt.Errorf("invalid ticker message")
+					return
+				}
+				message = nil
+				opcode = 0
 				i++
 				setDeadline()
 			case 9:
-				if wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 10, Payload: frame.Payload}, true) != nil {
+				if e := wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 10, Payload: frame.Payload}, true); e != nil {
+					failure = e
 					return
 				}
 			}
 		}
-		healthy = true
 	}()
 	return result, nil
 }

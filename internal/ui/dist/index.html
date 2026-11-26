@@ -1,20 +1,185 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Glitchdeck · Local resilience console</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/style.css"><script type="module" src="/app.mjs"></script></head>
-<body>
-<header class="topbar">
-  <h1>GLITCH<span>DECK</span><small> / RESILIENCE CONSOLE</small></h1>
-  <div class="connection"><i></i><span id="connection">CONNECTING</span><span id="route"></span></div><span id="demo-badge" class="badge" hidden>DEMO</span>
-  <div class="transport" aria-label="Tape transport"><button id="rec-button" data-testid="rec-button" aria-label="REC"><i class="rec-dot" aria-hidden="true"></i><span>REC</span></button><button id="stop-button" data-testid="stop-button" aria-label="STOP" disabled>■ <span>STOP</span></button><a id="export-button" data-testid="export-button" class="button disabled" href="/api/tape/export" download="tape.yaml" aria-label="EXPORT TAPE" aria-disabled="true">↓ <span>EXPORT TAPE</span></a></div>
-  <div class="tape-counter" id="tape-counter">00:00 · 0 EVENTS</div><button id="copy-cli" class="copy">COPY CLI <span>↗</span></button>
-</header>
-<div id="disconnect" class="disconnect" hidden>TELEMETRY DISCONNECTED <button id="reconnect">RECONNECT</button></div>
-<main>
-  <section class="scope-panel" aria-labelledby="scope-title"><div class="section-head"><h2 id="scope-title">01 / LIVE SIGNAL <span>OSCILLOSCOPE</span></h2><span>30 SEC WINDOW &nbsp; · &nbsp; LIVE TELEMETRY</span></div><div class="scope-body"><div class="crt"><canvas id="scope" role="img" aria-label="Live oscilloscope awaiting traffic"></canvas></div><div class="readouts"><div><span>P50 LATENCY</span><strong id="p50">— <small>ms</small></strong></div><div><span>P95 LATENCY</span><strong id="p95">— <small>ms</small></strong></div><div class="readout-pair"><div><span>REQ / S</span><b id="req-rate">0.0</b></div><div><span>WS / S</span><b id="ws-rate">0.0</b></div></div><div><span>FAULTS FIRED</span><strong id="fault-count">0</strong></div></div></div></section>
-  <div class="preset-bar"><span>SCENARIOS</span><button data-testid="preset-double-charge" data-preset="0">01 <b>DOUBLE-CHARGE WEBHOOK</b></button><button data-testid="preset-retry-storm" data-preset="1">02 <b>429 RETRY STORM</b></button><button data-testid="preset-ws-drop" data-preset="2">03 <b>SILENT WS DROP 1006</b></button><button id="bypass">BYPASS ALL</button></div>
-  <div class="tabs" role="tablist" aria-label="Console view"><button role="tab" id="tab-rack" data-testid="tab-rack" aria-selected="true" aria-controls="rack-panel">FAULT RACK <span>06</span></button><button role="tab" id="tab-demo" data-testid="tab-demo" aria-selected="false" aria-controls="inspector-panel" tabindex="-1">DEMO &amp; WIRE LOG <span id="alert-count" aria-label="1 alert" hidden>1</span></button></div>
-  <div class="deck"><section id="rack-panel" class="rack panel" role="tabpanel" aria-labelledby="tab-rack"><div class="section-head"><h2>02 / FAULT RACK <span>MODULAR BAY</span></h2><span>6 MODULES &nbsp; · &nbsp; LIVE CONFIG</span></div><div id="modules" class="modules"></div></section>
-  <section id="inspector-panel" class="inspector panel" role="tabpanel" aria-labelledby="tab-demo"><div id="demo-pane"><div class="section-head"><h2>03 / DEMO TARGET <span>CHECKOUT &amp; TICKER</span></h2><button id="run-checkout" data-testid="run-checkout">SEND CHECKOUT ↗</button></div><div id="double-charge-banner" data-testid="double-charge-banner" class="alert" role="alert" hidden></div><div class="demo-grid"><div><div class="micro">PAYMENT LEDGER <span id="ledger-total">$0.00 TOTAL</span></div><ul id="ledger"><li class="muted">No charges yet</li></ul></div><div class="ticker"><div class="micro">WS TICKER <span id="ticker-status">DISCONNECTED</span></div><strong id="ticker-value">—</strong><div id="ticker-meta" class="muted">Awaiting connection</div><button id="connect-ticker" data-testid="connect-ticker">CONNECT TICKER</button></div></div></div>
-  <div class="wire"><div class="section-head"><h2>04 / WIRE INSPECTOR <span>LIVE EVENT LOG</span></h2><button id="clear-log">CLEAR</button></div><div class="filters" aria-label="Wire log filters"><button data-filter="all" aria-pressed="true">ALL</button><button data-filter="http" aria-pressed="false">HTTP</button><button data-filter="ws" aria-pressed="false">WS</button><button data-filter="fault" aria-pressed="false">FAULTS</button><span id="event-count">0 EVENTS</span></div><div id="wire-log" class="wire-log"><p class="empty">AWAITING TRAFFIC</p></div></div></section></div>
-</main><div id="notice" role="status" class="notice"></div>
-</body></html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Glitchdeck · Local resilience console</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/app.mjs"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>GLITCH<span>DECK</span><small> / RESILIENCE CONSOLE</small></h1>
+      <div class="connection">
+        <i></i><span id="connection">CONNECTING</span><span id="route"></span>
+      </div>
+      <span id="demo-badge" class="badge" hidden>DEMO</span>
+      <div class="transport" aria-label="Tape transport">
+        <button id="rec-button" data-testid="rec-button" aria-label="REC">
+          <i class="rec-dot" aria-hidden="true"></i><span>REC</span></button
+        ><button
+          id="stop-button"
+          data-testid="stop-button"
+          aria-label="STOP"
+          disabled
+        >
+          ■ <span>STOP</span></button
+        ><a
+          id="export-button"
+          data-testid="export-button"
+          class="button disabled"
+          href="/api/tape/export"
+          download="tape.yaml"
+          aria-label="EXPORT TAPE"
+          aria-disabled="true"
+          >↓ <span>EXPORT TAPE</span></a
+        >
+      </div>
+      <div class="tape-counter" id="tape-counter">00:00 · 0 EVENTS</div>
+      <button id="copy-cli" class="copy">COPY CLI <span>↗</span></button>
+    </header>
+    <div id="disconnect" class="disconnect" hidden>
+      TELEMETRY DISCONNECTED <button id="reconnect">RECONNECT</button>
+    </div>
+    <main>
+      <section class="scope-panel" aria-labelledby="scope-title">
+        <div class="section-head">
+          <h2 id="scope-title">01 / LIVE SIGNAL <span>OSCILLOSCOPE</span></h2>
+          <span>30 SEC WINDOW &nbsp; · &nbsp; LIVE TELEMETRY</span>
+        </div>
+        <div class="scope-body">
+          <div class="crt">
+            <canvas
+              id="scope"
+              role="img"
+              aria-label="Live oscilloscope awaiting traffic"
+            ></canvas>
+          </div>
+          <div class="readouts">
+            <div>
+              <span>P50 LATENCY</span
+              ><strong id="p50">— <small>ms</small></strong>
+            </div>
+            <div>
+              <span>P95 LATENCY</span
+              ><strong id="p95">— <small>ms</small></strong>
+            </div>
+            <div class="readout-pair">
+              <div><span>REQ / S</span><b id="req-rate">0.0</b></div>
+              <div><span>WS / S</span><b id="ws-rate">0.0</b></div>
+            </div>
+            <div>
+              <span>FAULTS FIRED</span><strong id="fault-count">0</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+      <div class="preset-bar">
+        <span>SCENARIOS</span
+        ><button data-testid="preset-double-charge" data-preset="0">
+          01 <b>DOUBLE-CHARGE WEBHOOK</b></button
+        ><button data-testid="preset-retry-storm" data-preset="1">
+          02 <b>429 RETRY STORM</b></button
+        ><button data-testid="preset-ws-drop" data-preset="2">
+          03 <b>SILENT WS DROP 1006</b></button
+        ><button id="bypass">BYPASS ALL</button>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Console view">
+        <button
+          role="tab"
+          id="tab-rack"
+          data-testid="tab-rack"
+          aria-selected="true"
+          aria-controls="rack-panel"
+        >
+          FAULT RACK <span>06</span></button
+        ><button
+          role="tab"
+          id="tab-demo"
+          data-testid="tab-demo"
+          aria-selected="false"
+          aria-controls="inspector-panel"
+          tabindex="-1"
+        >
+          DEMO &amp; WIRE LOG
+          <span id="alert-count" aria-label="1 alert" hidden>1</span>
+        </button>
+      </div>
+      <div class="deck">
+        <section
+          id="rack-panel"
+          class="rack panel"
+          role="tabpanel"
+          aria-labelledby="tab-rack"
+        >
+          <div class="section-head">
+            <h2>02 / FAULT RACK <span>MODULAR BAY</span></h2>
+            <span>6 MODULES &nbsp; · &nbsp; LIVE CONFIG</span>
+          </div>
+          <div id="modules" class="modules"></div>
+        </section>
+        <section
+          id="inspector-panel"
+          class="inspector panel"
+          role="tabpanel"
+          aria-labelledby="tab-demo"
+        >
+          <div id="demo-pane">
+            <div class="section-head">
+              <h2>03 / DEMO TARGET <span>CHECKOUT &amp; TICKER</span></h2>
+              <button id="run-checkout" data-testid="run-checkout">
+                SEND CHECKOUT ↗
+              </button>
+            </div>
+            <div
+              id="double-charge-banner"
+              data-testid="double-charge-banner"
+              class="alert"
+              role="alert"
+              hidden
+            ></div>
+            <div class="demo-grid">
+              <div>
+                <div class="micro">
+                  PAYMENT LEDGER <span id="ledger-total">$0.00 TOTAL</span>
+                </div>
+                <ul id="ledger">
+                  <li class="muted">No charges yet</li>
+                </ul>
+              </div>
+              <div class="ticker">
+                <div class="micro">
+                  WS TICKER <span id="ticker-status">DISCONNECTED</span>
+                </div>
+                <strong id="ticker-value">—</strong>
+                <div id="ticker-meta" class="muted">Awaiting connection</div>
+                <button id="connect-ticker" data-testid="connect-ticker">
+                  CONNECT TICKER
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="wire">
+            <div class="section-head">
+              <h2>04 / WIRE INSPECTOR <span>LIVE EVENT LOG</span></h2>
+              <button id="clear-log">CLEAR</button>
+            </div>
+            <div class="filters" aria-label="Wire log filters">
+              <button data-filter="all" aria-pressed="true">ALL</button
+              ><button data-filter="http" aria-pressed="false">HTTP</button
+              ><button data-filter="ws" aria-pressed="false">WS</button
+              ><button data-filter="fault" aria-pressed="false">FAULTS</button
+              ><span id="event-count">0 EVENTS</span>
+            </div>
+            <div id="wire-log" class="wire-log">
+              <p class="empty">AWAITING TRAFFIC</p>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+    <div id="tape-warning" role="status" class="tape-warning"></div>
+    <div id="notice" role="status" class="notice"></div>
+  </body>
+</html>

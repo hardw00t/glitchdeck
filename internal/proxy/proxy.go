@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -21,30 +22,44 @@ import (
 )
 
 const maxBody = 4 << 20
+const TransportErrorHeader = "X-Glitchdeck-Transport-Error"
+
+type Outcome struct {
+	Seq     uint64
+	Reset   bool
+	WSFault bool
+	Err     error
+}
 
 type Record struct {
-	Seq          uint64
-	Method, Path string
-	Header       http.Header
-	Body         []byte
-	WebSocket    bool
-	At           time.Time
+	Seq              uint64
+	Method, Path     string
+	Header           http.Header
+	Body             []byte
+	WebSocket        bool
+	At               time.Time
+	UnrecordableBody bool
 }
 type Proxy struct {
-	target        *url.URL
-	cfg           atomic.Pointer[fault.Config]
-	seq           atomic.Uint64
-	bus           *telemetry.Bus
-	transport     *http.Transport
-	mu            sync.Mutex
-	ctx           context.Context
-	cancel        context.CancelFunc
-	pending       int
-	done          chan struct{}
-	closed        bool
-	OnRequest     func(Record)
-	OnClientFrame func(uint64, []byte)
-	OnServerFrame func(uint64, string, byte)
+	target             *url.URL
+	cfg                atomic.Pointer[fault.Config]
+	seq                atomic.Uint64
+	bus                *telemetry.Bus
+	transport          *http.Transport
+	gate               sync.Mutex
+	generation         uint64
+	activeWS           int
+	mu                 sync.Mutex
+	ctx                context.Context
+	cancel             context.CancelFunc
+	pending            int
+	done               chan struct{}
+	closed             bool
+	OnRequest          func(Record)
+	OnClientFrame      func(uint64, []byte)
+	OnServerFrame      func(uint64, string, byte)
+	OnUnsupportedFrame func(uint64)
+	OnOutcome          func(Outcome)
 }
 
 func ParseTarget(s string) (*url.URL, error) {
@@ -53,7 +68,7 @@ func ParseTarget(s string) (*url.URL, error) {
 		return nil, errors.New("target must be a loopback HTTP URL")
 	}
 	h := strings.ToLower(u.Hostname())
-	if h != "localhost" && h != "127.0.0.1" {
+	if h != "localhost" && (net.ParseIP(h) == nil || !net.ParseIP(h).IsLoopback()) {
 		return nil, errors.New("target must be loopback")
 	}
 	if u.Port() != "" {
@@ -70,11 +85,7 @@ func New(target *url.URL, cfg fault.Config, bus *telemetry.Bus) *Proxy {
 	p := &Proxy{target: &u, bus: bus, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	close(p.done)
 	p.transport = &http.Transport{DisableCompression: true, ForceAttemptHTTP2: false, DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-		_, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", port))
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}}
 	p.SetConfig(cfg)
 	return p
@@ -86,12 +97,30 @@ func cloneConfig(c fault.Config) fault.Config {
 	return out
 }
 func (p *Proxy) Config() fault.Config     { return cloneConfig(*p.cfg.Load()) }
-func (p *Proxy) SetConfig(c fault.Config) { c = cloneConfig(c); p.cfg.Store(&c) }
-func (p *Proxy) Seq() uint64              { return p.seq.Load() }
-func (p *Proxy) SetSeq(n uint64)          { p.seq.Store(n) }
-func (p *Proxy) Reset() {
+func (p *Proxy) SetConfig(c fault.Config) { p.SetConfigAt(c) }
+func (p *Proxy) SetConfigAt(c fault.Config) uint64 {
+	c = cloneConfig(c)
+	p.gate.Lock()
+	defer p.gate.Unlock()
+	p.cfg.Store(&c)
+	return p.seq.Load() + 1
+}
+func (p *Proxy) Seq() uint64           { return p.seq.Load() }
+func (p *Proxy) SetSeq(n uint64)       { p.gate.Lock(); p.seq.Store(n); p.gate.Unlock() }
+func (p *Proxy) ActiveWebSockets() int { p.gate.Lock(); defer p.gate.Unlock(); return p.activeWS }
+func (p *Proxy) CaptureBoundary(fn func(uint64, int)) {
+	p.gate.Lock()
+	defer p.gate.Unlock()
+	fn(p.seq.Load()+1, p.activeWS)
+}
+func (p *Proxy) Reset() { p.ResetWith(nil) }
+func (p *Proxy) ResetWith(fn func()) {
+	p.gate.Lock()
+	defer p.gate.Unlock()
 	p.mu.Lock()
 	p.cancel()
+	p.generation++
+	p.activeWS = 0
 	p.mu.Unlock()
 	_ = p.Wait(context.Background())
 	p.mu.Lock()
@@ -100,6 +129,9 @@ func (p *Proxy) Reset() {
 	}
 	p.seq.Store(0)
 	p.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 func (p *Proxy) Close() {
 	p.mu.Lock()
@@ -119,9 +151,25 @@ func (p *Proxy) Wait(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-func (p *Proxy) publish(kind string, v any) {
-	if p.bus != nil {
+func (p *Proxy) publish(gen uint64, kind string, v any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if gen == p.generation && p.bus != nil {
 		p.bus.Publish(kind, v)
+	}
+}
+func (p *Proxy) outcome(gen uint64, o Outcome) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if gen == p.generation && p.OnOutcome != nil {
+		p.OnOutcome(o)
+	}
+}
+func (p *Proxy) callback(gen uint64, fn func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if gen == p.generation {
+		fn()
 	}
 }
 func (p *Proxy) upstream(r *http.Request, body []byte, ctx context.Context) *http.Request {
@@ -144,21 +192,38 @@ func (p *Proxy) upstream(r *http.Request, body []byte, ctx context.Context) *htt
 }
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	p.gate.Lock()
+	p.mu.Lock()
+	ctx, gen, closed := p.ctx, p.generation, p.closed
+	p.mu.Unlock()
+	if closed || ctx.Err() != nil {
+		p.gate.Unlock()
+		http.Error(w, "proxy closed", 503)
+		return
+	}
 	seq := p.seq.Add(1)
 	cfg := *p.cfg.Load()
 	ws := strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody+1))
-	if err != nil || len(body) > maxBody {
-		http.Error(w, "request body too large or unreadable", http.StatusRequestEntityTooLarge)
-		return
-	}
-	if p.OnRequest != nil {
-		p.OnRequest(Record{seq, r.Method, r.URL.RequestURI(), r.Header, body, ws, start})
-	}
 	if ws {
-		p.serveWS(w, r, seq)
-		return
+		p.activeWS++
 	}
+	p.gate.Unlock()
+	if ws {
+		defer func() {
+			p.gate.Lock()
+			p.mu.Lock()
+			if gen == p.generation {
+				p.activeWS--
+			}
+			p.mu.Unlock()
+			p.gate.Unlock()
+		}()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(r.Context(), cancel)
+	defer stop()
+	defer cancel()
+	r = r.WithContext(ctx)
 	rule := fault.MatchRule(cfg, r.Method, r.URL.Path, seq, false)
 	var kind string
 	var params map[string]any
@@ -166,15 +231,47 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		kind, params = rule.Fault.Type, rule.Fault.Params
 	}
 	status, n := 0, int64(0)
+	var body []byte
 	var upstreamHeaders http.Header
-	defer func() {
-		p.publish("http_req", map[string]any{
-			"seq": seq, "ts_ms": start.UnixMilli(), "method": r.Method, "path": r.URL.RequestURI(),
-			"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n,
-			"fault": kind, "replay_index": 0, "request_headers": inspectorHeaders(r.Header),
-			"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": string(body[:min(len(body), 256)]),
+	if !ws {
+		defer func() {
+			p.publish(gen, "http_req", map[string]any{
+				"seq": seq, "ts_ms": start.UnixMilli(), "method": r.Method, "path": r.URL.RequestURI(),
+				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n,
+				"fault": kind, "replay_index": 0, "request_headers": inspectorHeaders(r.Header),
+				"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": string(body[:min(len(body), 256)]),
+			})
+		}()
+	}
+	if !ws && kind == "tcp-rst" && fault.Bool(params, "before_headers", false) {
+		if p.OnRequest != nil {
+			p.callback(gen, func() {
+				p.OnRequest(Record{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header, At: start})
+			})
+		}
+		resetWriter(w, func() { p.outcome(gen, Outcome{Seq: seq, Reset: true}) })
+		return
+	}
+	buffered := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch
+	if buffered {
+		var err error
+		body, err = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+		if err != nil || len(body) > maxBody {
+			body = nil
+			status = http.StatusRequestEntityTooLarge
+			http.Error(w, "request body too large or unreadable", status)
+			return
+		}
+	}
+	if p.OnRequest != nil {
+		p.callback(gen, func() {
+			p.OnRequest(Record{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header, Body: body, WebSocket: ws, At: start, UnrecordableBody: !buffered && r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0})
 		})
-	}()
+	}
+	if ws {
+		p.serveWS(w, r, seq, gen)
+		return
+	}
 	if kind == "rate-limit" {
 		status = fault.Int(params, "status", 429)
 		w.Header().Set("Retry-After", strconv.Itoa(fault.Int(params, "retry_after_sec", 5)))
@@ -185,36 +282,64 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n = int64(count)
 		return
 	}
-	if kind == "latency-wave" && !wait(r.Context(), time.Duration(fault.Latency(cfg.Seed, seq, params))*time.Millisecond) {
+	if kind == "latency-wave" && !wait(ctx, time.Duration(fault.Latency(cfg.Seed, seq, params))*time.Millisecond) {
 		return
 	}
-	if kind == "tcp-rst" && fault.Bool(params, "before_headers", false) {
-		resetWriter(w)
-		return
+	q := p.upstream(r, body, ctx)
+	if !buffered {
+		q.Body, q.ContentLength = r.Body, r.ContentLength
 	}
-	resp, err := p.transport.RoundTrip(p.upstream(r, body, r.Context()))
+	resp, err := p.transport.RoundTrip(q)
 	if err != nil {
+		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		status = 502
+		w.Header().Set(TransportErrorHeader, "1")
 		http.Error(w, "upstream unavailable", status)
 		return
 	}
 	defer resp.Body.Close()
+	resp.Header.Del(TransportErrorHeader)
 	status, upstreamHeaders = resp.StatusCode, resp.Header
 	if kind == "dup-webhook" {
-		p.replays(r, body, seq, params)
+		if buffered || r.Body == nil || r.Body == http.NoBody {
+			p.replays(r, body, seq, gen, params)
+		} else {
+			err := errors.New("cannot replay streamed request body")
+			p.outcome(gen, Outcome{Seq: seq, Err: err})
+			p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": "dup-webhook", "error": err.Error()})
+		}
 	}
 	if kind == "tcp-rst" {
-		n = p.resetResponse(w, resp, fault.Int(params, "after_bytes", 0))
+		n = resetResponse(w, resp, fault.Int(params, "after_bytes", 0), cancel, func(err error) {
+			p.outcome(gen, Outcome{Seq: seq, Reset: err == nil, Err: err})
+		})
 		return
 	}
+	stream := resp.ContentLength < 0 || strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 	stripHop(resp.Header)
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(status)
 	if kind == "byte-trickle" {
-		n = trickle(r.Context(), w, resp.Body, params)
-		return
+		n, err = trickle(ctx, w, resp.Body, params)
+	} else if stream {
+		n, err = io.Copy(flushWriter{w}, resp.Body)
+	} else {
+		n, err = io.Copy(w, resp.Body)
 	}
-	n, _ = io.Copy(w, resp.Body)
+	if err != nil {
+		p.outcome(gen, Outcome{Seq: seq, Err: err})
+		panic(http.ErrAbortHandler)
+	}
+}
+
+type flushWriter struct{ http.ResponseWriter }
+
+func (w flushWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+	return n, err
 }
 
 func inspectorHeaders(h http.Header) map[string]string {
@@ -267,7 +392,7 @@ func headerToken(h http.Header, key, token string) bool {
 	}
 	return false
 }
-func trickle(ctx context.Context, w http.ResponseWriter, body io.Reader, params map[string]any) int64 {
+func trickle(ctx context.Context, w http.ResponseWriter, body io.Reader, params map[string]any) (int64, error) {
 	size := fault.Int(params, "chunk_bytes", 128)
 	if size > 64<<10 {
 		size = 64 << 10
@@ -280,7 +405,7 @@ func trickle(ctx context.Context, w http.ResponseWriter, body io.Reader, params 
 		n, err := body.Read(buf)
 		if n > 0 {
 			if !wait(ctx, time.Duration(float64(time.Second)*float64(n)/float64(rate))) {
-				break
+				return total, ctx.Err()
 			}
 			k, e := w.Write(buf[:n])
 			total += int64(k)
@@ -288,20 +413,22 @@ func trickle(ctx context.Context, w http.ResponseWriter, body io.Reader, params 
 				f.Flush()
 			}
 			if e != nil {
-				break
+				return total, e
 			}
 			if !stalled && fault.Int(params, "stall_after_bytes", 0) > 0 && total >= int64(fault.Int(params, "stall_after_bytes", 0)) {
 				stalled = true
 				if !wait(ctx, time.Duration(fault.Int(params, "stall_ms", 0))*time.Millisecond) {
-					break
+					return total, ctx.Err()
 				}
 			}
 		}
+		if err == io.EOF {
+			return total, nil
+		}
 		if err != nil {
-			break
+			return total, err
 		}
 	}
-	return total
 }
 func rst(c net.Conn) {
 	if t, ok := c.(interface{ SetLinger(int) error }); ok {
@@ -309,7 +436,7 @@ func rst(c net.Conn) {
 	}
 	_ = c.Close()
 }
-func resetWriter(w http.ResponseWriter) {
+func resetWriter(w http.ResponseWriter, injected func()) {
 	h, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking unavailable", 500)
@@ -317,10 +444,11 @@ func resetWriter(w http.ResponseWriter) {
 	}
 	c, _, err := h.Hijack()
 	if err == nil {
+		injected()
 		rst(c)
 	}
 }
-func (p *Proxy) resetResponse(w http.ResponseWriter, resp *http.Response, n int) int64 {
+func resetResponse(w http.ResponseWriter, resp *http.Response, n int, cancel context.CancelFunc, result func(error)) int64 {
 	h, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking unavailable", 500)
@@ -330,29 +458,49 @@ func (p *Proxy) resetResponse(w http.ResponseWriter, resp *http.Response, n int)
 	if err != nil {
 		return 0
 	}
+	defer rst(c)
+	_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	timer := time.AfterFunc(2*time.Second, cancel)
+	defer timer.Stop()
 	stripHop(resp.Header)
+	var writer io.Writer = b
+	if resp.Body != http.NoBody && (resp.ContentLength < 0 || int64(n) >= resp.ContentLength) {
+		resp.Header.Del("Content-Length")
+		resp.Header.Set("Transfer-Encoding", "chunked")
+		writer = httputil.NewChunkedWriter(b)
+	}
 	resp.Header.Set("Connection", "close")
 	_, _ = fmt.Fprintf(b, "HTTP/1.1 %s\r\n", resp.Status)
 	_ = resp.Header.Write(b)
 	_, _ = b.WriteString("\r\n")
-	count, _ := io.CopyN(b, resp.Body, int64(n))
-	_ = b.Flush()
-	rst(c)
+	count, copyErr := io.CopyN(writer, resp.Body, int64(n))
+	if copyErr == io.EOF {
+		copyErr = nil
+	}
+	if flushErr := b.Flush(); copyErr == nil {
+		copyErr = flushErr
+	}
+	result(copyErr)
 	return count
 }
-func (p *Proxy) replays(r *http.Request, body []byte, seq uint64, params map[string]any) {
+func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, params map[string]any) {
 	count := fault.Int(params, "count", 2)
 	delay := fault.Int(params, "delay_ms", 150)
 	p.mu.Lock()
-	if p.closed || p.ctx.Err() != nil {
+	if p.closed || p.ctx.Err() != nil || gen != p.generation {
 		p.mu.Unlock()
 		return
 	}
 	ctx := p.ctx
-	if count > 1 && p.pending == 0 {
-		p.done = make(chan struct{})
-	}
+	overloaded := false
 	for i := 1; i < count; i++ {
+		if p.pending >= 64 {
+			overloaded = true
+			break
+		}
+		if p.pending == 0 {
+			p.done = make(chan struct{})
+		}
 		p.pending++
 		q := p.upstream(r, body, ctx)
 		if fault.Bool(params, "replay_header", false) {
@@ -367,20 +515,33 @@ func (p *Proxy) replays(r *http.Request, body []byte, seq uint64, params map[str
 				}
 				p.mu.Unlock()
 			}()
-			if !wait(ctx, time.Duration(index)*time.Duration(delay)*time.Millisecond) {
+			replayCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if !wait(replayCtx, time.Duration(index)*time.Duration(delay)*time.Millisecond) {
+				if ctx.Err() == nil {
+					p.outcome(gen, Outcome{Seq: seq, Err: replayCtx.Err()})
+				}
 				return
 			}
 			start := time.Now()
-			resp, err := p.transport.RoundTrip(q)
+			resp, err := p.transport.RoundTrip(q.WithContext(replayCtx))
 			status := 0
 			var n int64
 			if err == nil {
 				status = resp.StatusCode
-				n, _ = io.Copy(io.Discard, resp.Body)
+				n, err = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
 			}
-			p.publish("http_req", map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "replay_index": index})
+			if err != nil && ctx.Err() == nil {
+				p.outcome(gen, Outcome{Seq: seq, Err: err})
+			}
+			p.publish(gen, "http_req", map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "replay_index": index})
 		}(i)
 	}
 	p.mu.Unlock()
+	if overloaded {
+		err := errors.New("webhook replay capacity exceeded")
+		p.outcome(gen, Outcome{Seq: seq, Err: err})
+		p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": "dup-webhook", "error": err.Error()})
+	}
 }

@@ -47,6 +47,12 @@ The second command prints `duplicate_charges: expected 0, got 1`. A tape contain
 
 Use `--timeout`, `--target`, or `--json` to set the run deadline, override the tape's target, or emit structured results.
 
+### Known limitations
+
+- HTTP request and response trailers are not forwarded.
+- Tape playback runs HTTP steps serially. It preserves sequence numbers and start offsets, but does not reproduce overlap between concurrent HTTP requests.
+- Full WebSocket UTF-8 validation across fragments is not implemented. Recordings that cannot be replayed faithfully, including binary or fragmented WebSocket traffic and connections already open at **REC**, show a warning and exit `2` in CI.
+
 ## Console screenshots
 
 - [Desktop: fault detonation](docs/screenshots/desktop-1440-demo-detonation.png)

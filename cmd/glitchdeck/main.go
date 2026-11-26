@@ -11,12 +11,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"glitchdeck/internal/demo"
 	"glitchdeck/internal/fault"
+	"glitchdeck/internal/localweb"
 	"glitchdeck/internal/proxy"
 	"glitchdeck/internal/tape"
 	"glitchdeck/internal/telemetry"
@@ -102,9 +104,7 @@ func testTape(args []string) int {
 			if len(r.Failures) == 0 {
 				fmt.Printf("PASS %s\n", r.Name)
 			} else {
-				for _, failure := range r.Failures {
-					fmt.Printf("FAIL %s: %s\n", r.Name, failure)
-				}
+				fmt.Printf("FAIL %s: %s\n", r.Name, strings.Join(r.Failures, "; "))
 			}
 		}
 	}
@@ -134,18 +134,23 @@ func serve(args []string, isDemo bool) int {
 	var appListener net.Listener
 	var err error
 	if isDemo {
+		host, port, e := net.SplitHostPort(*app)
+		n, portErr := strconv.Atoi(port)
+		if e != nil || portErr != nil || n < 0 || n > 65535 {
+			fmt.Fprintln(os.Stderr, "invalid demo listener")
+			return 2
+		}
+		if _, e = proxy.ParseTarget("http://" + net.JoinHostPort(host, "1")); e != nil {
+			fmt.Fprintln(os.Stderr, e)
+			return 2
+		}
 		appListener, err = net.Listen("tcp", *app)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 2
 		}
 		defer appListener.Close()
-		_, port, e := net.SplitHostPort(appListener.Addr().String())
-		if e != nil {
-			fmt.Fprintln(os.Stderr, e)
-			return 2
-		}
-		*target = "http://127.0.0.1:" + port
+		*target = "http://" + appListener.Addr().String()
 	}
 	u, err := proxy.ParseTarget(*target)
 	if err != nil {
@@ -190,7 +195,21 @@ func serve(args []string, isDemo bool) int {
 		demoURL = *target
 	}
 	handler := ui.New(p, bus, ui.Options{Target: *target, Listen: pl.Addr().String(), UI: ul.Addr().String(), DemoURL: demoURL})
-	servers := []*http.Server{{Handler: p}, {Handler: handler}}
+	var proxyHandler http.Handler = p
+	if isDemo {
+		proxyHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !localweb.Allowed(r, pl.Addr().String()) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			if r.Method != http.MethodGet && r.Method != http.MethodHead {
+				r = r.Clone(r.Context())
+				r.Header.Del("Origin")
+			}
+			p.ServeHTTP(w, r)
+		})
+	}
+	servers := []*http.Server{{Handler: proxyHandler}, {Handler: handler}}
 	listeners := []net.Listener{pl, ul}
 	if isDemo {
 		servers = append(servers, &http.Server{Handler: demo.New()})

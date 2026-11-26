@@ -1,6 +1,7 @@
 package demo
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"glitchdeck/internal/localweb"
 	"glitchdeck/internal/wsframe"
 )
 
@@ -31,7 +33,13 @@ func New() http.Handler {
 	mux.HandleFunc("/api/state", s.state)
 	mux.HandleFunc("/api/reset", s.reset)
 	mux.HandleFunc("/ws/ticker", s.ticker)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !localweb.Allowed(r, "") {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 func (s *service) charge(e entry) {
 	for _, old := range s.charges {
@@ -119,7 +127,16 @@ func (s *service) reset(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 func (s *service) ticker(w http.ResponseWriter, r *http.Request) {
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || r.Header.Get("Sec-WebSocket-Key") == "" {
+	key, err := base64.StdEncoding.DecodeString(r.Header.Get("Sec-WebSocket-Key"))
+	connectionUpgrade := false
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				connectionUpgrade = true
+			}
+		}
+	}
+	if r.Method != http.MethodGet || !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") || !connectionUpgrade || r.Header.Get("Sec-WebSocket-Version") != "13" || err != nil || len(key) != 16 {
 		http.Error(w, "websocket required", 400)
 		return
 	}
@@ -133,20 +150,73 @@ func (s *service) ticker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
 	if rw.Flush() != nil {
 		return
 	}
+	frames := make(chan wsframe.Frame, 1)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		defer close(frames)
+		for {
+			frame, err := wsframe.Read(rw.Reader, true)
+			if err != nil {
+				return
+			}
+			if frame.Opcode == 8 || frame.Opcode == 9 {
+				select {
+				case frames <- frame:
+				case <-stop:
+					return
+				}
+				if frame.Opcode == 8 {
+					return
+				}
+			}
+		}
+	}()
+	write := func(frame wsframe.Frame) bool {
+		_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+		return wsframe.Write(conn, frame, false) == nil
+	}
+	control := func(frame wsframe.Frame, ok bool) bool {
+		if !ok {
+			return false
+		}
+		if frame.Opcode == 8 {
+			_ = write(frame)
+			return false
+		}
+		frame.Opcode = 10
+		return write(frame)
+	}
 	ticker := time.NewTicker(400 * time.Millisecond)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.mu.Lock()
-		s.ticks++
-		seq, orders := s.ticks, len(s.orders)
-		s.mu.Unlock()
-		payload, _ := json.Marshal(map[string]any{"seq": seq, "price": 10000 + seq, "orders": orders})
-		if err := wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 1, Payload: payload}, false); err != nil {
-			return
+	for {
+		select {
+		case frame, ok := <-frames:
+			if !control(frame, ok) {
+				return
+			}
+			continue
+		default:
+		}
+		select {
+		case frame, ok := <-frames:
+			if !control(frame, ok) {
+				return
+			}
+		case <-ticker.C:
+			s.mu.Lock()
+			s.ticks++
+			seq, orders := s.ticks, len(s.orders)
+			s.mu.Unlock()
+			payload, _ := json.Marshal(map[string]any{"seq": seq, "price": 10000 + seq, "orders": orders})
+			if !write(wsframe.Frame{Fin: true, Opcode: 1, Payload: payload}) {
+				return
+			}
 		}
 	}
 }

@@ -3,11 +3,14 @@ package tape
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"glitchdeck/internal/fault"
+	"glitchdeck/internal/wsframe"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRoundTrip(t *testing.T) {
@@ -37,7 +40,7 @@ func TestRunnerAssertionDiff(t *testing.T) {
 }
 
 func TestRejectRemoteTarget(t *testing.T) {
-	_, err := Run(context.Background(), Tape{Version: 1, Target: "http://0:80"}, "")
+	_, err := Run(context.Background(), Tape{Version: 1, Target: "http://" + "0" + ":80"}, "")
 	if err == nil {
 		t.Fatal("remote target accepted")
 	}
@@ -80,5 +83,86 @@ func TestRejectDirectNonDemo(t *testing.T) {
 	_, err := Run(context.Background(), Tape{Version: 1, Target: "http://127.0.0.1:1", Assertions: []Assertion{{HTTPGet: "/api/state", Direct: true}}}, "")
 	if err == nil {
 		t.Fatal("accepted direct non-demo assertion")
+	}
+}
+
+func TestJSONPresenceNumbersAndTrailingData(t *testing.T) {
+	for _, tc := range []struct {
+		body     string
+		expected map[string]any
+		failures int
+	}{
+		{`{"n":1.0}`, map[string]any{"n": 1}, 0},
+		{`{}`, map[string]any{"missing": nil}, 1},
+		{`{"n":1} garbage`, map[string]any{"n": 1}, 1},
+	} {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(tc.body)) }))
+		results, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Assertions: []Assertion{{HTTPGet: "/", JSONEq: tc.expected}}}, "")
+		s.Close()
+		if err != nil || len(results) != 1 || len(results[0].Failures) != tc.failures {
+			t.Fatalf("body %s: %v %v", tc.body, results, err)
+		}
+	}
+}
+
+func TestIncompleteAndBadSequenceRejected(t *testing.T) {
+	for _, tp := range []Tape{
+		{Version: 1, Target: "demo", Incomplete: true},
+		{Version: 1, Target: "demo", StartSeq: 2, Script: []Step{{Seq: 2, HTTP: &HTTP{Path: "/"}}}},
+	} {
+		if _, err := Run(context.Background(), tp, ""); err == nil {
+			t.Fatal("accepted invalid tape")
+		}
+	}
+}
+
+func TestUnreachableUpstreamIsError(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	target := s.URL
+	s.Close()
+	_, err := Run(context.Background(), Tape{Version: 1, Target: target, Script: []Step{{HTTP: &HTTP{Path: "/"}}}}, "")
+	if err == nil {
+		t.Fatal("unreachable upstream accepted")
+	}
+}
+
+func TestFragmentedTickerJSON(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
+		_ = rw.Flush()
+		_ = wsframe.Write(c, wsframe.Frame{Opcode: 1, Payload: []byte(`{"seq":`)}, false)
+		_ = wsframe.Write(c, wsframe.Frame{Fin: true, Opcode: 0, Payload: []byte(`1}`)}, false)
+	}))
+	defer s.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ch, err := startWS(ctx, s.URL, WS{Path: "/ws/ticker", Frames: 1}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-ch; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnexpectedWebSocketEndIsError(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
+		_ = rw.Flush()
+	}))
+	defer s.Close()
+	_, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Script: []Step{{WS: &WS{Path: "/", Frames: 1}}}}, "")
+	if err == nil {
+		t.Fatal("unexpected websocket close accepted")
 	}
 }

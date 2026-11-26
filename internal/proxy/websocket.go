@@ -18,27 +18,23 @@ import (
 	"glitchdeck/internal/wsframe"
 )
 
-func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq uint64) {
+func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64) {
 	key := r.Header.Get("Sec-WebSocket-Key")
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if r.Method != "GET" || r.Header.Get("Sec-WebSocket-Version") != "13" || err != nil || len(decoded) != 16 {
 		http.Error(w, "invalid websocket handshake", 400)
 		return
 	}
-	p.mu.Lock()
-	ctx := p.ctx
-	closed := p.closed
-	p.mu.Unlock()
-	if closed || ctx.Err() != nil {
-		http.Error(w, "proxy closed", 503)
-		return
-	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 	port := p.target.Port()
 	if port == "" {
 		port = "80"
 	}
-	up, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", port))
+	up, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(p.target.Hostname(), port))
 	if err != nil {
+		p.outcome(gen, Outcome{Seq: seq, Err: err})
+		w.Header().Set(TransportErrorHeader, "1")
 		http.Error(w, "upstream unavailable", 502)
 		return
 	}
@@ -51,15 +47,27 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq uint64) {
 	q.Header.Set("Upgrade", "websocket")
 	q.Header.Del("Sec-WebSocket-Extensions")
 	if err = q.Write(up); err != nil {
+		p.outcome(gen, Outcome{Seq: seq, Err: err})
+		w.Header().Set(TransportErrorHeader, "1")
 		http.Error(w, "upstream handshake failed", 502)
 		return
 	}
 	reader := bufio.NewReader(up)
-	resp, err := http.ReadResponse(reader, q)
-	if err != nil {
-		http.Error(w, "upstream handshake failed", 502)
-		return
+	var resp *http.Response
+	for {
+		resp, err = http.ReadResponse(reader, q)
+		if err != nil {
+			p.outcome(gen, Outcome{Seq: seq, Err: err})
+			w.Header().Set(TransportErrorHeader, "1")
+			http.Error(w, "upstream handshake failed", 502)
+			return
+		}
+		if resp.StatusCode < 100 || resp.StatusCode >= 200 || resp.StatusCode == 101 {
+			break
+		}
+		resp.Body.Close()
 	}
+	resp.Header.Del(TransportErrorHeader)
 	if resp.StatusCode != 101 {
 		defer resp.Body.Close()
 		stripHop(resp.Header)
@@ -68,8 +76,20 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq uint64) {
 		_, _ = io.Copy(w, resp.Body)
 		return
 	}
-	if !headerToken(resp.Header, "Connection", "upgrade") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") || resp.Header.Get("Sec-WebSocket-Accept") != wsframe.AcceptKey(key) || resp.Header.Get("Sec-WebSocket-Extensions") != "" {
-		http.Error(w, "unsupported upstream websocket handshake", 502)
+	selected := resp.Header.Get("Sec-WebSocket-Protocol")
+	offered := selected == ""
+	for _, offer := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, item := range strings.Split(offer, ",") {
+			if strings.TrimSpace(item) == selected {
+				offered = true
+			}
+		}
+	}
+	if !headerToken(resp.Header, "Connection", "upgrade") || !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") || resp.Header.Get("Sec-WebSocket-Accept") != wsframe.AcceptKey(key) || resp.Header.Get("Sec-WebSocket-Extensions") != "" || !offered {
+		err := fmt.Errorf("unsupported upstream websocket handshake")
+		p.outcome(gen, Outcome{Seq: seq, Err: err})
+		w.Header().Set(TransportErrorHeader, "1")
+		http.Error(w, err.Error(), 502)
 		return
 	}
 	_ = up.SetDeadline(time.Time{})
@@ -83,6 +103,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq uint64) {
 		return
 	}
 	defer client.Close()
+	_ = client.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err = fmt.Fprintf(buf, "HTTP/1.1 101 Switching Protocols\r\n"); err != nil {
 		return
 	}
@@ -95,10 +116,12 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq uint64) {
 	if err = buf.Flush(); err != nil {
 		return
 	}
+	_ = client.SetWriteDeadline(time.Time{})
 	done := make(chan struct{})
 	var once sync.Once
 	closeBoth := func(abnormal bool) {
 		once.Do(func() {
+			cancel()
 			if abnormal {
 				rst(client)
 				rst(up)
@@ -117,20 +140,43 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq uint64) {
 		}
 	}()
 	var wg sync.WaitGroup
+	var closing sync.Once
+	beginClose := func() {
+		closing.Do(func() {
+			_ = client.SetDeadline(time.Now().Add(time.Second))
+			_ = up.SetDeadline(time.Now().Add(time.Second))
+			timer := time.AfterFunc(time.Second, func() { closeBoth(false) })
+			context.AfterFunc(ctx, func() { timer.Stop() })
+		})
+	}
 	wg.Add(2)
-	go func() { defer wg.Done(); p.pump(ctx, buf.Reader, up, true, "c2s", seq, r.URL.Path, closeBoth) }()
-	go func() { defer wg.Done(); p.pump(ctx, reader, client, false, "s2c", seq, r.URL.Path, closeBoth) }()
+	go func() {
+		defer wg.Done()
+		p.pump(ctx, buf.Reader, up, true, "c2s", seq, gen, r.URL.Path, closeBoth, beginClose)
+	}()
+	go func() {
+		defer wg.Done()
+		p.pump(ctx, reader, client, false, "s2c", seq, gen, r.URL.Path, closeBoth, beginClose)
+	}()
 	wg.Wait()
 	closeBoth(false)
 }
-func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bool, dir string, seq uint64, path string, closeBoth func(bool)) {
-	defer closeBoth(false)
+func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bool, dir string, seq, gen uint64, path string, closeBoth func(bool), beginClose func()) {
+	normalClose := false
+	defer func() {
+		if !normalClose {
+			closeBoth(false)
+		}
+	}()
 	var frameSeq uint64
 	fragmented := false
 	for {
 		f, err := wsframe.Read(src, masked)
 		if err != nil {
 			return
+		}
+		if (f.Opcode == 2 || f.Opcode == 0 || !f.Fin) && p.OnUnsupportedFrame != nil {
+			p.callback(gen, func() { p.OnUnsupportedFrame(seq) })
 		}
 		if f.Opcode == 0 {
 			if !fragmented {
@@ -147,7 +193,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 		}
 		frameSeq++
 		if dir == "c2s" && f.Opcode == 1 && f.Fin && p.OnClientFrame != nil {
-			p.OnClientFrame(seq, f.Payload)
+			p.callback(gen, func() { p.OnClientFrame(seq, f.Payload) })
 		}
 		action := ""
 		var params map[string]any
@@ -166,7 +212,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			}
 		}
 		if dir == "s2c" && p.OnServerFrame != nil {
-			p.OnServerFrame(seq, action, f.Opcode)
+			p.callback(gen, func() { p.OnServerFrame(seq, action, f.Opcode) })
 		}
 		preview := ""
 		if f.Opcode == 1 {
@@ -175,7 +221,10 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 				preview = string(snippet)
 			}
 		}
-		p.publish("ws_frame", map[string]any{"conn_id": seq, "frame_seq": frameSeq, "ts_ms": time.Now().UnixMilli(), "dir": dir, "opcode": f.Opcode, "bytes": len(f.Payload), "fault": action, "preview": preview})
+		p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "frame_seq": frameSeq, "ts_ms": time.Now().UnixMilli(), "dir": dir, "opcode": f.Opcode, "bytes": len(f.Payload), "fault": action, "preview": preview})
+		if action != "" {
+			p.outcome(gen, Outcome{Seq: seq, WSFault: true})
+		}
 		switch action {
 		case "drop":
 			continue
@@ -205,10 +254,15 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			closeBoth(true)
 			return
 		}
+		if f.Opcode == 8 {
+			beginClose()
+		}
 		if wsframe.Write(dst, f, masked) != nil {
+			closeBoth(false)
 			return
 		}
 		if f.Opcode == 8 {
+			normalClose = true
 			return
 		}
 	}

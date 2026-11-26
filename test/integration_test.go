@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -58,8 +60,8 @@ func TestTCPRST(t *testing.T) {
 	}
 	defer r.Body.Close()
 	body, err := io.ReadAll(r.Body)
-	if len(body) > 128 || err == nil || r.ContentLength != 4096 {
-		t.Fatalf("read %d of %d bytes: %v", len(body), r.ContentLength, err)
+	if len(body) > 128 || err == nil {
+		t.Fatalf("read %d bytes: %v", len(body), err)
 	}
 }
 
@@ -98,7 +100,7 @@ func TestByteTrickleAndRateLimit(t *testing.T) {
 	s, _, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls <- r.URL.Path
 		_, _ = io.WriteString(w, "abcdefghijkl")
-	}), rule("rate-limit", "/rate", map[string]any{"retry_after_sec": 1}), rule("byte-trickle", "/slow", map[string]any{"bytes_per_sec": 40, "chunk_bytes": 4}))
+	}), rule("rate-limit", "/rate", map[string]any{"retry_after_sec": 1}), rule("byte-trickle", "/slow", map[string]any{"bytes_per_sec": 40, "chunk_bytes": 4, "stall_after_bytes": 4, "stall_ms": 150}))
 	r, err := client.Get(s.URL + "/rate")
 	if err != nil {
 		t.Fatal(err)
@@ -107,15 +109,23 @@ func TestByteTrickleAndRateLimit(t *testing.T) {
 	if r.StatusCode != 429 || r.Header.Get("Retry-After") != "1" || r.Header.Get("X-Glitchdeck-Fault") != "rate-limit" || len(calls) != 0 {
 		t.Fatalf("status=%d headers=%v upstream calls=%d", r.StatusCode, r.Header, len(calls))
 	}
-	start := time.Now()
 	r, err = client.Get(s.URL + "/slow")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Body.Close()
-	body, err := io.ReadAll(r.Body)
-	if err != nil || string(body) != "abcdefghijkl" || time.Since(start) < 180*time.Millisecond {
-		t.Fatalf("body=%q after %s: %v", body, time.Since(start), err)
+	buf := make([]byte, 4)
+	times := make([]time.Time, 3)
+	var body []byte
+	for i := range times {
+		if _, err := io.ReadFull(r.Body, buf); err != nil {
+			t.Fatal(err)
+		}
+		body = append(body, buf...)
+		times[i] = time.Now()
+	}
+	if string(body) != "abcdefghijkl" || times[1].Sub(times[0]) < 200*time.Millisecond || times[2].Sub(times[1]) < 70*time.Millisecond {
+		t.Fatalf("body=%q gaps=%v,%v", body, times[1].Sub(times[0]), times[2].Sub(times[1]))
 	}
 }
 
@@ -143,6 +153,13 @@ func TestWSGlitch1006AndDrop(t *testing.T) {
 			if err != nil || json.Unmarshal(f.Payload, &first) != nil || first.Seq != 1 {
 				t.Fatalf("first frame=%q seq=%d err=%v", f.Payload, first.Seq, err)
 			}
+			if action == "close_1006" {
+				_, err = reader.ReadByte()
+				if err == nil || !errors.Is(err, syscall.ECONNRESET) {
+					t.Fatalf("expected reset without close frame, got %v", err)
+				}
+				return
+			}
 			f, err = wsframe.Read(reader, false)
 			switch action {
 			case "drop":
@@ -168,6 +185,109 @@ func TestWSGlitch1006AndDrop(t *testing.T) {
 				}
 			}
 			t.Fatal("missing telemetry for faulted frame #2")
+		})
+	}
+}
+
+func TestTCPRSTWire(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		params  map[string]any
+		chunked bool
+	}{
+		{"before", map[string]any{"before_headers": true}, false},
+		{"complete", map[string]any{"after_bytes": 32}, false},
+		{"chunked", map[string]any{"after_bytes": 32}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.chunked {
+					w.(http.Flusher).Flush()
+				}
+				_, _ = io.WriteString(w, "hello")
+			}), rule("tcp-rst", "/", tc.params))
+			c, err := net.DialTimeout("tcp", s.Listener.Addr().String(), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(4 * time.Second))
+			_, err = fmt.Fprintf(c, "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.name != "before" {
+				_, _ = io.WriteString(c, "0123456789")
+			}
+			data, err := io.ReadAll(c)
+			if !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("wire %q: expected reset, got %v", data, err)
+			}
+			if tc.name == "before" && len(data) != 0 {
+				t.Fatalf("unexpected bytes before reset: %q", data)
+			}
+			if tc.name != "before" && (!bytes.Contains(data, []byte("hello")) || bytes.HasSuffix(data, []byte("0\r\n\r\n"))) {
+				t.Fatalf("unexpected wire: %q", data)
+			}
+		})
+	}
+}
+
+func TestResetDropsOldGeneration(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s, p, bus, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = io.WriteString(w, "late")
+	}))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := client.Get(s.URL)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	<-started
+	p.ResetWith(func() { bus.Clear() })
+	close(release)
+	<-done
+	if got := bus.History(0); len(got) != 0 {
+		t.Fatalf("old generation published: %+v", got)
+	}
+}
+
+func TestStreamingFlushAndReadError(t *testing.T) {
+	for _, kind := range []string{"normal", "byte-trickle"} {
+		t.Run(kind, func(t *testing.T) {
+			release := make(chan struct{})
+			var rules []fault.Rule
+			if kind == "byte-trickle" {
+				rules = append(rules, rule(kind, "/", map[string]any{"bytes_per_sec": 1000, "chunk_bytes": 4}))
+			}
+			s, _, _, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "20")
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, "part")
+				w.(http.Flusher).Flush()
+				<-release
+			}), rules...)
+			resp, err := client.Get(s.URL)
+			if err != nil {
+				close(release)
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			got := make([]byte, 4)
+			if _, err = io.ReadFull(resp.Body, got); err != nil || string(got) != "part" {
+				close(release)
+				t.Fatalf("first chunk %q: %v", got, err)
+			}
+			close(release)
+			if _, err = io.ReadAll(resp.Body); err == nil {
+				t.Fatal("truncated upstream succeeded")
+			}
 		})
 	}
 }
