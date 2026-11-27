@@ -1,0 +1,12 @@
+# CONNECTs to pinned.example.com keep the upstream certificate.
+# Local demo traffic still uses interception.
+version: 2
+name: tls-passthrough
+target: demo
+tls_mitm: true
+upstream_allow: [pinned.example.com]
+tls_passthrough: [pinned.example.com]
+script:
+  - {name: state, http: {url: '${DEMO_TLS}/api/state'}}
+assertions:
+  - {name: demo-state, http_get: /api/state, direct: true, expect_status: 200}

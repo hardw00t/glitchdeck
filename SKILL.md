@@ -7,7 +7,9 @@ description: Reproduce and regression-test HTTP, webhook, SSE, WebSocket, and gR
 
 Validate tapes without running them with `glitchdeck validate faults.tape.yaml`. Run a local tape with `glitchdeck test --json examples/checkout-dup-webhook.tape.yaml`, or wrap a command with `glitchdeck exec --tape faults.tape.yaml --json -- your-command`. The child receives `GLITCHDECK_PROXY_URL` and standard proxy environment variables. Version 1 test JSON is an array; version 2 and exec use an envelope. `--report` writes the envelope to a file.
 
-Exec fails with exit 1 if no requests reach the proxy, or if enabled fault rules trigger no faults without an explicit zero-allowing fault expectation. `--allow-zero-traffic` disables both checks; other assertions and child-exit expectations still apply. Check proxy bypass and CA trust when traffic is missing.
+Use `--tls-passthrough` or v2 `tls_passthrough` for pinned CONNECT hosts that should keep their upstream certificate; the upstream allowlist still applies.
+Exec fails closed on `tls_rejected_only`, `egress_denied_only`, `zero_traffic`, or `zero_faults`; `--allow-zero-traffic` skips those checks but not tape expectations. To assert that a client rejects the interception CA, use `--allow-zero-traffic` with `expect.child_exit: nonzero`.
+Go skips environment proxies for localhost; use reverse mode by setting the client base URL to `GLITCHDECK_PROXY_URL`.
 
 For LLM streams, start with `examples/tapes/your-app-openai-sse-cut.tape.yaml` or its Anthropic counterpart.
 Assert the application's `finish_reason` or `stop_reason`, not just that the SDK returned without an exception.
