@@ -172,6 +172,9 @@ func (s *Server) Serve() error {
 						if invalid {
 							code = -32602
 							message = "Invalid params"
+							if p.Name == "tape_validate" {
+								message = "Invalid params: supply exactly one of tape_path or tape_yaml"
+							}
 							break
 						}
 						b, e := json.Marshal(value)
@@ -495,6 +498,25 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			next = event.ID
 		}
 		return map[string]any{"events": events, "count": len(events), "next_since_id": next, "truncated": truncated}, false
+	case "tape_validate":
+		var a struct {
+			Path *string `json:"tape_path"`
+			YAML *string `json:"tape_yaml"`
+		}
+		if json.Unmarshal(raw, &a) != nil || (a.Path == nil) == (a.YAML == nil) {
+			return nil, true
+		}
+		var t tape.Tape
+		var err error
+		if a.Path != nil {
+			t, err = s.readTape(*a.Path)
+		} else {
+			t, err = tape.Decode(strings.NewReader(*a.YAML))
+		}
+		if err != nil {
+			return map[string]any{"ok": false, "error": err.Error()}, false
+		}
+		return map[string]any{"ok": true, "version": t.Version, "name": t.Name, "rules": len(t.Rules)}, false
 	case "tape_run":
 		var a struct {
 			TapePath  string `json:"tape_path"`
@@ -716,11 +738,32 @@ func (s *Server) path(p string) string {
 }
 
 func (s *Server) readTape(path string) (tape.Tape, error) {
-	fd, err := syscall.Open(s.path(path), syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	base := s.opts.Workdir
+	if base == "" {
+		base = "."
+	}
+	if filepath.IsAbs(path) {
+		abs, err := filepath.Abs(base)
+		if err != nil {
+			return tape.Tape{}, err
+		}
+		path, err = filepath.Rel(abs, path)
+		if err != nil {
+			return tape.Tape{}, err
+		}
+	}
+	if !filepath.IsLocal(path) {
+		return tape.Tape{}, fmt.Errorf("tape path is empty or escapes workdir")
+	}
+	root, err := os.OpenRoot(base)
 	if err != nil {
 		return tape.Tape{}, err
 	}
-	f := os.NewFile(uintptr(fd), path)
+	defer root.Close()
+	f, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return tape.Tape{}, err
+	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {

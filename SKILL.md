@@ -9,4 +9,4 @@ Validate tapes without running them with `glitchdeck validate faults.tape.yaml`.
 
 Inspect failed assertions and fault counts, fix the application, then rerun the same tape. Keep the tape in the repository as a regression test; the composite action supports exec mode with its `command` input. Exit 0 means pass; 1 means a mismatch; 2 means invalid input; 3 means runtime failure; 124 means timeout; 125–127 mean child startup failure.
 
-For interactive use, configure the local stdio server as `{"command":"glitchdeck","args":["mcp"]}`. Start with `proxy_start`, configure rules with `fault_set`, inspect `wire_events`, then use `tape_export` and `tape_run`. Finish with `proxy_stop`. Use controlled loopback targets only.
+For interactive use, configure the local stdio server as `{"command":"glitchdeck","args":["mcp"]}`. Start with `proxy_start`, configure rules with `fault_set`, inspect `wire_events`, then use `tape_export`, `tape_validate`, and `tape_run`. Finish with `proxy_stop`. Use controlled loopback targets only.

@@ -25,10 +25,14 @@ func validateCommand(args []string) int {
 	f := flag.NewFlagSet("validate", flag.ContinueOnError)
 	f.SetOutput(io.Discard)
 	asJSON := f.Bool("json", false, "JSON output")
+	const validateUsage = "usage: glitchdeck validate [--json] <file...>"
+	if showCommandHelp(f, args, validateUsage) {
+		return 0
+	}
 	flags, files := cli.SplitArgs(args)
 	parseErr := f.Parse(flags)
 	if parseErr == nil && len(files) == 0 {
-		parseErr = errors.New("usage: glitchdeck validate [--json] <file...>")
+		parseErr = errors.New(validateUsage)
 	}
 	results := make([]validationResult, 0, len(files))
 	ok := parseErr == nil

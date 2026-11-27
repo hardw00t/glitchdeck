@@ -67,6 +67,39 @@ func run(args []string) int {
 		return 2
 	}
 }
+
+// Check for help before parsing so it also works after positional arguments.
+func showCommandHelp(f *flag.FlagSet, args []string, usage string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		name, ok := strings.CutPrefix(arg, "-")
+		if !ok {
+			continue
+		}
+		name, _, assigned := strings.Cut(strings.TrimPrefix(name, "-"), "=")
+		if name == "h" || name == "help" {
+			f.SetOutput(os.Stdout)
+			f.Usage = func() {
+				fmt.Fprintln(f.Output(), usage)
+				f.PrintDefaults()
+			}
+			return f.Parse(args[i:i+1]) == flag.ErrHelp
+		}
+		if option := f.Lookup(name); !assigned && option != nil {
+			if b, ok := option.Value.(interface{ IsBoolFlag() bool }); !ok || !b.IsBoolFlag() {
+				if i+1 < len(args) && args[i+1] == "--" {
+					break
+				}
+				i++
+			}
+		}
+	}
+	return false
+}
+
 func testTape(args []string) int {
 	f := flag.NewFlagSet("test", flag.ContinueOnError)
 	wantJSON := cli.JSONRequested(args)
@@ -79,6 +112,10 @@ func testTape(args []string) int {
 	report := f.String("report", "", "write JSON report")
 	tlsEnabled := f.Bool("tls", false, "enable TLS")
 	caDir := f.String("ca-dir", "", "CA directory")
+	const testUsage = "usage: glitchdeck test [flags] tape.yaml"
+	if showCommandHelp(f, args, testUsage) {
+		return 0
+	}
 	flags, files := cli.SplitArgs(args, "target", "timeout", "report", "ca-dir")
 	filename := ""
 	if len(files) == 1 {
@@ -108,7 +145,7 @@ func testTape(args []string) int {
 		return fail("USAGE", err)
 	}
 	if filename == "" || *timeout <= 0 {
-		return fail("USAGE", errors.New("usage: glitchdeck test [flags] tape.yaml"))
+		return fail("USAGE", errors.New(testUsage))
 	}
 	file, err := os.Open(filename)
 	if err != nil {
@@ -211,6 +248,9 @@ func serve(args []string, isDemo bool) int {
 	h2tap := f.String("h2-tap", "on", "HTTP/2 tap")
 	sseMax := f.Int("sse-telemetry-max", 512, "SSE telemetry limit")
 	allowRemote := f.Bool("allow-remote", false, "allow remote listener")
+	if showCommandHelp(f, args, "usage: glitchdeck "+name+" [flags]") {
+		return 0
+	}
 	if err := f.Parse(args); err != nil {
 		return fail("usage", err)
 	}

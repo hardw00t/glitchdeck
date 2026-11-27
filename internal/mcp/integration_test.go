@@ -119,10 +119,10 @@ func TestExportPathGuard(t *testing.T) {
 }
 
 func TestTapeRunReportsAssertions(t *testing.T) {
-	input := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":\"../../examples/clean.tape.yaml\"}}}\n" +
-		"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":\"../../examples/checkout-dup-webhook.tape.yaml\"}}}\n"
+	input := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":\"clean.tape.yaml\"}}}\n" +
+		"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":\"checkout-dup-webhook.tape.yaml\"}}}\n"
 	var output strings.Builder
-	if err := NewServer(strings.NewReader(input), &output, Options{}).Serve(); err != nil {
+	if err := NewServer(strings.NewReader(input), &output, Options{Workdir: "../../examples"}).Serve(); err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(output.String()), "\n")

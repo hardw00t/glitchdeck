@@ -23,12 +23,36 @@ func TestHandshakeAndList(t *testing.T) {
 	}
 	var result struct {
 		Result struct {
-			Tools []any `json:"tools"`
+			Tools []struct {
+				Name  string `json:"name"`
+				Input struct {
+					Type                 string `json:"type"`
+					AdditionalProperties *bool  `json:"additionalProperties"`
+					Properties           map[string]struct {
+						Type      string `json:"type"`
+						MaxLength int    `json:"maxLength"`
+					} `json:"properties"`
+					Required []string `json:"required"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal([]byte(lines[1]), &result); err != nil || len(result.Result.Tools) != 8 {
+	if err := json.Unmarshal([]byte(lines[1]), &result); err != nil || len(result.Result.Tools) != 9 {
 		t.Fatal(out.String())
 	}
+	for _, tool := range result.Result.Tools {
+		if tool.Name != "tape_validate" {
+			continue
+		}
+		s := tool.Input
+		if s.Type != "object" || s.AdditionalProperties == nil || *s.AdditionalProperties ||
+			len(s.Required) != 0 || len(s.Properties) != 2 || s.Properties["tape_path"].Type != "string" ||
+			s.Properties["tape_yaml"].Type != "string" || s.Properties["tape_yaml"].MaxLength != 1048576 {
+			t.Fatalf("unexpected tape_validate schema: %+v", s)
+		}
+		return
+	}
+	t.Fatal("tape_validate missing from tools/list")
 }
 func TestRejectsUnknownToolAndParameters(t *testing.T) {
 	var out bytes.Buffer

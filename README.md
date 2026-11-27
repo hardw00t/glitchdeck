@@ -192,7 +192,7 @@ Use the stdio configuration above for interactive MCP:
 glitchdeck mcp
 ```
 
-Use `proxy_start` with a loopback target or `demo`, `fault_set` to arm rules, and `wire_events` to inspect traffic. Then export a tape or call `tape_run` to replay one. See [SKILL.md](SKILL.md) for the regression workflow.
+Use `proxy_start` with a loopback target or `demo`, `fault_set` to arm rules, and `wire_events` to inspect traffic. Use `tape_export` to save a recording, `tape_validate` to check a tape without running it, and `tape_run` to replay one. Tape input paths must stay within the MCP workdir (`.` by default). See [SKILL.md](SKILL.md) for the regression workflow.
 
 To run the [composite action](action.yml) from a checkout of this repository:
 

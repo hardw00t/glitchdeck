@@ -65,13 +65,7 @@ func execCommand(args []string) int {
 	if wantJSON {
 		f.SetOutput(io.Discard)
 	}
-	head := args
-	if i := slices.Index(args, "--"); i >= 0 {
-		head = args[:i]
-	}
-	if !wantJSON && (slices.Contains(head, "-h") || slices.Contains(head, "-help") || slices.Contains(head, "--help")) {
-		f.SetOutput(os.Stdout)
-		f.Usage()
+	if showCommandHelp(f, args, execUsage) {
 		return 0
 	}
 	emit := func(e execrun.Envelope) int {
@@ -139,6 +133,9 @@ func execCommand(args []string) int {
 func mcpCommand(args []string) int {
 	f := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	workdir := f.String("workdir", ".", "working directory")
+	if showCommandHelp(f, args, "usage: glitchdeck mcp [flags]") {
+		return 0
+	}
 	if f.Parse(args) != nil || f.NArg() != 0 {
 		return 2
 	}
@@ -161,6 +158,10 @@ func caCommand(args []string) int {
 	dir := f.String("ca-dir", tlsmitm.DefaultDir(), "CA directory")
 	force := f.Bool("force", false, "replace CA")
 	asJSON := f.Bool("json", false, "JSON output")
+	const caUsage = "usage: glitchdeck ca init|path|print [--ca-dir path]"
+	if showCommandHelp(f, args, caUsage) {
+		return 0
+	}
 	wantJSON := cli.JSONRequested(flags)
 	if wantJSON {
 		f.SetOutput(io.Discard)
@@ -177,7 +178,7 @@ func caCommand(args []string) int {
 		return fail("usage", err, 2)
 	}
 	if len(pos) != 1 {
-		return fail("usage", errors.New("usage: glitchdeck ca init|path|print [--ca-dir path]"), 2)
+		return fail("usage", errors.New(caUsage), 2)
 	}
 	store := tlsmitm.Store{Dir: *dir}
 	var ca *tlsmitm.CA
@@ -249,6 +250,9 @@ func buildMetadata() (v, rev, date string) {
 func versionCommand(args []string) int {
 	f := flag.NewFlagSet("version", flag.ContinueOnError)
 	asJSON := f.Bool("json", false, "JSON output")
+	if showCommandHelp(f, args, "usage: glitchdeck version [--json]") {
+		return 0
+	}
 	if f.Parse(args) != nil || f.NArg() != 0 {
 		return 2
 	}
@@ -272,6 +276,9 @@ func reportCommand(args []string) int {
 	f := flag.NewFlagSet("report", flag.ContinueOnError)
 	github := f.Bool("github", false, "GitHub annotations")
 	asJSON := f.Bool("json", false, "JSON output")
+	if showCommandHelp(f, args, "usage: glitchdeck report [--github|--json] report.json") {
+		return 0
+	}
 	if f.Parse(flags) != nil || len(pos) != 1 || *github && *asJSON {
 		return 2
 	}

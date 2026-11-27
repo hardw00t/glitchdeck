@@ -39,6 +39,7 @@ func tools() []map[string]any {
 		{"fault_clear", "Clear fault rules", object(schema{"rule_ids": array(str), "reset_bus": boolean})},
 		{"wire_events", "Read bounded wire events", object(schema{"since_id": uint, "limit": bounded("integer", 1, 100), "type": choice("all", "http_req", "ws_frame", "sse_event", "grpc_call"), "faulted_only": boolean})},
 		{"tape_run", "Run a tape", object(schema{"tape_path": str, "tape_yaml": schema{"type": "string", "maxLength": 1048576}, "target": str, "timeout_ms": bounded("integer", 100, 120000)})},
+		{"tape_validate", "Validate a tape without running it; supply exactly one of tape_path or tape_yaml", object(schema{"tape_path": str, "tape_yaml": schema{"type": "string", "maxLength": 1048576}})},
 		{"tape_export", "Export recorded traffic", object(schema{"name": schema{"type": "string", "minLength": 1}, "out_path": str}, "name")},
 		{"demo_trigger", "Drive the demo", object(schema{"action": choice("checkout", "webhook", "ticker", "state", "reset"), "order_id": str, "amount_cents": uint, "frames": bounded("integer", 1, 50)}, "action")},
 	}
