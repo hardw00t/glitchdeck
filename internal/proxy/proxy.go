@@ -382,8 +382,9 @@ func (p *Proxy) skipUnsupportedSSE(gen uint64, rule *fault.Rule, encoding string
 		}
 		p.sseEncodingWarned[rule.ID] = true
 	}
+	report := first && !p.options.SuppressStderr
 	p.mu.Unlock()
-	if first {
+	if report {
 		fmt.Fprintf(os.Stderr, "rule %s: SSE fault skipped, upstream Content-Encoding %s is not decodable (stdlib supports gzip/deflate)\n", rule.ID, encoding)
 	}
 	return reason

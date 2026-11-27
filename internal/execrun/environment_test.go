@@ -35,7 +35,7 @@ func TestInheritedCertificatesOnlyAndDeduplicated(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SSL_CERT_FILE", path)
-	got := certBundle(inheritedCerts("SSL_CERT_FILE"), ca.PEM)
+	got := certBundle(inheritedCerts("SSL_CERT_FILE", nil), ca.PEM)
 	if bytes.Contains(got, []byte("PRIVATE KEY")) || bytes.Contains(got, []byte("do-not-copy")) || bytes.Count(got, []byte("BEGIN CERTIFICATE")) != 1 {
 		t.Fatalf("unexpected bundle %s", got)
 	}
@@ -45,17 +45,17 @@ func TestInheritedCertificatesOnlyAndDeduplicated(t *testing.T) {
 	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 4<<20+1), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if len(inheritedCerts("SSL_CERT_FILE")) != 0 {
+	if len(inheritedCerts("SSL_CERT_FILE", nil)) != 0 {
 		t.Fatal("accepted oversized file")
 	}
 	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not a certificate")}), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if len(inheritedCerts("SSL_CERT_FILE")) != 0 {
+	if len(inheritedCerts("SSL_CERT_FILE", nil)) != 0 {
 		t.Fatal("accepted invalid certificate DER")
 	}
 	t.Setenv("SSL_CERT_FILE", t.TempDir())
-	if len(inheritedCerts("SSL_CERT_FILE")) != 0 {
+	if len(inheritedCerts("SSL_CERT_FILE", nil)) != 0 {
 		t.Fatal("accepted directory")
 	}
 }
@@ -340,7 +340,7 @@ func TestInheritedCADiagnosticRedactsURL(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Stderr = w
-	inheritedCerts("SSL_CERT_FILE")
+	inheritedCerts("SSL_CERT_FILE", nil)
 	w.Close()
 	os.Stderr = old
 	data, _ := io.ReadAll(r)

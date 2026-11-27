@@ -119,7 +119,9 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		if secured, spec, ok := f.intercept(c, rw.Reader, r.Host, host, p.options.MITMALPN, func(name string, err error) {
 			p.tlsRejected.Add(1)
 			rejected = true
-			fmt.Fprintf(os.Stderr, "tls_handshake_failed: host=%q sni=%q: %q\n", r.Host, name, err)
+			if !p.options.SuppressStderr {
+				fmt.Fprintf(os.Stderr, "tls_handshake_failed: host=%q sni=%q: %q\n", r.Host, name, err)
+			}
 			p.publish(gen, "tls_handshake_failed", map[string]any{"host": r.Host, "sni": name, "error": err.Error(), "ts_ms": start.UnixMilli()})
 		}); ok {
 			seen := new(atomic.Bool)

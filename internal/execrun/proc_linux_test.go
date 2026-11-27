@@ -16,6 +16,14 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/tape"
 )
 
+var _ = func() bool {
+	if marker := os.Getenv("GD_TEST_STALLED_HELPER"); marker != "" && os.Getenv(helperEnv) != "" {
+		_ = os.WriteFile(marker, []byte(strconv.Itoa(os.Getpid())), 0600)
+		_ = syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+	}
+	return true
+}()
+
 func TestInheritedCARejectsNamedPipeWithoutWaitingForWriter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "roots.pem")
 	if err := syscall.Mkfifo(path, 0600); err != nil {
@@ -23,7 +31,7 @@ func TestInheritedCARejectsNamedPipeWithoutWaitingForWriter(t *testing.T) {
 	}
 	t.Setenv("SSL_CERT_FILE", path)
 	done := make(chan []byte, 1)
-	go func() { done <- inheritedCerts("SSL_CERT_FILE") }()
+	go func() { done <- inheritedCerts("SSL_CERT_FILE", nil) }()
 	select {
 	case data := <-done:
 		if len(data) != 0 {
@@ -105,5 +113,64 @@ func TestExecNonExecutableOnPath(t *testing.T) {
 	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{"not-executable"}, JSON: true})
 	if r.ExitCode != 126 {
 		t.Fatalf("expected 126, got %d", r.ExitCode)
+	}
+}
+
+func TestExecDetachedPreservesLargeArgumentVector(t *testing.T) {
+	args := []string{"sh", "-c", `printf '%s:%s' "$#" "${64}"`, "sh"}
+	for range 64 {
+		args = append(args, strings.Repeat("x", 4095))
+	}
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{
+		Command: args, DetachStdio: true, AllowZeroTraffic: true, TailBytes: 8192,
+		Timeout: 10 * time.Second,
+	})
+	if r.Error != nil || r.Exec.ExitCode != 0 || r.Exec.StdoutTail != "64:"+strings.Repeat("x", 4095) {
+		t.Fatalf("large argv failed: error=%v exit=%d output=%q", r.Error, r.Exec.ExitCode, r.Exec.StdoutTail)
+	}
+}
+
+func TestExecDetachedStalledHelperIsKilledAndReaped(t *testing.T) {
+	if marker := os.Getenv("GD_TEST_STALLED_HELPER"); marker != "" {
+		target := marker + ".target"
+		r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{
+			Command:     []string{"sh", "-c", `touch "$1"`, "sh", target},
+			DetachStdio: true, AllowZeroTraffic: true, Timeout: 200 * time.Millisecond,
+		})
+		data, err := os.ReadFile(marker)
+		if err != nil {
+			t.Fatalf("helper never reached pre-ready stall: %v", err)
+		}
+		pid, err := strconv.Atoi(string(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Kill(pid, 0); err != syscall.ESRCH {
+			t.Fatalf("helper %d not reaped: %v", pid, err)
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Fatalf("target started: stat error %v", err)
+		}
+		if !r.Exec.TimedOut && r.ExitCode != 124 {
+			t.Fatalf("expected timeout, got exit=%d error=%v", r.ExitCode, r.Error)
+		}
+		return
+	}
+	marker := filepath.Join(t.TempDir(), "helper-pid")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestExecDetachedStalledHelperIsKilledAndReaped$")
+	cmd.Env = append(os.Environ(), "GD_TEST_STALLED_HELPER="+marker)
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
+	if data, readErr := os.ReadFile(marker); readErr == nil {
+		if pid, parseErr := strconv.Atoi(string(data)); parseErr == nil {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	} else {
+		t.Fatalf("helper did not start: %v; output: %s", readErr, out)
+	}
+	if err != nil {
+		t.Fatalf("stalled helper was not handled: %v; output: %s", err, out)
 	}
 }

@@ -153,8 +153,11 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	e := NewEnvelope("exec", o.TapePath, target)
 	e.Exec = &Exec{Cmd: o.Command}
 	warn := func(message string) {
-		fmt.Fprintln(os.Stderr, message)
-		if o.DetachStdio && len(e.Exec.Warnings) < 16 {
+		if !o.DetachStdio {
+			fmt.Fprintln(os.Stderr, message)
+			return
+		}
+		if len(e.Exec.Warnings) < 16 {
 			message = strings.ToValidUTF8(message, "�")
 			if len(message) > 512 {
 				message = message[:512]
@@ -164,6 +167,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			}
 			e.Exec.Warnings = append(e.Exec.Warnings, message)
 		}
+	}
+	var caWarn func(string)
+	if o.DetachStdio {
+		caWarn = warn
 	}
 	finish := func(code int, kind string, err error) Envelope {
 		e.ExitCode = code
@@ -237,6 +244,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
 	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), TLSPassthrough: append(append([]string{}, t.TLSPassthrough...), o.TLSPassthrough...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress, RequireUpstreamAllow: o.RequireUpstreamAllow}
+	opts.SuppressStderr = o.DetachStdio
 	for i, pattern := range opts.TLSPassthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {
 			return finish(2, "USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
@@ -275,7 +283,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	var system, sslCerts []byte
 	if o.TLS || o.UpstreamCA != "" || os.Getenv("SSL_CERT_FILE") != "" || os.Getenv("SSL_CERT_DIR") != "" {
 		system = systemPEM()
-		sslCerts = inheritedCerts("SSL_CERT_FILE")
+		sslCerts = inheritedCerts("SSL_CERT_FILE", caWarn)
 		opts.UpstreamCA = proxyRoots(system, sslCerts)
 	}
 	if o.UpstreamCA != "" {
@@ -320,7 +328,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
 			"GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "AWS_CA_BUNDLE", "DENO_CERT", "GIT_SSL_CAINFO", "PIP_CERT", "NPM_CONFIG_CAFILE", "CARGO_HTTP_CAINFO",
 		} {
-			certs := inheritedCerts(name)
+			certs := inheritedCerts(name, caWarn)
 			inherited = append(inherited, certs)
 			if name == "NODE_EXTRA_CA_CERTS" {
 				node = certs
@@ -405,13 +413,15 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		}()
 	}
 	go p.Serve(listener)
-	noProxy, dropped := mergeNoProxy(os.Getenv("NO_PROXY"), os.Getenv("no_proxy"), o.NoProxy, listenerAddr, parsed)
+	noProxy := listenerAddr
 	if o.DetachStdio {
 		e.Exec.NoProxy = listenerAddr
-		if len(dropped) != 0 {
-			warn(fmt.Sprintf("no_proxy: dropped %d inherited entries that could bypass glitchdeck", len(dropped)))
+		if os.Getenv("NO_PROXY") != "" || os.Getenv("no_proxy") != "" {
+			warn("no_proxy: ignored inherited bypass entries")
 		}
 	} else {
+		var dropped []string
+		noProxy, dropped = mergeNoProxy(os.Getenv("NO_PROXY"), os.Getenv("no_proxy"), o.NoProxy, listenerAddr, parsed)
 		safeTarget := "(forward-only)"
 		if parsed != nil {
 			safeTarget = parsed.Scheme + "://" + parsed.Host
@@ -428,9 +438,11 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	childCtx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(childCtx, o.Command[0], o.Command[1:]...)
-	cmd.Env = append(os.Environ(), env...)
 	cmd.Dir = o.Dir
-	if !o.DetachStdio {
+	if o.DetachStdio {
+		cmd.Env = append(cmd.Environ(), env...)
+	} else {
+		cmd.Env = append(os.Environ(), env...)
 		cmd.Stdin = os.Stdin
 	}
 	limit := o.TailBytes
@@ -449,28 +461,49 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if err = setupProcess(cmd, o.Grace); err != nil {
 		return finish(3, "PROCESS_SETUP_FAILED", err)
 	}
-	reportReader, reportWriter, err := isolateProcess(cmd, o.Grace)
+	var reportReader, reportWriter *os.File
+	var detached *detachedHelper
+	if o.DetachStdio {
+		detached, err = isolateDetachedProcess(cmd, o.Grace)
+		if detached != nil {
+			defer detached.close()
+			reportReader = detached.reportReader
+		}
+	} else {
+		reportReader, reportWriter, err = isolateProcess(cmd, o.Grace)
+		if reportReader != nil {
+			defer reportReader.Close()
+		}
+	}
 	if err != nil {
 		return finish(3, "PROCESS_SETUP_FAILED", err)
 	}
-	if reportReader != nil {
-		defer reportReader.Close()
-	}
 	ready := make(chan struct{})
+	authorized := false
 	if reportReader != nil {
 		cancelProcess := cmd.Cancel
 		cmd.Cancel = func() error {
 			<-ready
+			if detached != nil && !authorized {
+				return cmd.Process.Kill()
+			}
 			return cancelProcess()
 		}
 	}
-	relayGrace := o.Grace
-	if reportReader != nil {
-		relayGrace = 0
+	var startSignals func(*exec.Cmd)
+	if !o.DetachStdio {
+		relayGrace := o.Grace
+		if reportReader != nil {
+			relayGrace = 0
+		}
+		var stopSignals func()
+		startSignals, stopSignals = forwardSignals(relayGrace)
+		defer stopSignals()
 	}
-	startSignals, stopSignals := forwardSignals(relayGrace)
-	defer stopSignals()
 	err = cmd.Start()
+	if detached != nil {
+		detached.afterStart()
+	}
 	if reportWriter != nil {
 		_ = reportWriter.Close()
 	}
@@ -502,13 +535,40 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	var helperOutput *bufio.Reader
 	if reportReader != nil {
 		helperOutput = bufio.NewReader(reportReader)
-		line, _ := helperOutput.ReadString('\n')
-		if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
+	}
+	if detached != nil {
+		err = detached.authorize(childCtx, helperOutput)
+		authorized = err == nil
+		close(ready)
+		var pid int
+		if authorized {
+			pid, err = detached.readPID(childCtx, helperOutput)
+		}
+		if err != nil {
+			timedOut := errors.Is(childCtx.Err(), context.DeadlineExceeded)
+			cancel()
+			_ = cmd.Wait()
+			if timedOut {
+				e.Exec.TimedOut = true
+				return finish(124, "TIMEOUT", context.DeadlineExceeded)
+			}
+			return finish(3, "PROCESS_SETUP_FAILED", err)
+		}
+		if pid > 0 {
 			e.Exec.PID = pid
 		}
+	} else {
+		if helperOutput != nil {
+			line, _ := helperOutput.ReadString('\n')
+			if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
+				e.Exec.PID = pid
+			}
+		}
+		close(ready)
 	}
-	close(ready)
-	startSignals(cmd)
+	if startSignals != nil {
+		startSignals(cmd)
+	}
 	waitErr := cmd.Wait()
 	timedOut := waitErr != nil && errors.Is(childCtx.Err(), context.DeadlineExceeded)
 	leaked := cleanupProcess(cmd, o.Grace)
@@ -554,7 +614,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	var limits *assertionLimits
 	if o.DetachStdio {
 		assertCtx = childCtx
-		limits = &assertionLimits{remaining: 64 << 10}
+		limits = &assertionLimits{remaining: 64 << 10, dial: p.DialContext}
 	}
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
 	defer cancelDrain()
@@ -573,7 +633,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		}
 		if waitErr == nil {
 			httpResults = assertions(assertCtx, httpTape, probeURL, target, probePassword, nil, limits, opts.UpstreamCA)
-			waitErr = p.Wait(drainCtx)
+			if o.DetachStdio {
+				waitCtx, cancelWait := context.WithTimeout(assertCtx, o.Grace)
+				waitErr = p.Wait(waitCtx)
+				cancelWait()
+			} else {
+				waitErr = p.Wait(drainCtx)
+			}
 		}
 	}
 	e.Summary.RequestsTotal = p.RequestsTotal()

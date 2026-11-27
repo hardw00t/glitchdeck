@@ -58,13 +58,54 @@ func isolateProcess(cmd *exec.Cmd, grace time.Duration) (*os.File, *os.File, err
 	return reader, writer, nil
 }
 
+func isolateDetachedProcess(cmd *exec.Cmd, grace time.Duration) (*detachedHelper, error) {
+	if cmd.Err != nil {
+		return nil, nil
+	}
+	path := cmd.Path
+	if cmd.Dir != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(cmd.Dir, path)
+	}
+	if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Mode().Perm()&0111 == 0 {
+		return nil, nil
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	reportReader, reportWriter, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	ackReader, ackWriter, err := os.Pipe()
+	if err != nil {
+		_ = reportReader.Close()
+		_ = reportWriter.Close()
+		return nil, err
+	}
+	h := &detachedHelper{reportReader: reportReader, reportWriter: reportWriter, ackReader: ackReader, ackWriter: ackWriter}
+	cmd.Args = append([]string{self, cmd.Path}, cmd.Args...)
+	cmd.Path = self
+	cmd.Env = append(cmd.Env, helperEnv+"=detached:"+strconv.FormatInt(int64(grace), 10))
+	cmd.ExtraFiles = append(cmd.ExtraFiles, reportWriter, ackReader)
+	cmd.WaitDelay = 3*grace + 6*time.Second
+	return h, nil
+}
+
 func init() {
 	value := os.Getenv(helperEnv)
 	if value == "" {
 		return
 	}
 	var spec helperSpec
-	if json.Unmarshal([]byte(value), &spec) != nil || spec.Path == "" || len(spec.Args) == 0 {
+	detached := strings.HasPrefix(value, "detached:")
+	if detached {
+		grace, err := strconv.ParseInt(strings.TrimPrefix(value, "detached:"), 10, 64)
+		if err != nil || len(os.Args) < 3 {
+			os.Exit(125)
+		}
+		spec = helperSpec{Path: os.Args[1], Args: os.Args[2:], Grace: time.Duration(grace)}
+	} else if json.Unmarshal([]byte(value), &spec) != nil || spec.Path == "" || len(spec.Args) == 0 {
 		os.Exit(125)
 	}
 	_ = os.Unsetenv(helperEnv)
@@ -78,6 +119,24 @@ func init() {
 	startSignals, stopSignals := forwardSignals(spec.Grace)
 	report := os.NewFile(3, "helper-report")
 	syscall.CloseOnExec(3)
+	if detached {
+		ack := os.NewFile(4, "helper-ack")
+		syscall.CloseOnExec(4)
+		if report == nil || ack == nil {
+			stopSignals()
+			os.Exit(125)
+		}
+		if _, err := fmt.Fprintln(report, "ready"); err != nil {
+			stopSignals()
+			os.Exit(125)
+		}
+		var b [1]byte
+		if n, err := ack.Read(b[:]); err != nil || n != 1 || b[0] != 1 {
+			stopSignals()
+			os.Exit(125)
+		}
+		_ = ack.Close()
+	}
 	if err := cmd.Start(); err != nil {
 		stopSignals()
 		code := 125

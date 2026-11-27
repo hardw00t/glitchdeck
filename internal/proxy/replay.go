@@ -152,7 +152,7 @@ func (p *Proxy) replayCapacity(gen, seq uint64, rule *fault.Rule, mode string, f
 	if p.replayWarned == nil {
 		p.replayWarned = make(map[string]bool)
 	}
-	first := !p.replayWarned[rule.ID]
+	report := !p.replayWarned[rule.ID] && !p.options.SuppressStderr
 	p.replayWarned[rule.ID] = true
 	p.mu.Unlock()
 	for i := firstIndex; i < firstIndex+count; i++ {
@@ -163,7 +163,7 @@ func (p *Proxy) replayCapacity(gen, seq uint64, rule *fault.Rule, mode string, f
 		}
 		p.publish(gen, "http_req", event)
 	}
-	if first {
+	if report {
 		fmt.Fprintf(os.Stderr, "rule %q: webhook replay capacity exceeded\n", rule.ID)
 	}
 }

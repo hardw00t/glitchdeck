@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 type assertionLimits struct {
 	remaining int
 	omitted   int
+	dial      func(context.Context, string, string) (net.Conn, error)
 }
 
 func (l *assertionLimits) trim(r tape.Result) tape.Result {
@@ -55,6 +57,13 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 		client.Transport = transport
 		defer transport.CloseIdleConnections()
 	}
+	directClient := client
+	if private && limits.dial != nil {
+		transport := client.Transport.(*http.Transport).Clone()
+		transport.DialContext = limits.dial
+		directClient.Transport = transport
+		defer transport.CloseIdleConnections()
+	}
 	for _, a := range t.Assertions {
 		if private && ctx.Err() != nil {
 			break
@@ -78,7 +87,11 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 			req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("glitchdeck:"+password)))
 		}
 		start := time.Now()
-		resp, err := client.Do(req)
+		requestClient := &client
+		if a.Direct {
+			requestClient = &directClient
+		}
+		resp, err := requestClient.Do(req)
 		if err != nil {
 			if private {
 				r.Failures = append(r.Failures, "assertion request failed")
@@ -93,7 +106,11 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 			add(r)
 			continue
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		bodyLimit := int64(4 << 20)
+		if private && len(a.JSONEq) > 0 {
+			bodyLimit++
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, bodyLimit))
 		resp.Body.Close()
 		if err != nil {
 			if private {
@@ -109,7 +126,9 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 			r.Failures = append(r.Failures, "latency exceeded")
 		}
 		if len(a.JSONEq) > 0 {
-			if private {
+			if private && len(body) > 4<<20 {
+				r.Failures = append(r.Failures, "assertion response too large")
+			} else if private {
 				r.Failures = append(r.Failures, tape.CheckAssertionJSONRedacted(body, a.JSONEq)...)
 			} else {
 				r.Failures = append(r.Failures, tape.CheckAssertionJSON(body, a.JSONEq, nil)...)

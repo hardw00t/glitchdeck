@@ -3,7 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
 	"strconv"
 	"time"
 )
@@ -55,11 +55,25 @@ func (s *Server) runningJob() *job {
 
 func (s *Server) busyJob() (string, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.job != nil {
-		return s.job.id, true
+	j := s.job
+	if j == nil {
+		s.mu.Unlock()
+		return "", false
 	}
-	return "", false
+	finished, id := j.finished, j.id
+	s.mu.Unlock()
+	if finished {
+		select {
+		case <-j.done:
+			return "", false
+		case <-s.ctx.Done():
+			// The writer may still own the slot during shutdown.
+		}
+	}
+	if len(id) > 128 {
+		id = id[:128] + "..."
+	}
+	return id, true
 }
 
 func (s *Server) startJob(id json.RawMessage, name string, run jobRun, write func(any)) <-chan struct{} {
@@ -84,7 +98,7 @@ func (s *Server) startJob(id json.RawMessage, name string, run jobRun, write fun
 		j.finished = true
 		s.mu.Unlock()
 		if cancelled {
-			log.Printf("%s cancelled: request %s", name, j.id)
+			LogDiagnostic(fmt.Sprintf("%s cancelled: request %.128s", name, j.id))
 		} else if len(id) != 0 {
 			write(response)
 		}
@@ -112,6 +126,6 @@ func (s *Server) shutdownJob() {
 	select {
 	case <-j.done:
 	case <-timer.C:
-		log.Print("exec_run: child cleanup did not finish")
+		LogDiagnostic("exec_run: child cleanup did not finish")
 	}
 }

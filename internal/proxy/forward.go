@@ -38,6 +38,7 @@ type Options struct {
 	OnReset              func()
 	RequireUpstreamAllow bool
 	AllowLoopbackEgress  bool
+	SuppressStderr       bool
 }
 
 type RuleStats struct {
@@ -297,6 +298,11 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 	restrict := p.restrictEgressLocked(ctx)
 	p.mu.Unlock()
 	return p.dialWithPolicy(ctx, network, addr, restrict)
+}
+
+// DialContext applies the upstream allowlist and pins localhost to loopback.
+func (p *Proxy) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	return p.dialWithPolicy(ctx, network, addr, false)
 }
 
 func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restrict bool) (net.Conn, error) {

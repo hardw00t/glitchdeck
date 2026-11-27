@@ -15,7 +15,6 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 	"github.com/hardw00t/glitchdeck/internal/ui"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -131,6 +130,9 @@ func (s *Server) Serve() error {
 		case l = <-lines:
 		}
 		if l.data == nil {
+			if l.err != nil {
+				return l.err
+			}
 			if j := s.runningJob(); j != nil {
 				select {
 				case <-ctx.Done():
@@ -293,6 +295,9 @@ func (s *Server) Serve() error {
 			}
 		} else if reply := handle(l.data, false); reply != nil {
 			response = reply
+		}
+		if ctx.Err() != nil {
+			return nil
 		}
 		if response != nil {
 			if err := write(response); err != nil {
@@ -707,13 +712,29 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 			if e != nil {
 				return fail("INVALID_PATH", e.Error()), nil
 			}
+			base := s.opts.Workdir
+			if base == "" {
+				base = "."
+			}
+			base, e = filepath.Abs(base)
+			if e == nil {
+				base, e = filepath.EvalSymlinks(base)
+			}
+			var relative string
+			if e == nil {
+				relative, e = filepath.Rel(base, path)
+			}
+			if e != nil {
+				return fail("INVALID_PATH", e.Error()), nil
+			}
 			if e = s.writeTape(path, []byte(b)); e != nil {
 				return fail("INVALID_PATH", e.Error()), nil
 			}
 			res["out_path"] = path
+			res["tape_path"] = relative
 		}
 		if t.Truncated {
-			log.Printf("tape export truncated: dropped_entries=%d", t.DroppedEntries)
+			LogDiagnostic(fmt.Sprintf("tape export truncated: dropped_entries=%d", t.DroppedEntries))
 		}
 		return res, nil
 	case "demo_trigger":

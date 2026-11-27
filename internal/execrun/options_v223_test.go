@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/tape"
 )
@@ -45,6 +46,69 @@ func TestExecRecordsWarnings(t *testing.T) {
 	})
 	if len(r.Exec.Warnings) == 0 || !strings.Contains(r.Exec.Warnings[0], "tls-passthrough") {
 		t.Fatalf("warnings = %v", r.Exec.Warnings)
+	}
+}
+
+func TestDetachedWarningsStayOffStderr(t *testing.T) {
+	t.Setenv("SSL_CERT_FILE", filepath.Join(t.TempDir(), "missing.pem"))
+	f, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	previous := os.Stderr
+	os.Stderr = f
+	defer func() { os.Stderr = previous }()
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{
+		Command: []string{"true"}, DetachStdio: true, AllowZeroTraffic: true,
+		TLSPassthrough: []string{"example.com"},
+	})
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	warnings := strings.Join(r.Exec.Warnings, "\n")
+	if !r.OK || info.Size() != 0 || !strings.Contains(warnings, "tls-passthrough") ||
+		!strings.Contains(warnings, "SSL_CERT_FILE") || strings.Contains(warnings, "missing.pem") {
+		t.Fatalf("detached warnings: %q; stderr bytes: %d; error: %v", warnings, info.Size(), r.Error)
+	}
+}
+
+func TestDetachedProxyWaitStartsAfterAssertions(t *testing.T) {
+	const grace = 20 * time.Millisecond
+	t.Setenv("GORACE", os.Getenv("GORACE")+" atexit_sleep_ms=0")
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(3 * grace)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	doc := tape.Tape{Version: 2, Target: target.URL, Assertions: []tape.Assertion{{
+		Name: "slow", HTTPGet: "/", Direct: true, ExpectStatus: http.StatusNoContent,
+	}}}
+	for range 16 {
+		r := Run(context.Background(), doc, Options{
+			Command: []string{"true"}, Grace: grace, Timeout: 5 * time.Second, DetachStdio: true, AllowZeroTraffic: true,
+		})
+		if !r.OK || r.Summary.AssertionsPassed != 1 {
+			t.Fatalf("successful assertion failed cleanup: %+v", r)
+		}
+	}
+}
+
+func TestDetachedEnvironmentMatchesCwdAndProxyReport(t *testing.T) {
+	t.Setenv("PWD", t.TempDir())
+	t.Setenv("NO_PROXY", "example.com")
+	t.Setenv("no_proxy", "*")
+	dir := t.TempDir()
+	r := Run(context.Background(), tape.Tape{Version: 2}, Options{
+		Command: []string{"printenv", "PWD", "NO_PROXY", "no_proxy"},
+		Dir:     dir, DetachStdio: true, AllowZeroTraffic: true,
+	})
+	if !r.OK {
+		t.Fatalf("execution failed: %+v", r)
+	}
+	if got, want := r.Exec.StdoutTail, strings.Join([]string{dir, r.Exec.NoProxy, r.Exec.NoProxy}, "\n"); got != want {
+		t.Fatalf("effective child environment %q, want %q", got, want)
 	}
 }
 

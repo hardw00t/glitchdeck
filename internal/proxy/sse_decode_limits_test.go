@@ -108,6 +108,9 @@ func TestSSEDecoderStopsAtLineLimit(t *testing.T) {
 					if decoded.n > 1<<20+64<<10+32<<10 {
 						t.Fatalf("decoded %d bytes from %d compressed bytes", decoded.n, src.n)
 					}
+					if src.n >= len(data) {
+						t.Fatalf("read all %d compressed bytes before line limit", src.n)
+					}
 				}
 			})
 		}

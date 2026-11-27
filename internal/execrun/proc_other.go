@@ -14,3 +14,7 @@ func ownsChildren() bool  { return true }
 func isolateProcess(cmd *exec.Cmd, grace time.Duration) (*os.File, *os.File, error) {
 	return nil, nil, nil
 }
+
+func isolateDetachedProcess(cmd *exec.Cmd, grace time.Duration) (*detachedHelper, error) {
+	return nil, nil
+}

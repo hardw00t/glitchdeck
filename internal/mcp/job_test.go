@@ -36,7 +36,13 @@ func TestJobKeepsSlotUntilResponseWritten(t *testing.T) {
 	s := NewServer(nil, nil, Options{})
 	s.ctx = context.Background()
 	writing, release := make(chan struct{}), make(chan struct{})
-	defer close(release)
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
 	s.startJob(json.RawMessage(`1`), "tape_run", func(context.Context) map[string]any {
 		return map[string]any{"ok": true}
 	}, func(any) {
@@ -48,8 +54,21 @@ func TestJobKeepsSlotUntilResponseWritten(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("job did not reach the writer")
 	}
-	if id, busy := s.busyJob(); !busy || id != "1" {
-		t.Fatal("blocked response left the slot available")
+	admitted := make(chan bool, 1)
+	go func() { _, busy := s.busyJob(); admitted <- busy }()
+	select {
+	case busy := <-admitted:
+		t.Fatalf("admission returned before response completed: busy=%v", busy)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case busy := <-admitted:
+		if busy {
+			t.Fatal("completed response left slot busy")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("admission did not resume")
 	}
 }
 

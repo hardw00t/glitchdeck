@@ -112,7 +112,7 @@ func reportNoProxy(value string) string {
 	return strings.Join(items, ",")
 }
 
-func inheritedCerts(name string) []byte {
+func inheritedCerts(name string, warn func(string)) []byte {
 	path := os.Getenv(name)
 	if path == "" {
 		return nil
@@ -153,6 +153,10 @@ func inheritedCerts(name string) []byte {
 		}
 	}
 	if err != nil {
+		if warn != nil {
+			warn("ca: ignoring unreadable inherited " + name)
+			return nil
+		}
 		if e, ok := err.(*os.PathError); ok {
 			err = e.Err
 		}
