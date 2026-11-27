@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +45,45 @@ func TestExplicitTargetDoesNotGrantForwardEgress(t *testing.T) {
 	p.ServeHTTP(w, httptest.NewRequest("GET", "http://"+host+":1234/", nil))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("forward status %d", w.Code)
+	}
+}
+
+func TestConnectToSelfUsesReverseTarget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.URL.RequestURI() != "/" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	target, err := ParseTarget(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := New(target, fault.Config{}, nil)
+	defer p.Close()
+	server := httptest.NewServer(p)
+	defer server.Close()
+	addr := server.Listener.Addr().String()
+	c, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(c, "CONNECT %[1]s HTTP/1.1\r\nHost: %[1]s\r\n\r\n", addr); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("CONNECT status %d, want %d", resp.StatusCode, http.StatusNoContent)
 	}
 }
 

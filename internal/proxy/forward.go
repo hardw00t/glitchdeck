@@ -122,8 +122,7 @@ func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) {
 	p.stats[id] = v
 }
 
-func (p *Proxy) authorize(w http.ResponseWriter, r *http.Request) bool {
-	absolute := r.Method == http.MethodConnect || r.URL.IsAbs()
+func (p *Proxy) authorize(w http.ResponseWriter, r *http.Request, absolute bool) bool {
 	bind, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
 	bound := ""
 	if bind != nil {

@@ -282,6 +282,32 @@ func (p *Proxy) upstream(r *http.Request, body []byte, ctx context.Context) *htt
 	}
 	return q
 }
+
+func normalizeSelfRequest(r *http.Request) bool {
+	var host, port string
+	switch {
+	case r.Method == http.MethodConnect:
+		var err error
+		host, port, err = net.SplitHostPort(r.Host)
+		if err != nil {
+			return false
+		}
+	case (r.URL.Scheme == "http" || r.URL.Scheme == "https") && r.URL.User == nil:
+		host, port = r.URL.Hostname(), upstreamPort(r.URL.Scheme, r.URL.Port())
+	default:
+		return false
+	}
+	if !listenerAuthority(r.Context(), host, port) {
+		return false
+	}
+	*r.URL = url.URL{Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
+	if r.URL.Path == "" {
+		r.URL.Path = "/"
+	}
+	r.RequestURI = r.URL.RequestURI()
+	return true
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	if p.closed || p.draining {
@@ -296,11 +322,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request does not match CONNECT authority", http.StatusMisdirectedRequest)
 		return
 	}
-	if !p.authorize(w, r) {
+	self := normalizeSelfRequest(r)
+	tunnel := r.Method == http.MethodConnect && !self
+	if !p.authorize(w, r, tunnel || r.URL.IsAbs()) {
 		return
 	}
 	p.requests.Add(1)
-	if r.Method == http.MethodConnect {
+	if tunnel {
 		p.connect(w, r)
 		return
 	}

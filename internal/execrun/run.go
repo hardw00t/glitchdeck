@@ -286,7 +286,8 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		defer server.Close()
 		env = append(env, "GLITCHDECK_DEMO_TLS=https://"+l.Addr().String())
 	}
-	proxyURL := "http://" + listener.Addr().String()
+	listenerAddr := listener.Addr().String()
+	proxyURL := "http://" + listenerAddr
 	publicURL := proxyURL
 	if o.ProxyAuth {
 		var token [24]byte
@@ -294,7 +295,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			return finish(3, "PROXY_START_FAILED", err)
 		}
 		opts.ProxyAuth = hex.EncodeToString(token[:])
-		proxyURL = "http://glitchdeck:" + opts.ProxyAuth + "@" + listener.Addr().String()
+		proxyURL = "http://glitchdeck:" + opts.ProxyAuth + "@" + listenerAddr
 	}
 	p.SetOptions(opts)
 	e.Exec.ProxyURL, e.Exec.LeakedPIDs = publicURL, []int{}
@@ -336,7 +337,11 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		}()
 	}
 	go p.Serve(listener)
-	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+o.NoProxy, "no_proxy="+o.NoProxy, "NODE_USE_ENV_PROXY=1")
+	noProxy := listenerAddr
+	if o.NoProxy != "" {
+		noProxy = o.NoProxy + "," + noProxy
+	}
+	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
 	if e.Exec.UIURL != "" {
 		env = append(env, "GLITCHDECK_UI_URL="+e.Exec.UIURL)
 	}

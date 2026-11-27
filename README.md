@@ -36,7 +36,7 @@ glitchdeck exec --tape examples/tapes/openai-stream-reset.tape.yaml --json -- sh
 
 The checkout regression tape exits `1` and reports `duplicate_charges: expected 0, got 1`. [Example packs](examples/tapes/) run against the bundled demo without external calls; each tape documents its expected result. Version 1 tapes keep the original `test --json` array. Version 2 tapes and `exec --json` emit a versioned object with assertions and applied faults. `--report` saves that object to a file.
 
-`exec` injects `GLITCHDECK_PROXY_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and lowercase variants. Go clients bypass environment proxies for loopback; point their base URL at `GLITCHDECK_PROXY_URL` to use reverse mode. `exec` sets `NODE_USE_ENV_PROXY=1` and, when TLS is enabled, provides temporary CA paths to supported clients. Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers the process group; detached descendants can escape. Windows cleanup is best-effort and does not guarantee stopping grandchildren.
+`exec` injects `GLITCHDECK_PROXY_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and lowercase variants. The `NO_PROXY` list includes the proxy's own host and port. Point a client's base URL at `GLITCHDECK_PROXY_URL` to use reverse mode, including with Go clients that bypass environment proxies for loopback. `exec` sets `NODE_USE_ENV_PROXY=1` and, when TLS is enabled, provides temporary CA paths to supported clients. Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers the process group; detached descendants can escape. Windows cleanup is best-effort and does not guarantee stopping grandchildren.
 
 | Exit | Meaning |
 | --- | --- |

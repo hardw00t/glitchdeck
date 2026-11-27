@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,6 +84,29 @@ func authorityMatches(got, want, scheme string) bool {
 	return ((p == "443" && scheme == "https") || (p == "80" && scheme == "http")) && strings.EqualFold(strings.Trim(got, "[]"), h)
 }
 
+func listenerAuthority(ctx context.Context, host, port string) bool {
+	local, ok := ctx.Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	n, err := strconv.ParseUint(port, 10, 16)
+	if !ok || err != nil || uint64(local.Port) != n {
+		return false
+	}
+	ip, _ := netip.ParseAddr(host)
+	ip = ip.Unmap()
+	localIP := local.AddrPort().Addr().Unmap()
+	if ip.IsValid() && ip == localIP {
+		return true
+	}
+	var boundIP netip.Addr
+	if s, ok := ctx.Value(http.ServerContextKey).(*http.Server); ok && s.Addr != "" {
+		bound, _ := netip.ParseAddrPort(s.Addr)
+		boundIP = bound.Addr().Unmap()
+		if ip.IsValid() && ip == boundIP {
+			return true
+		}
+	}
+	return (localIP.IsLoopback() || boundIP.IsUnspecified()) && (ip.IsLoopback() || strings.EqualFold(host, "localhost"))
+}
+
 type bufferedConn struct {
 	net.Conn
 	r *bufio.Reader
@@ -126,6 +150,7 @@ func (p *Proxy) Serve(listener net.Listener) error {
 	protocols := H2CProtocols()
 	protocols.SetHTTP1(true)
 	s := &http.Server{
+		Addr:              listener.Addr().String(),
 		Handler:           p,
 		Protocols:         protocols,
 		ReadHeaderTimeout: 10 * time.Second,

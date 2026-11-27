@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -140,6 +141,36 @@ func TestExecReportsChildRequests(t *testing.T) {
 	})
 	if r.ExitCode != 0 || r.Summary.RequestsTotal != 1 {
 		t.Fatalf("unexpected child report: %+v", r)
+	}
+}
+
+func TestExecAbsoluteFormToSelfAssertsSSEReset(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl unavailable")
+	}
+	f, err := os.Open("../../examples/tapes/openai-sse-truncate-rst.tape.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tp, err := tape.Decode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Run(context.Background(), tp, Options{
+		Command: []string{"sh", "-c", `
+			test "$NO_PROXY" = "example.invalid,${GLITCHDECK_PROXY_URL#http://}" && \
+				test "$no_proxy" = "$NO_PROXY" || exit 9
+			unset NO_PROXY no_proxy
+			curl -q -sS -N --max-time 5 -X POST -H 'Content-Type: application/json' \
+				-d '{"tokens":8,"token_ms":1}' "$GLITCHDECK_PROXY_URL/api/chat/stream"
+			test "$?" -eq 56
+		`},
+		NoProxy: "example.invalid",
+		JSON:    true,
+	})
+	if r.ExitCode != 0 || r.Summary.RequestsTotal != 1 || r.Summary.AssertionsPassed != 1 {
+		t.Fatalf("unexpected child report: %+v, exec: %+v", r, r.Exec)
 	}
 }
 
