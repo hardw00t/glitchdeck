@@ -388,15 +388,13 @@ func TestDelayedReplayAfterFiveSeconds(t *testing.T) {
 	}
 }
 
-func TestOversizeUpgradePostPublishesError(t *testing.T) {
+func TestOversizeReplayPostPublishesError(t *testing.T) {
 	s, p, bus, _ := startProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("oversize request reached upstream")
-	}))
+		t.Error("oversize replay reached upstream")
+	}), rule("dup-webhook", "/", map[string]any{"count": 2}))
 	outcomes := make(chan proxy.Outcome, 1)
 	p.OnOutcome = func(o proxy.Outcome) { outcomes <- o }
 	req, _ := http.NewRequest("POST", s.URL, strings.NewReader(strings.Repeat("x", (4<<20)+1)))
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
