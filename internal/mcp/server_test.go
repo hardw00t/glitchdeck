@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,6 +98,32 @@ func TestTapeExportStaysInRoot(t *testing.T) {
 	}
 	if err := s.writeTape(filepath.Join(filepath.Dir(dir), "outside.yaml"), []byte("bad")); err == nil {
 		t.Fatal("wrote outside root")
+	}
+}
+
+func TestTapeExportReportsDroppedEntries(t *testing.T) {
+	s := NewServer(nil, nil, Options{Workdir: t.TempDir()})
+	s.ctx = context.Background()
+	start, _ := s.call("proxy_start", []byte(`{"target":"demo","record":true}`))
+	if start["error"] != nil {
+		t.Fatal(start)
+	}
+	t.Cleanup(s.stop)
+	for range 258 {
+		resp, err := http.Get(start["proxy_url"].(string) + "/api/state")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK {
+			t.Fatalf("request failed: %s: %v", resp.Status, err)
+		}
+	}
+	got, _ := s.call("tape_export", []byte(`{"name":"capped"}`))
+	if data, _ := got["yaml"].(string); got["truncated"] != true || got["dropped_entries"] != 2 ||
+		!strings.Contains(data, "truncated: true") || !strings.Contains(data, "dropped_entries: 2") {
+		t.Fatalf("tape export omitted truncation: %v", got)
 	}
 }
 

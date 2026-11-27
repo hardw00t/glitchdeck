@@ -13,6 +13,7 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 	"github.com/hardw00t/glitchdeck/internal/ui"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -613,6 +614,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			return fail("INVALID_TAPE", e.Error()), false
 		}
 		res := map[string]any{"name": a.Name, "steps": len(t.Script), "rules": len(t.Rules), "incomplete": t.Incomplete}
+		if t.Truncated {
+			res["truncated"], res["dropped_entries"] = true, t.DroppedEntries
+		}
 		if a.OutPath == "" {
 			if b.Len() > 64<<10 {
 				return fail("INVALID_PATH", "use out_path for large tapes"), false
@@ -630,6 +634,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 				return fail("INVALID_PATH", e.Error()), false
 			}
 			res["out_path"] = path
+		}
+		if t.Truncated {
+			log.Printf("tape export truncated: dropped_entries=%d", t.DroppedEntries)
 		}
 		return res, false
 	case "demo_trigger":

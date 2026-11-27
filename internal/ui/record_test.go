@@ -1,12 +1,15 @@
 package ui
 
 import (
+	"bytes"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/tape"
 )
 
 func TestStoppedTapeFreezesConfigChangesAndSequenceGaps(t *testing.T) {
@@ -113,4 +116,105 @@ func TestRecordingBudgetIncludesConfigSnapshots(t *testing.T) {
 			t.Fatal("recording retained an oversized initial configuration")
 		}
 	})
+}
+
+func TestRecordingRedactsHeadersAndQueryValues(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	h := make(http.Header)
+	for _, k := range []string{"x-api-key", "x-goog-api-key", "Stripe-Signature", "x-my-token", "x-extra-apikey", "x-my-secret", "Authorization"} {
+		h.Set(k, "fixture-secret")
+	}
+	h.Set("Content-Type", "application/json")
+	query := "?api_key=sk-123&keep=a%20b&ToKeN=other-secret;hidden-suffix&keep=c&%53ig=hidden&apikey=private&key=key-value&access_token=access-value&secret=secret-value&signature=sig-value"
+	now := time.Now()
+	r.request(proxy.Record{Seq: 1, Method: "GET", Path: "/reverse" + query, Header: h, At: now})
+	r.request(proxy.Record{Seq: 2, Method: "GET", Path: "/forward" + query, URL: "http://127.0.0.1/forward" + query, Header: h, At: now})
+	r.markSSE(2)
+	r.request(proxy.Record{Seq: 3, Path: "/ws" + query, WebSocket: true, At: now})
+	doc := r.tape(fault.Config{})
+	var data bytes.Buffer
+	if err := tape.Encode(&data, doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"fixture-secret", "sk-123", "other-secret", "hidden", "private", "key-value", "access-value", "secret-value", "sig-value"} {
+		if strings.Contains(data.String(), secret) {
+			t.Errorf("tape contains %q: %s", secret, data.String())
+		}
+	}
+	if !strings.Contains(data.String(), "Content-Type: application/json") ||
+		strings.Count(data.String(), "keep=a%20b") != 3 || strings.Count(data.String(), "keep=c") != 3 {
+		t.Fatalf("unrelated header or query values lost: %s", data.String())
+	}
+}
+
+func TestRecordingExportReportsEvictions(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		n     int
+		body  []byte
+		drops int
+	}{
+		{"entries", maxEntries + 2, nil, 2},
+		{"bytes", 5, bytes.Repeat([]byte("a"), 2<<20), 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var r recorder
+			r.start(0, 0, fault.Config{})
+			now := time.Now()
+			for i := 1; i <= tc.n; i++ {
+				r.request(proxy.Record{Seq: uint64(i), At: now, Method: "POST", Path: "/", Body: tc.body})
+			}
+			r.stop()
+			doc := r.tape(fault.Config{})
+			var data bytes.Buffer
+			if err := tape.Encode(&data, doc); err != nil {
+				t.Fatal(err)
+			}
+			if want := tc.n - tc.drops; len(doc.Script) != want || doc.Script[0].Seq != uint64(tc.drops+1) {
+				t.Fatalf("retained %d steps, want %d starting after %d", len(doc.Script), want, tc.drops)
+			}
+			if !bytes.Contains(data.Bytes(), []byte("truncated: true")) || !bytes.Contains(data.Bytes(), []byte("dropped_entries: 2")) {
+				t.Fatal("tape omits truncation metadata")
+			}
+			if _, err := tape.Decode(&data); err != nil {
+				t.Fatalf("truncated tape does not decode: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecordingMarksCappedRequestBody(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	r.request(proxy.Record{Seq: 1, Method: "POST", Path: "/upload", At: time.Now(), Body: []byte("prefix"), BodyTruncated: true})
+	status := r.stop()
+	doc := r.tape(fault.Config{})
+	if !status.Truncated || !doc.Truncated || !doc.Incomplete || doc.DroppedEntries != 0 ||
+		!strings.Contains(doc.IncompleteReason, "body was truncated") || len(doc.Script) != 1 || doc.Script[0].HTTP.Body != "prefix" {
+		t.Fatalf("status %+v, tape %+v", status, doc)
+	}
+	if next := r.start(1, 0, fault.Config{}); next.Truncated || next.Incomplete || next.DroppedEntries != 0 {
+		t.Fatalf("new recording inherited truncation: %+v", next)
+	}
+}
+
+func TestRecordingStopReportsPendingBody(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	if !r.shouldCaptureBody(1) {
+		t.Fatal("active recording did not capture the upload")
+	}
+	if doc := r.tape(fault.Config{}); !doc.Incomplete || !strings.Contains(doc.IncompleteReason, "in flight") {
+		t.Fatalf("running export omitted pending upload: %+v", doc)
+	}
+	r.request(proxy.Record{Seq: 1, Method: "POST", Path: "/", At: time.Now(), BodyCaptureStarted: true})
+	if status := r.stop(); status.Incomplete {
+		t.Fatalf("completed upload was still pending: %+v", status)
+	}
+	r.start(1, 0, fault.Config{})
+	r.shouldCaptureBody(2)
+	if status := r.stop(); !status.Incomplete || !strings.Contains(status.IncompleteReason, "in flight") {
+		t.Fatalf("stopped recording omitted pending upload: %+v", status)
+	}
 }

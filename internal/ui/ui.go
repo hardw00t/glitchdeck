@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -386,6 +387,11 @@ func (c *control) export(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-yaml")
 	w.Header().Set("Content-Disposition", `attachment; filename="tape.yaml"`)
 	w.Header().Set("Cache-Control", "no-store")
+	if doc.Truncated {
+		w.Header().Set("X-Glitchdeck-Truncated", "true")
+		w.Header().Set("X-Glitchdeck-Dropped-Entries", strconv.Itoa(doc.DroppedEntries))
+		log.Printf("tape export truncated: dropped_entries=%d", doc.DroppedEntries)
+	}
 	_, _ = data.WriteTo(w)
 }
 

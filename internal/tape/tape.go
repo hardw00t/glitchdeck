@@ -45,6 +45,8 @@ type Tape struct {
 	Script           []Step         `yaml:"script" json:"script"`
 	Incomplete       bool           `yaml:"incomplete,omitempty" json:"incomplete,omitempty"`
 	IncompleteReason string         `yaml:"incomplete_reason,omitempty" json:"incomplete_reason,omitempty"`
+	Truncated        bool           `yaml:"truncated,omitempty" json:"truncated,omitempty"`
+	DroppedEntries   int            `yaml:"dropped_entries,omitempty" json:"dropped_entries,omitempty"`
 	ConfigChanges    []ConfigChange `yaml:"config_changes,omitempty" json:"config_changes,omitempty"`
 	Assertions       []Assertion    `yaml:"assertions" json:"assertions"`
 	TLSMITM          bool           `yaml:"tls_mitm,omitempty" json:"tls_mitm,omitempty"`

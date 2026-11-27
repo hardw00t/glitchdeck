@@ -200,6 +200,8 @@ glitchdeck mcp
 
 Use `proxy_start` with a loopback target or `demo`, `fault_set` to arm rules, and `wire_events` to inspect traffic. Use `tape_export` to save a recording, `tape_validate` to check a tape without running it, and `tape_run` to replay one. Tape input paths must stay within the MCP workdir (`.` by default). See [SKILL.md](SKILL.md) for the regression workflow.
 
+Recordings strip common credential headers and replace sensitive query values with `REDACTED`. Check bodies and other fields for credentials before sharing a tape. Ring eviction sets `truncated` and `dropped_entries` in the exported tape and MCP result; the console download also exposes them as response headers.
+
 Use `glitchdeck report --junit report.json` for CI test dashboards and `glitchdeck validate -` to lint tapes from stdin.
 
 To run the [composite action](action.yml) from a checkout of this repository:

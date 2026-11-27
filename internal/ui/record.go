@@ -20,12 +20,16 @@ const (
 	maxRecordBytes = 8 << 20
 )
 
+const pendingBodyReason = "recording ended with request bodies still in flight"
+
 type recordingStatus struct {
 	Recording        bool   `json:"recording"`
 	ElapsedMS        int64  `json:"elapsed_ms"`
 	Events           int    `json:"events"`
 	Incomplete       bool   `json:"incomplete"`
 	IncompleteReason string `json:"incomplete_reason,omitempty"`
+	Truncated        bool   `json:"truncated,omitempty"`
+	DroppedEntries   int    `json:"dropped_entries,omitempty"`
 }
 
 type recorded struct {
@@ -57,6 +61,9 @@ type recorder struct {
 	changes          []recordedChange
 	incompleteReason string
 	lastFrame        time.Time
+	bodyTruncated    bool
+	droppedEntries   int
+	pendingBodies    int
 }
 
 // Recording captures traffic and configuration changes from a single proxy.
@@ -92,11 +99,22 @@ func (r *Recording) Export(name string) (tape.Tape, error) {
 
 func (r *recorder) attach(p *proxy.Proxy) {
 	p.OnRequest = r.request
+	p.ShouldCaptureBody = r.shouldCaptureBody
 	p.OnClientFrame = r.clientFrame
 	p.OnServerFrame = r.serverFrame
 	p.OnUnsupportedFrame = r.unsupportedFrame
 	p.OnSSE = r.markSSE
 	p.OnBlindTunnel = r.blindTunnel
+}
+
+func (r *recorder) shouldCaptureBody(seq uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running || seq <= r.startSeq {
+		return false
+	}
+	r.pendingBodies++
+	return true
 }
 
 func (r *recorder) markSSE(seq uint64) {
@@ -122,6 +140,7 @@ func (r *recorder) clear() {
 	r.changes = nil
 	r.incompleteReason = ""
 	r.lastFrame = time.Time{}
+	r.bodyTruncated, r.droppedEntries, r.pendingBodies = false, 0, 0
 }
 
 func (r *recorder) reset() {
@@ -154,6 +173,9 @@ func (r *recorder) stop() recordingStatus {
 	defer r.mu.Unlock()
 	if r.running {
 		r.running, r.stopped = false, time.Now()
+		if r.pendingBodies != 0 {
+			r.markIncomplete(pendingBodyReason)
+		}
 	}
 	return r.snapshot()
 }
@@ -172,6 +194,7 @@ func (r *recorder) snapshot() recordingStatus {
 	return recordingStatus{
 		Recording: r.running, ElapsedMS: end.Sub(r.started).Milliseconds(), Events: r.events,
 		Incomplete: r.incompleteReason != "", IncompleteReason: r.incompleteReason,
+		Truncated: r.bodyTruncated || r.droppedEntries != 0, DroppedEntries: r.droppedEntries,
 	}
 }
 
@@ -255,7 +278,13 @@ func (r *recorder) request(req proxy.Record) {
 	if !r.running || req.Seq <= r.startSeq {
 		return
 	}
-	if req.UnrecordableBody {
+	if req.BodyCaptureStarted {
+		r.pendingBodies--
+	}
+	if req.BodyTruncated {
+		r.bodyTruncated = true
+		r.markIncomplete("recorded request body was truncated")
+	} else if req.UnrecordableBody {
 		r.markIncomplete("streamed request body was not captured")
 	}
 	if req.URL != "" {
@@ -264,6 +293,7 @@ func (r *recorder) request(req proxy.Record) {
 			r.markIncomplete("forwarded traffic requires explicit upstream authorization for replay")
 		}
 	}
+	req.Path, req.URL = redactQuery(req.Path), redactQuery(req.URL)
 	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM}
 	if req.WebSocket {
 		if req.MITM || req.URL != "" {
@@ -281,8 +311,13 @@ func (r *recorder) request(req proxy.Record) {
 		}
 		e.bytes += len(req.Body) + len(req.URL) + len(req.Proto)
 		for k, v := range req.Header {
-			switch strings.ToLower(k) {
+			name := strings.ToLower(k)
+			switch name {
 			case "authorization", "proxy-authorization", "cookie", "set-cookie", "connection", "upgrade", "transfer-encoding", "content-length", "expect", "te", "trailer", "x-glitchdeck-run", "x-glitchdeck-seq":
+				continue
+			}
+			if strings.Contains(name, "secret") || strings.Contains(name, "token") ||
+				strings.Contains(name, "api-key") || strings.Contains(name, "apikey") || strings.Contains(name, "signature") {
 				continue
 			}
 			if e.http.Headers == nil {
@@ -298,6 +333,43 @@ func (r *recorder) request(req proxy.Record) {
 	r.trim()
 }
 
+func redactQuery(raw string) string {
+	base, query, ok := strings.Cut(raw, "?")
+	if !ok {
+		return raw
+	}
+	var out strings.Builder
+	for start := 0; start < len(query); {
+		end := strings.IndexByte(query[start:], '&')
+		if end < 0 {
+			end = len(query)
+		} else {
+			end += start
+		}
+		if key, _, hasValue := strings.Cut(query[start:end], "="); hasValue {
+			decoded, _ := url.QueryUnescape(key)
+			switch strings.ToLower(decoded) {
+			case "api_key", "apikey", "key", "token", "access_token", "secret", "sig", "signature":
+				if out.Len() == 0 {
+					out.WriteString(base)
+					out.WriteByte('?')
+				}
+				out.WriteString(query[:start])
+				out.WriteString(key)
+				out.WriteString("=REDACTED")
+				query, start = query[end:], 0
+				continue
+			}
+		}
+		start = end + 1
+	}
+	if out.Len() == 0 {
+		return raw
+	}
+	out.WriteString(query)
+	return out.String()
+}
+
 func (r *recorder) trim() {
 	for len(r.entries) > maxEntries || r.bytes > maxRecordBytes {
 		old := r.entries[0]
@@ -306,6 +378,7 @@ func (r *recorder) trim() {
 		delete(r.streams, old.seq)
 		r.bytes -= old.bytes
 		r.events -= old.events
+		r.droppedEntries++
 	}
 }
 
@@ -375,10 +448,15 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 			return 0
 		}
 	})
+	reason := r.incompleteReason
+	if reason == "" && r.pendingBodies != 0 {
+		reason = pendingBodyReason
+	}
 	doc := tape.Tape{
 		Version: 1,
 		Seed:    fallback.Seed, Rules: fallback.Rules,
-		Incomplete: r.incompleteReason != "", IncompleteReason: r.incompleteReason,
+		Incomplete: reason != "", IncompleteReason: reason,
+		Truncated: r.bodyTruncated || r.droppedEntries != 0, DroppedEntries: r.droppedEntries,
 		Script: make([]tape.Step, 0, len(entries)),
 	}
 	if r.started.IsZero() {
