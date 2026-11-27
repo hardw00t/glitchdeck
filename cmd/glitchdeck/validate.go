@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"slices"
 
 	"github.com/hardw00t/glitchdeck/internal/cli"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 )
+
+var validateStdin io.Reader = os.Stdin
 
 type validationResult struct {
 	File    string `json:"file"`
@@ -31,8 +35,12 @@ func validateCommand(args []string) int {
 	}
 	flags, files := cli.SplitArgs(args)
 	parseErr := f.Parse(flags)
-	if parseErr == nil && len(files) == 0 {
-		parseErr = errors.New(validateUsage)
+	if parseErr == nil {
+		if len(files) == 0 {
+			parseErr = errors.New(validateUsage)
+		} else if i := slices.Index(files, "-"); i >= 0 && slices.Contains(files[i+1:], "-") {
+			parseErr = errors.New("stdin (-) may be specified only once")
+		}
 	}
 	results := make([]validationResult, 0, len(files))
 	ok := parseErr == nil
@@ -45,15 +53,8 @@ func validateCommand(args []string) int {
 		}
 	} else {
 		for _, path := range files {
-			result := validationResult{File: path}
-			file, err := os.Open(path)
-			if err == nil {
-				t, decodeErr := tape.Decode(file)
-				file.Close()
-				result.Version, result.Name, result.Rules = t.Version, t.Name, len(t.Rules)
-				err = decodeErr
-			}
-			result.OK = err == nil
+			t, err := readValidationTape(path)
+			result := validationResult{File: path, OK: err == nil, Version: t.Version, Name: t.Name, Rules: len(t.Rules)}
 			if err != nil {
 				ok = false
 				result.Error = err.Error()
@@ -79,4 +80,24 @@ func validateCommand(args []string) int {
 		return 2
 	}
 	return 0
+}
+
+func readValidationTape(path string) (tape.Tape, error) {
+	if path == "-" {
+		const limit = 1 << 20
+		data, err := io.ReadAll(io.LimitReader(validateStdin, limit+1))
+		if len(data) > limit {
+			return tape.Tape{}, errors.New("stdin exceeds 1 MiB limit")
+		}
+		if err != nil {
+			return tape.Tape{}, err
+		}
+		return tape.Decode(bytes.NewReader(data))
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return tape.Tape{}, err
+	}
+	defer file.Close()
+	return tape.Decode(file)
 }

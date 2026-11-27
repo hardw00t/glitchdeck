@@ -75,3 +75,94 @@ func TestValidateRequiresFiles(t *testing.T) {
 		t.Fatalf("validate with no files: exit %d, want 2", code)
 	}
 }
+
+func TestValidateStdin(t *testing.T) {
+	old := validateStdin
+	t.Cleanup(func() { validateStdin = old })
+	const v2 = "version: 2\nname: current\ntarget: demo\n"
+	const limit = 1 << 20
+	const sizeError = "stdin exceeds 1 MiB limit"
+	for _, tc := range []struct {
+		name, input, wantName, wantError string
+		version                          int
+	}{
+		{"v1", "version: 1\nname: legacy\ntarget: demo\n", "legacy", "", 1},
+		{"v2", v2, "current", "", 2},
+		{"invalid YAML", "version: [\n", "", "yaml:", 0},
+		{"invalid schema", "version: 2\nunknown_field: true\n", "", "unknown_field", 0},
+		{"exact limit", v2 + strings.Repeat(" ", limit-len(v2)), "current", "", 2},
+		{"over limit", v2 + strings.Repeat(" ", limit+1-len(v2)), "", sizeError, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ok := tc.wantError == ""
+			wantExit := 0
+			if !ok {
+				wantExit = 2
+			}
+			validateStdin = strings.NewReader(tc.input)
+			code, out := launchOutput(t, "validate", "-")
+			if code != wantExit || ok && out != "OK -\n" ||
+				!ok && (!strings.HasPrefix(out, "INVALID -: ") || !strings.Contains(out, tc.wantError)) {
+				t.Errorf("human output: exit %d, stdout %q", code, out)
+			}
+
+			validateStdin = strings.NewReader(tc.input)
+			code, out = launchOutput(t, "validate", "-", "--json")
+			var got struct {
+				OK      *bool              `json:"ok"`
+				Results []validationResult `json:"results"`
+			}
+			if err := json.Unmarshal([]byte(out), &got); err != nil || code != wantExit || got.OK == nil || *got.OK != ok || len(got.Results) != 1 {
+				t.Fatalf("JSON output: exit %d, stdout %q, decode error %v", code, out, err)
+			}
+			r := got.Results[0]
+			if r.File != "-" || r.OK != ok || ok && (r.Name != tc.wantName || r.Version != tc.version || r.Error != "") ||
+				!ok && !strings.Contains(r.Error, tc.wantError) {
+				t.Errorf("wrong stdin result: %+v", r)
+			}
+		})
+	}
+}
+
+func TestValidateStdinDuplicate(t *testing.T) {
+	old := validateStdin
+	t.Cleanup(func() { validateStdin = old })
+	const input = "version: 2\nname: current\ntarget: demo\n"
+	reader := strings.NewReader(input)
+	validateStdin = reader
+	if code, out := launchOutput(t, "validate", "-", "-"); code != 2 || out != "" || reader.Len() != len(input) {
+		t.Fatalf("exit %d, stdout %q, unread bytes %d; want usage error before reading", code, out, reader.Len())
+	}
+	code, out, stderr := runHelpProcess(t, "validate", "-", "--json", "-")
+	var usage struct {
+		Code     string `json:"code"`
+		ExitCode int    `json:"exit_code"`
+	}
+	if err := json.Unmarshal([]byte(stderr), &usage); err != nil || code != 2 || usage.Code != "usage" ||
+		usage.ExitCode != 2 || !strings.Contains(out, `"ok":false,"results":[]`) {
+		t.Fatalf("exit %d, stdout %q, stderr %q, decode error %v", code, out, stderr, err)
+	}
+}
+
+func TestValidateStdinMixedWithFile(t *testing.T) {
+	old := validateStdin
+	t.Cleanup(func() { validateStdin = old })
+	validateStdin = strings.NewReader("version: 2\nname: piped\ntarget: demo\n")
+	path := filepath.Join(t.TempDir(), "file.yaml")
+	if err := os.WriteFile(path, []byte("version: 1\nname: disk\ntarget: demo\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, out := launchOutput(t, "validate", path, "-", "--json")
+	var got struct {
+		OK      bool               `json:"ok"`
+		Results []validationResult `json:"results"`
+	}
+	want := []validationResult{
+		{File: path, OK: true, Version: 1, Name: "disk"},
+		{File: "-", OK: true, Version: 2, Name: "piped"},
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 0 || !got.OK || len(got.Results) != 2 ||
+		got.Results[0] != want[0] || got.Results[1] != want[1] {
+		t.Fatalf("exit %d, stdout %q, decode error %v", code, out, err)
+	}
+}

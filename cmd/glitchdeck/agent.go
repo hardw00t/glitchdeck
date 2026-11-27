@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"flag"
 	"fmt"
@@ -276,10 +277,11 @@ func reportCommand(args []string) int {
 	f := flag.NewFlagSet("report", flag.ContinueOnError)
 	github := f.Bool("github", false, "GitHub annotations")
 	asJSON := f.Bool("json", false, "JSON output")
-	if showCommandHelp(f, args, "usage: glitchdeck report [--github|--json] report.json") {
+	junit := f.Bool("junit", false, "JUnit XML output")
+	if showCommandHelp(f, args, "usage: glitchdeck report [--github|--json|--junit] report.json") {
 		return 0
 	}
-	if f.Parse(flags) != nil || len(pos) != 1 || *github && *asJSON {
+	if f.Parse(flags) != nil || len(pos) != 1 || *github && *asJSON || *junit && (*github || *asJSON) {
 		return 2
 	}
 	data, err := os.ReadFile(pos[0])
@@ -297,6 +299,13 @@ func reportCommand(args []string) int {
 	}
 	if *asJSON {
 		_ = json.NewEncoder(os.Stdout).Encode(e)
+		return 0
+	}
+	if *junit {
+		if err := writeJUnitReport(os.Stdout, e); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 3
+		}
 		return 0
 	}
 	if *github {
@@ -338,6 +347,87 @@ func reportCommand(args []string) int {
 		fmt.Printf("Exit code: %d\n", e.ExitCode)
 	}
 	return 0
+}
+
+func writeJUnitReport(w io.Writer, e execrun.Envelope) error {
+	type problem struct {
+		Message string `xml:"message,attr"`
+		Text    string `xml:",chardata"`
+	}
+	type testcase struct {
+		Name      string   `xml:"name,attr"`
+		Classname string   `xml:"classname,attr"`
+		Failure   *problem `xml:"failure,omitempty"`
+		Error     *problem `xml:"error,omitempty"`
+	}
+	doc := struct {
+		XMLName xml.Name `xml:"testsuites"`
+		Suite   struct {
+			Name     string     `xml:"name,attr"`
+			Tests    int        `xml:"tests,attr"`
+			Failures int        `xml:"failures,attr"`
+			Errors   int        `xml:"errors,attr"`
+			Cases    []testcase `xml:"testcase"`
+		} `xml:"testsuite"`
+	}{}
+	suite := &doc.Suite
+	suite.Name = e.Tape
+	if suite.Name == "" {
+		suite.Name = "glitchdeck"
+	}
+	add := func(c testcase) {
+		c.Classname = suite.Name
+		suite.Cases = append(suite.Cases, c)
+		if c.Failure != nil {
+			suite.Failures++
+		}
+		if c.Error != nil {
+			suite.Errors++
+		}
+	}
+	represented := make(map[string]struct{})
+	for _, a := range e.Assertions {
+		c := testcase{Name: a.Name}
+		if !a.Passed {
+			c.Failure = &problem{Message: "assertion failed"}
+			if len(a.Failures) > 0 {
+				c.Failure.Message = a.Failures[0]
+				c.Failure.Text = strings.Join(a.Failures, "\n")
+			}
+			for _, line := range a.Failures {
+				represented[a.Name+": "+line] = struct{}{}
+			}
+		}
+		add(c)
+	}
+	for i, line := range e.Diff {
+		if _, ok := represented[line]; !ok {
+			add(testcase{Name: fmt.Sprintf("diff %d", i+1), Failure: &problem{Message: line, Text: line}})
+		}
+	}
+	if failure, ok := e.Error.(map[string]any); ok {
+		code, _ := failure["code"].(string)
+		message, _ := failure["message"].(string)
+		if message == "" {
+			message = code
+		} else if code != "" {
+			message = code + ": " + message
+		}
+		add(testcase{Name: "error", Error: &problem{Message: message, Text: message}})
+	}
+	if !e.OK && suite.Failures == 0 && suite.Errors == 0 {
+		message := fmt.Sprintf("exit code %d", e.ExitCode)
+		add(testcase{Name: "glitchdeck", Failure: &problem{Message: message, Text: message}})
+	} else if e.OK && len(e.Assertions) == 0 {
+		add(testcase{Name: "expectations"})
+	}
+	suite.Tests = len(suite.Cases)
+
+	if _, err := io.WriteString(w, xml.Header); err != nil {
+		return err
+	}
+	// encoding/xml escapes text and attributes and replaces invalid XML characters.
+	return xml.NewEncoder(w).Encode(doc)
 }
 
 func githubSummary(e execrun.Envelope, failures []string) string {
