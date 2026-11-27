@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -186,6 +187,57 @@ func TestToolArgumentsModesAndClosures(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestToolArgumentsSkipEmptyFragments(t *testing.T) {
+	const first = `{"city": "Paris"`
+	for _, tc := range []struct{ name, initial, fragment string }{
+		{"chat", `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"weather","arguments":""}}]}}]}`, `{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":%q}}]}}]}`},
+		{"legacy", `{"choices":[{"index":0,"delta":{"function_call":{"name":"weather","arguments":""}}}]}`, `{"choices":[{"index":0,"delta":{"function_call":{"arguments":%q}}}]}`},
+		{"anthropic", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":%q}}`},
+		{"responses", `{"type":"response.function_call_arguments.delta","item_id":"call_1","delta":""}`, `{"type":"response.function_call_arguments.delta","item_id":"call_1","delta":%q}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initial := "data: " + tc.initial + "\n\n"
+			laterEmpty := fmt.Sprintf("data: "+tc.fragment+"\n\n", "")
+			input := initial + fmt.Sprintf("data: "+tc.fragment+"\n\n", first) + laterEmpty
+			for _, fragment := range []string{`,`, `"unit":`, `"C"}`} {
+				input += fmt.Sprintf("data: "+tc.fragment+"\n\n", fragment)
+			}
+
+			p := New(nil, fault.Config{}, nil)
+			defer p.Close()
+			rule := &fault.Rule{ID: "tools", Fault: fault.Fault{Type: "sse-glitch", Params: map[string]any{"action": "corrupt_tool_args"}}}
+			w := httptest.NewRecorder()
+			result := p.relaySSE(context.Background(), w, strings.NewReader(input), rule, 1, 1, 0, time.Now(), "")
+			reader := sse.NewReader(w.Body, 0)
+			var args string
+			var frames []string
+			for {
+				frame, err := reader.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !json.Valid([]byte(frame.Data)) {
+					t.Fatalf("invalid outer JSON %q", frame.Data)
+				}
+				frames = append(frames, string(frame.Raw))
+				parts, _ := toolFragments(frame)
+				for _, part := range parts {
+					args += part.obj[part.field].(string)
+				}
+			}
+			if !result.applied || args != `{"city":` || json.Valid([]byte(args)) {
+				t.Fatalf("expected non-empty broken prefix; got arguments %q, result %+v", args, result)
+			}
+			if len(frames) != 3 || frames[0] != initial || frames[2] != laterEmpty {
+				t.Fatalf("empty fragments changed or later arguments leaked: %q", frames)
+			}
+		})
 	}
 }
 

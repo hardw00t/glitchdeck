@@ -401,6 +401,10 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 				parts, obj := toolFragments(f)
 				changed, drop := false, false
 				for _, part := range parts {
+					value := part.obj[part.field].(string)
+					if value == "" {
+						continue
+					}
 					if part.key == droppedTool {
 						if len(parts) == 1 && !part.shared {
 							drop = true
@@ -413,7 +417,6 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 					fragments++
 					if !res.applied && fragments == fault.Int(params, "after_fragments", 1) {
 						current = action
-						value := part.obj[part.field].(string)
 						switch fault.String(params, "mode", "truncate") {
 						case "drop":
 							drop = true
