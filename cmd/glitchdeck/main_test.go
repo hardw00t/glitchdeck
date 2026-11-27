@@ -5,9 +5,51 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestTopLevelHelp(t *testing.T) {
+	for _, alias := range []string{"-h", "--help", "help"} {
+		t.Run(alias, func(t *testing.T) {
+			code, out := launchOutput(t, alias)
+			if code != 0 || !strings.Contains(out, "validate") || !strings.Contains(out, "version") {
+				t.Fatalf("exit %d, stdout %q", code, out)
+			}
+		})
+	}
+	if code, _ := launchOutput(t, "not-a-command"); code != 2 {
+		t.Fatalf("unknown command: exit %d, want 2", code)
+	}
+}
+
+func TestBrowserCommand(t *testing.T) {
+	const ui = "http://127.0.0.1:8081"
+	for _, tc := range []struct {
+		goos, name string
+		args       []string
+	}{
+		{"darwin", "open", []string{ui}},
+		{"windows", "rundll32", []string{"url.dll,FileProtocolHandler", ui}},
+		{"linux", "xdg-open", []string{ui}},
+	} {
+		name, args := browserCommand(tc.goos, ui)
+		if name != tc.name || !slices.Equal(args, tc.args) {
+			t.Errorf("%s: got %q %q, want %q %q", tc.goos, name, args, tc.name, tc.args)
+		}
+	}
+	for _, url := range []string{"http://localhost:8081", "http://[::1]:8081"} {
+		if name, _ := browserCommand("linux", url); name == "" {
+			t.Errorf("refused loopback URL %q", url)
+		}
+	}
+	for _, url := range []string{"http://0.0.0.0:8081", "http://localhost.example:8081", "http://localhost@example.com:8081", "file://localhost/tmp", "--help"} {
+		if name, args := browserCommand("linux", url); name != "" || len(args) != 0 {
+			t.Errorf("accepted %q: %q %q", url, name, args)
+		}
+	}
+}
 
 func TestTapeExitCodes(t *testing.T) {
 	malformed := filepath.Join(t.TempDir(), "bad.yaml")

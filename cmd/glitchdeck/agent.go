@@ -292,15 +292,18 @@ func reportCommand(args []string) int {
 		_ = json.NewEncoder(os.Stdout).Encode(e)
 		return 0
 	}
-	for _, line := range e.Diff {
-		if *github {
-			escape := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
-			fmt.Printf("::error::%s\n", escape.Replace(line))
-		} else {
-			fmt.Println(line)
-		}
-	}
 	if *github {
+		escape := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
+		for _, line := range e.Diff {
+			fmt.Printf("::error::%s\n", escape.Replace(line))
+		}
+		if failure, ok := e.Error.(map[string]any); ok {
+			message, _ := failure["message"].(string)
+			code, _ := failure["code"].(string)
+			if message != "" {
+				fmt.Printf("::error::%s\n", escape.Replace(code+": "+message))
+			}
+		}
 		if e.OK {
 			fmt.Println("::notice::Glitchdeck expectations passed")
 		}
@@ -318,6 +321,9 @@ func reportCommand(args []string) int {
 			}
 		}
 	} else {
+		for _, line := range e.Diff {
+			fmt.Println(line)
+		}
 		fmt.Printf("Exit code: %d\n", e.ExitCode)
 	}
 	return 0

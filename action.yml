@@ -8,13 +8,40 @@ inputs:
     description: Release tag, major tag, source ref, or local
     required: false
     default: ""
+  command:
+    description: Command to run under the proxy
+    required: false
+    default: ""
+  target:
+    description: Override the tape target
+    required: false
+    default: ""
+  tls:
+    description: Enable TLS interception
+    required: false
+    default: "false"
+  upstream-allow:
+    description: Comma-separated allowed upstreams for exec
+    required: false
+    default: ""
+  timeout:
+    description: Run timeout duration
+    required: false
+    default: ""
+  summary:
+    description: Write a GitHub step summary
+    required: false
+    default: "true"
 outputs:
   exit-code:
-    description: Exit code from the tape test
+    description: Exit code from the Glitchdeck run
     value: ${{ steps.test.outputs.exit-code }}
   report:
     description: Path to the JSON report
     value: ${{ steps.test.outputs.report }}
+  summary-bytes:
+    description: Bytes written to the step summary
+    value: ${{ steps.test.outputs.summary-bytes }}
 runs:
   using: composite
   steps:
@@ -130,13 +157,35 @@ runs:
       shell: bash
       env:
         TAPE: ${{ inputs.tape }}
+        COMMAND: ${{ inputs.command }}
+        TARGET: ${{ inputs.target }}
+        TLS: ${{ inputs.tls }}
+        UPSTREAM_ALLOW: ${{ inputs.upstream-allow }}
+        TIMEOUT: ${{ inputs.timeout }}
+        SUMMARY: ${{ inputs.summary }}
       run: |
         report="$(mktemp -d "$RUNNER_TEMP/glitchdeck-report.XXXXXX")/report.json"
         if [[ "$RUNNER_OS" == Windows ]]; then report=$(cygpath -w "$report"); fi
+        flags=()
+        [[ -n "$TARGET" ]] && flags+=(--target "$TARGET")
+        [[ "$TLS" == true ]] && flags+=(--tls)
+        [[ -n "$TIMEOUT" ]] && flags+=(--timeout "$TIMEOUT")
         set +e
-        glitchdeck test "$TAPE" --json --report "$report"
+        if [[ -n "$COMMAND" ]]; then
+          [[ -n "$UPSTREAM_ALLOW" ]] && flags+=(--upstream-allow "$UPSTREAM_ALLOW")
+          glitchdeck exec --tape "$TAPE" --json --report "$report" "${flags[@]}" -- bash -lc "$COMMAND"
+        else
+          glitchdeck test "$TAPE" --json --report "$report" "${flags[@]}"
+        fi
         code=$?
-        set -e
+        if [[ "$SUMMARY" == true ]]; then
+          glitchdeck report --github "$report"
+        fi
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" && -f "$GITHUB_STEP_SUMMARY" ]]; then
+          echo "summary-bytes=$(wc -c < "$GITHUB_STEP_SUMMARY" | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+        else
+          echo "summary-bytes=0" >> "$GITHUB_OUTPUT"
+        fi
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
         echo "report=$report" >> "$GITHUB_OUTPUT"
         exit "$code"

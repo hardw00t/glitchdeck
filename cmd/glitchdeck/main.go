@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,12 +32,20 @@ import (
 )
 
 func main() { os.Exit(run(os.Args[1:])) }
+
+const usage = "usage: glitchdeck demo|proxy|test|exec|mcp|ca|report|validate|version"
+
 func run(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: glitchdeck demo|proxy|test|exec|mcp|ca|report|version")
+		fmt.Fprintln(os.Stderr, usage)
 		return 2
 	}
 	switch args[0] {
+	case "help", "-h", "--help":
+		fmt.Fprintln(os.Stdout, usage)
+		return 0
+	case "validate":
+		return validateCommand(args[1:])
 	case "demo":
 		return serve(args[1:], true)
 	case "proxy":
@@ -358,7 +368,17 @@ func serve(args []string, isDemo bool) int {
 		}
 	}
 	if *open {
-		_ = exec.Command("xdg-open", "http://"+ul.Addr().String()).Start()
+		name, args := browserCommand(runtime.GOOS, "http://"+ul.Addr().String())
+		if name == "" {
+			fmt.Fprintln(os.Stderr, "warning: --open requires a loopback UI URL")
+		} else {
+			cmd := exec.Command(name, args...)
+			if err := cmd.Start(); err != nil {
+				fmt.Fprintln(os.Stderr, "warning: opening UI:", err)
+			} else {
+				go func() { _ = cmd.Wait() }()
+			}
+		}
 	}
 	code := 0
 	select {
@@ -383,4 +403,19 @@ func serve(args []string, isDemo bool) int {
 		json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "shutdown", "exit_code": code})
 	}
 	return code
+}
+
+func browserCommand(goos, rawURL string) (string, []string) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "http" || u.User != nil || !cli.Loopback(net.JoinHostPort(u.Hostname(), u.Port())) {
+		return "", nil
+	}
+	switch goos {
+	case "darwin":
+		return "open", []string{rawURL}
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", rawURL}
+	default:
+		return "xdg-open", []string{rawURL}
+	}
 }

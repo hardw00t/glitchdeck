@@ -1,0 +1,11 @@
+version: 2
+name: your-app-h2-reset
+target: http://127.0.0.1:3000
+rules:
+  - id: reset
+    enabled: true
+    match: {proto: h2, path_prefix: /health}
+    fault: {type: h2-glitch, params: {action: rst_stream, code: REFUSED_STREAM}}
+expect:
+  child_exit: nonzero
+  faults: [{rule: reset, min_applied: 1}]

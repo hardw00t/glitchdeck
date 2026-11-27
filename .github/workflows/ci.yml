@@ -28,6 +28,7 @@ jobs:
         shell: bash
         run: |
           go build -o "$RUNNER_TEMP/glitchdeck" ./cmd/glitchdeck
+          "$RUNNER_TEMP/glitchdeck" validate examples/*.tape.yaml examples/tapes/*.tape.yaml
           set +e
           "$RUNNER_TEMP/glitchdeck" test examples/checkout-dup-webhook.tape.yaml --json
           fault=$?
@@ -45,3 +46,41 @@ jobs:
         with:
           version: local
           tape: examples/clean.tape.yaml
+      - name: Start local handler
+        run: python3 -m http.server 18765 --bind 127.0.0.1 > "$RUNNER_TEMP/handler.log" 2>&1 &
+      - name: Run exec action
+        id: exec
+        uses: ./
+        with:
+          version: local
+          tape: examples/tapes/your-app-openai-sse-cut.tape.yaml
+          target: http://127.0.0.1:18765
+          command: curl --fail --retry 5 --retry-connrefused --retry-delay 1 "$GLITCHDECK_PROXY_URL/"
+      - name: Check exec action
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.exec.outputs.exit-code }}
+          REPORT: ${{ steps.exec.outputs.report }}
+          SUMMARY_BYTES: ${{ steps.exec.outputs.summary-bytes }}
+        run: |
+          [[ "$EXIT_CODE" == 0 && -s "$REPORT" && "$SUMMARY_BYTES" -gt 0 ]]
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["command"] == "exec" and r["exit_code"] == 0' "$REPORT"
+      - name: Run failing exec action
+        id: failing
+        continue-on-error: true
+        uses: ./
+        with:
+          version: local
+          tape: examples/tapes/your-app-openai-sse-cut.tape.yaml
+          command: exit 1
+      - name: Check failing exec action
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.failing.outcome }}
+          EXIT_CODE: ${{ steps.failing.outputs.exit-code }}
+          REPORT: ${{ steps.failing.outputs.report }}
+          SUMMARY_BYTES: ${{ steps.failing.outputs.summary-bytes }}
+        run: |
+          [[ "$OUTCOME" == failure && "$EXIT_CODE" == 1 && -s "$REPORT" && "$SUMMARY_BYTES" -gt 0 ]]
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); assert r["command"] == "exec" and r["exit_code"] == 1' "$REPORT"

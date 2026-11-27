@@ -1,0 +1,10 @@
+version: 2
+name: your-app-stripe-dup-webhook
+target: http://127.0.0.1:3000
+rules:
+  - id: duplicate
+    enabled: true
+    match: {method: POST, path_prefix: /webhooks/stripe}
+    fault: {type: dup-webhook, params: {count: 2, delay_ms: 20}}
+expect:
+  faults: [{rule: duplicate, min_applied: 1}]

@@ -256,11 +256,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 				break
 			}
 		}
-		data = append(data, ca.PEM...)
-		if x = os.WriteFile(bundle, data, 0600); x != nil {
+		if x = writeCABundle(bundle, data, ca.PEM); x != nil {
 			return finish(3, "CA_ERROR", x)
 		}
-		env = append(env, "GLITCHDECK_CA_CERT="+cert, "NODE_EXTRA_CA_CERTS="+cert, "SSL_CERT_FILE="+bundle, "REQUESTS_CA_BUNDLE="+bundle, "CURL_CA_BUNDLE="+bundle)
+		env = append(env, "GLITCHDECK_CA_CERT="+cert, "NODE_EXTRA_CA_CERTS="+cert, "SSL_CERT_FILE="+bundle, "REQUESTS_CA_BUNDLE="+bundle, "CURL_CA_BUNDLE="+bundle, "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH="+bundle, "AWS_CA_BUNDLE="+bundle)
 	}
 	if opts.CA != nil && demoHandler != nil {
 		l, e := net.Listen("tcp", "127.0.0.1:0")
@@ -516,6 +515,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		return finish(1, "", nil)
 	}
 	return finish(0, "", nil)
+}
+
+func writeCABundle(path string, data, ca []byte) error {
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		data = append(data, '\n')
+	}
+	return os.WriteFile(path, append(data, ca...), 0600)
 }
 
 type tail struct{ b []byte }

@@ -1,8 +1,11 @@
 package execrun
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +18,7 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
+	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 )
 
 func TestExecInjectsProxy(t *testing.T) {
@@ -26,6 +30,98 @@ func TestExecInjectsProxy(t *testing.T) {
 	}
 	t.Setenv("GD_HELPER", "1")
 	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{os.Args[0], "-test.run=TestExecInjectsProxy"}})
+	if r.ExitCode != 0 {
+		t.Fatalf("exit %d: %+v", r.ExitCode, r)
+	}
+}
+
+func TestWriteCABundleSeparatesCertificates(t *testing.T) {
+	systemCA, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyCA, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"with newline", systemCA.PEM},
+		{"without newline", []byte(strings.TrimSuffix(string(systemCA.PEM), "\n"))},
+		{"empty", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "bundle.pem")
+			if err := writeCABundle(path, tc.data, proxyCA.PEM); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantData := append([]byte(nil), tc.data...)
+			if len(wantData) > 0 && wantData[len(wantData)-1] != '\n' {
+				wantData = append(wantData, '\n')
+			}
+			wantData = append(wantData, proxyCA.PEM...)
+			if !bytes.Equal(data, wantData) {
+				t.Fatal("bundle does not preserve and separate the certificates")
+			}
+			if strings.Contains(string(data), "-----END CERTIFICATE----------BEGIN CERTIFICATE-----") {
+				t.Fatal("certificates are glued together")
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(data) {
+				t.Fatal("bundle contains no valid certificates")
+			}
+			want := 2
+			if len(tc.data) == 0 {
+				want = 1
+			}
+			if len(pool.Subjects()) != want {
+				t.Fatalf("bundle contains %d certificates, want %d", len(pool.Subjects()), want)
+			}
+		})
+	}
+}
+
+func TestExecTLSExportsUsableBundle(t *testing.T) {
+	if os.Getenv("GD_TLS_HELPER") == "1" {
+		bundle := os.Getenv("SSL_CERT_FILE")
+		for _, name := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "AWS_CA_BUNDLE"} {
+			if bundle == "" || os.Getenv(name) != bundle {
+				t.Fatalf("%s does not point to SSL_CERT_FILE", name)
+			}
+		}
+		if os.Getenv("NODE_EXTRA_CA_CERTS") != os.Getenv("GLITCHDECK_CA_CERT") {
+			t.Fatal("NODE_EXTRA_CA_CERTS does not point to the proxy CA")
+		}
+		data, err := os.ReadFile(bundle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ca, err := os.ReadFile(os.Getenv("GLITCHDECK_CA_CERT"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		block, _ := pem.Decode(ca)
+		pool := x509.NewCertPool()
+		if block == nil || !pool.AppendCertsFromPEM(data) {
+			t.Fatal("invalid CA or bundle")
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := cert.Verify(x509.VerifyOptions{Roots: pool}); err != nil {
+			t.Fatalf("bundle does not trust proxy CA: %v", err)
+		}
+		return
+	}
+	t.Setenv("GD_TLS_HELPER", "1")
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{TLS: true, Command: []string{os.Args[0], "-test.run=^TestExecTLSExportsUsableBundle$"}, JSON: true})
 	if r.ExitCode != 0 {
 		t.Fatalf("exit %d: %+v", r.ExitCode, r)
 	}

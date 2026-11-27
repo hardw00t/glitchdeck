@@ -1,0 +1,10 @@
+version: 2
+name: your-app-ws-drop-1006
+target: http://127.0.0.1:3000
+rules:
+  - id: disconnect
+    enabled: true
+    match: {path_prefix: /ws}
+    fault: {type: ws-glitch, params: {action: close_1006, after_frames: 1}}
+expect:
+  faults: [{rule: disconnect, min_applied: 1}]

@@ -77,17 +77,98 @@ The checkout regression tape exits `1` and reports `duplicate_charges: expected 
 | `126` | Child command is not executable |
 | `127` | Child command was not found |
 
-## Your own app
+## Real-world use cases
 
-With an OpenAI-compatible SSE server running on port 3000, wrap the client from the repository root:
+Run these from the repository root with the named local services running. Starter tapes contain no demo traffic; change paths and payloads to match your app. `glitchdeck validate examples/tapes/your-app-*.tape.yaml` checks them without running traffic.
+
+### LLM stream disconnect
+
+With an OpenAI-compatible streaming service on port 3000:
 
 ```sh
-glitchdeck exec --tape examples/tapes/your-app-openai-sse-cut.tape.yaml --target http://127.0.0.1:3000 --json -- sh -c '
+glitchdeck exec --tape examples/tapes/your-app-openai-sse-cut.tape.yaml --json -- sh -c '
   export OPENAI_BASE_URL="$GLITCHDECK_PROXY_URL/v1"
   curl -q -fsSN --max-time 5 -H "Content-Type: application/json" -d '\''{"model":"local","messages":[{"role":"user","content":"Hi"}],"stream":true}'\'' "$OPENAI_BASE_URL/chat/completions"'
 ```
 
-Replace the curl line with your app's launch command if its SDK reads `OPENAI_BASE_URL`; otherwise, pass that URL as the SDK's base URL. Use a model your server supports. The tape closes the stream just before `[DONE]`. Curl exits `0` on this clean HTTP close, and the JSON report lists one `openai-stream-cut` fault for one streaming request. For a direct reverse proxy to an HTTPS origin such as `https://api.openai.com`, set `--target` to that origin (no `/v1` suffix). This exact reverse-proxy origin needs neither `--upstream-allow` nor `--tls`; forwarding HTTPS through CONNECT instead requires the explicit allowlist and `--tls` to inspect the stream.
+For an Anthropic-compatible service on the same port:
+
+```sh
+glitchdeck exec --tape examples/tapes/your-app-anthropic-sse-cut.tape.yaml --json -- sh -c '
+  export ANTHROPIC_BASE_URL="$GLITCHDECK_PROXY_URL"
+  curl -q -fsSN --max-time 5 -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" -d '\''{"model":"local","max_tokens":32,"messages":[{"role":"user","content":"Hi"}],"stream":true}'\'' "$ANTHROPIC_BASE_URL/v1/messages"'
+```
+
+The tapes close before `[DONE]` or `message_stop`; a clean HTTP close can still make curl exit 0. For Python or Node SDKs, replace curl with your app command and use the exported base URL (or configure the SDK explicitly). Use a model and credentials accepted by your service.
+
+### Duplicate Stripe webhook
+
+Run against a local endpoint accepting this test payload; use a valid signed fixture if signature verification is enabled:
+
+```sh
+glitchdeck exec --tape examples/tapes/your-app-stripe-dup-webhook.tape.yaml --json -- sh -c '
+  curl -q -fsS -H "Content-Type: application/json" -d '\''{"id":"evt_test_1","type":"payment_intent.succeeded"}'\'' "$GLITCHDECK_PROXY_URL/webhooks/stripe"'
+```
+
+The proxy replays the same POST; assert in your app's tests that the event produces only one charge or other side effect.
+
+### WebSocket silent drop
+
+With a server sending frames at `/ws`, use Node 22+ and inspect its abnormal close code:
+
+```sh
+glitchdeck exec --tape examples/tapes/your-app-ws-drop-1006.tape.yaml --timeout 10s --json -- node -e '
+  const ws = new WebSocket(process.env.GLITCHDECK_PROXY_URL.replace(/^http/, "ws") + "/ws");
+  ws.onclose = e => { console.log("close code:", e.code); process.exit(e.code === 1006 ? 0 : 1); };'
+```
+
+Change `after_frames` in the tape to choose when to drop the connection, then use your mobile client to test reconnect and backoff.
+
+### gRPC deadline and HTTP/2 reset
+
+For a local h2c service on port 3000 exposing the gRPC health service with reflection, install `grpcurl` and run:
+
+```sh
+glitchdeck exec --tape examples/tapes/your-app-grpc-deadline.tape.yaml --json -- sh -c '
+  grpcurl -plaintext -d "{}" "${GLITCHDECK_PROXY_URL#http://}" grpc.health.v1.Health/Check'
+```
+
+The tape expects a nonzero child exit and an injected `DEADLINE_EXCEEDED`. For an h2c HTTP service exposing `/health`, use curl built with HTTP/2 support:
+
+```sh
+glitchdeck exec --tape examples/tapes/your-app-h2-reset.tape.yaml --json -- sh -c '
+  curl -q -fsS --noproxy "*" --http2-prior-knowledge --max-time 5 "$GLITCHDECK_PROXY_URL/health"'
+```
+
+This injects `RST_STREAM` (`REFUSED_STREAM`); the tape expects curl to fail. Adjust the target and paths for your service. For a TLS upstream, use an `https://` target and `--upstream-ca` when its certificate is privately signed.
+
+### Regression loop
+
+1. Reproduce with `glitchdeck exec --tape examples/tapes/your-app-stripe-dup-webhook.tape.yaml --json -- your-test-command`, or use `glitchdeck mcp` to configure and inspect faults interactively.
+2. Fix the app, then rerun the same tape and check the JSON fault counts and assertions.
+3. Commit the `.tape.yaml` and run it in CI with the action below. See [SKILL.md](SKILL.md).
+
+Configure the stdio server (the executable must be on `PATH`):
+
+Claude Code, project `.mcp.json`:
+
+```json
+{"mcpServers":{"glitchdeck":{"type":"stdio","command":"glitchdeck","args":["mcp"]}}}
+```
+
+Cursor, project `.cursor/mcp.json`:
+
+```json
+{"mcpServers":{"glitchdeck":{"type":"stdio","command":"glitchdeck","args":["mcp"]}}}
+```
+
+Codex, `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.glitchdeck]
+command = "glitchdeck"
+args = ["mcp"]
+```
 
 ## Faults
 
@@ -105,10 +186,10 @@ Replace the curl line with your app's launch command if its SDK reads `OPENAI_BA
 
 ## MCP and CI
 
-Add `glitchdeck mcp` to a client that supports stdio MCP:
+Use the stdio configuration above for interactive MCP:
 
-```json
-{"mcpServers":{"glitchdeck":{"command":"glitchdeck","args":["mcp"]}}}
+```sh
+glitchdeck mcp
 ```
 
 Use `proxy_start` with a loopback target or `demo`, `fault_set` to arm rules, and `wire_events` to inspect traffic. Then export a tape or call `tape_run` to replay one. See [SKILL.md](SKILL.md) for the regression workflow.
@@ -123,13 +204,23 @@ To run the [composite action](action.yml) from a checkout of this repository:
     version: local
 ```
 
+Wrap an application's tests in exec mode:
+
+```yaml
+- uses: hardw00t/glitchdeck@v2
+  with:
+    tape: examples/tapes/your-app-stripe-dup-webhook.tape.yaml
+    target: http://127.0.0.1:3000
+    command: pytest tests/test_webhooks.py
+```
+
 In another repository, pin a release tag (or the floating major tag):
 
 ```yaml
 - uses: actions/checkout@v4
 - uses: hardw00t/glitchdeck@v2
   with:
-    tape: tapes/checkout.tape.yaml
+    tape: examples/clean.tape.yaml
 ```
 
 For a published action ref, omit `version` to use that ref. The action uses verified release binaries when available for the requested release, with a Go build for source refs. It exposes `exit-code` and the JSON `report` path.

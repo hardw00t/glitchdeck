@@ -1,0 +1,10 @@
+version: 2
+name: your-app-anthropic-sse-cut
+target: http://127.0.0.1:3000
+rules:
+  - id: anthropic-stream-cut
+    enabled: true
+    match: {method: POST, path_prefix: /v1/messages}
+    fault: {type: sse-glitch, params: {action: eof_early, before_event: message_stop, http_clean: true}}
+expect:
+  faults: [{rule: anthropic-stream-cut, min_applied: 1}]

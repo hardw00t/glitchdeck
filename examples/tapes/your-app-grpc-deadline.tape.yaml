@@ -1,0 +1,11 @@
+version: 2
+name: your-app-grpc-deadline
+target: http://127.0.0.1:3000
+rules:
+  - id: deadline
+    enabled: true
+    match: {path_prefix: /grpc.health.v1.Health/Check}
+    fault: {type: grpc-glitch, params: {code: DEADLINE_EXCEEDED, delay_ms: 20}}
+expect:
+  child_exit: nonzero
+  faults: [{rule: deadline, min_applied: 1}]
