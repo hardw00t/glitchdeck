@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,48 @@ func TestExecZeroTrafficFlag(t *testing.T) {
 		if code != tc.want || (tc.want == 1 && !strings.Contains(out, "zero_traffic")) {
 			t.Fatalf("exit %d, output %s", code, out)
 		}
+	}
+}
+
+func TestTLSPassthroughFlags(t *testing.T) {
+	path := execTapeWithoutExpectations(t)
+	for _, command := range []string{"exec", "proxy", "demo"} {
+		args := []string{command, "--tls-passthrough", "valid.test,api.*.com"}
+		if command == "exec" {
+			args = append(args, "--tape", path, "--", "true")
+		}
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := os.Stderr
+		os.Stderr = w
+		code, _ := launchOutput(t, args...)
+		os.Stderr = old
+		w.Close()
+		output, err := io.ReadAll(r)
+		r.Close()
+		if err != nil || code != 2 || !strings.Contains(string(output), "tls_passthrough[1]") {
+			t.Errorf("%s: exit %d, stderr %q, error %v", command, code, output, err)
+		}
+	}
+}
+
+func TestTLSPassthroughWithoutTLSNote(t *testing.T) {
+	path := execTapeWithoutExpectations(t)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	code, _ := launchOutput(t, "exec", "--tape", path, "--allow-zero-traffic", "--tls-passthrough", " example.com ", "--tls-passthrough", "*.example.com", "--", "true")
+	os.Stderr = old
+	w.Close()
+	output, err := io.ReadAll(r)
+	r.Close()
+	if err != nil || code != 0 || strings.Count(string(output), "tls-passthrough has no effect without --tls") != 1 {
+		t.Fatalf("exit %d, stderr %q, error %v", code, output, err)
 	}
 }
 

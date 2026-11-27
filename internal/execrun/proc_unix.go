@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const caReadFlags = os.O_RDONLY | syscall.O_NONBLOCK
+
 func setupProcess(cmd *exec.Cmd, grace time.Duration) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }

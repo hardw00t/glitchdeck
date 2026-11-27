@@ -242,6 +242,8 @@ func serve(args []string, isDemo bool) int {
 	asJSON := f.Bool("json", false, "stream JSON events")
 	var upstreamAllow listFlag
 	f.Var(&upstreamAllow, "upstream-allow", "allow upstream")
+	var passthrough listFlag
+	f.Var(&passthrough, "tls-passthrough", "tunnel matching TLS hosts without interception")
 	upstreamCA := f.String("upstream-ca", "", "upstream CA")
 	insecure := f.Bool("insecure-upstream", false, "skip upstream TLS verification")
 	alpn := f.String("mitm-alpn", "", "MITM ALPN")
@@ -257,6 +259,41 @@ func serve(args []string, isDemo bool) int {
 	}
 	if f.NArg() != 0 || *sseMax < 0 || (*alpn != "" && *alpn != "h1" && *alpn != "h2") || (*h2tap != "on" && *h2tap != "off") {
 		return fail("usage", errors.New("unexpected argument or invalid protocol option"))
+	}
+	for i, pattern := range passthrough {
+		if err := proxy.ValidatePassthrough(pattern); err != nil {
+			return fail("usage", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
+		}
+	}
+	cfg := fault.Config{Seed: *seed}
+	var startSeq uint64
+	if *tapePath != "" {
+		file, e := os.Open(*tapePath)
+		if e != nil {
+			return fail("tape_io", e)
+		}
+		t, e := tape.Decode(file)
+		file.Close()
+		if e != nil {
+			return fail("tape_invalid", e)
+		}
+		cfg = fault.Config{Seed: t.Seed, Rules: t.Rules}
+		startSeq = t.StartSeq
+		passthrough = append(passthrough, t.TLSPassthrough...)
+		if len(t.TLSPassthrough) != 0 {
+			// Serving tapes without passthrough retains the original flag-only policy.
+			tlsFromFlag := false
+			f.Visit(func(flag *flag.Flag) { tlsFromFlag = tlsFromFlag || flag.Name == "tls" })
+			if !tlsFromFlag {
+				*tlsEnabled = *tlsEnabled || t.TLSMITM
+			}
+			if *tlsEnabled {
+				upstreamAllow = append(upstreamAllow, t.UpstreamAllow...)
+			}
+		}
+	}
+	if len(passthrough) != 0 && !*tlsEnabled {
+		fmt.Fprintln(os.Stderr, "tls-passthrough has no effect without --tls")
 	}
 	for _, endpoint := range []string{*listen, *uiAddr} {
 		if !cli.Loopback(endpoint) {
@@ -290,21 +327,6 @@ func serve(args []string, isDemo bool) int {
 	if err != nil {
 		return fail("usage", err)
 	}
-	cfg := fault.Config{Seed: *seed}
-	var startSeq uint64
-	if *tapePath != "" {
-		file, e := os.Open(*tapePath)
-		if e != nil {
-			return fail("tape_io", e)
-		}
-		t, e := tape.Decode(file)
-		file.Close()
-		if e != nil {
-			return fail("tape_invalid", e)
-		}
-		cfg = fault.Config{Seed: t.Seed, Rules: t.Rules}
-		startSeq = t.StartSeq
-	}
 	pl, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fail("listen_failed", err)
@@ -317,7 +339,7 @@ func serve(args []string, isDemo bool) int {
 	defer ul.Close()
 	bus := telemetry.New()
 	p := proxy.New(u, cfg, bus)
-	opts := proxy.Options{Demo: isDemo, UpstreamAllow: upstreamAllow, InsecureUpstream: *insecure, MITMALPN: *alpn, H2TapOff: *h2tap == "off", SSETelemetryMax: *sseMax, AllowLoopbackEgress: *allowLoopbackEgress}
+	opts := proxy.Options{Demo: isDemo, UpstreamAllow: upstreamAllow, TLSPassthrough: passthrough, InsecureUpstream: *insecure, MITMALPN: *alpn, H2TapOff: *h2tap == "off", SSETelemetryMax: *sseMax, AllowLoopbackEgress: *allowLoopbackEgress}
 	if *upstreamCA != "" {
 		data, e := os.ReadFile(*upstreamCA)
 		if e != nil {

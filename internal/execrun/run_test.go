@@ -1,7 +1,6 @@
 package execrun
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -23,7 +22,6 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
-	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 )
 
 func TestExecInjectsProxy(t *testing.T) {
@@ -40,68 +38,16 @@ func TestExecInjectsProxy(t *testing.T) {
 	}
 }
 
-func TestWriteCABundleSeparatesCertificates(t *testing.T) {
-	systemCA, err := tlsmitm.Ephemeral()
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxyCA, err := tlsmitm.Ephemeral()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		name string
-		data []byte
-	}{
-		{"with newline", systemCA.PEM},
-		{"without newline", []byte(strings.TrimSuffix(string(systemCA.PEM), "\n"))},
-		{"empty", nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "bundle.pem")
-			if err := writeCABundle(path, tc.data, proxyCA.PEM); err != nil {
-				t.Fatal(err)
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			wantData := append([]byte(nil), tc.data...)
-			if len(wantData) > 0 && wantData[len(wantData)-1] != '\n' {
-				wantData = append(wantData, '\n')
-			}
-			wantData = append(wantData, proxyCA.PEM...)
-			if !bytes.Equal(data, wantData) {
-				t.Fatal("bundle does not preserve and separate the certificates")
-			}
-			if strings.Contains(string(data), "-----END CERTIFICATE----------BEGIN CERTIFICATE-----") {
-				t.Fatal("certificates are glued together")
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(data) {
-				t.Fatal("bundle contains no valid certificates")
-			}
-			want := 2
-			if len(tc.data) == 0 {
-				want = 1
-			}
-			if len(pool.Subjects()) != want {
-				t.Fatalf("bundle contains %d certificates, want %d", len(pool.Subjects()), want)
-			}
-		})
-	}
-}
-
 func TestExecTLSExportsUsableBundle(t *testing.T) {
 	if os.Getenv("GD_TLS_HELPER") == "1" {
 		bundle := os.Getenv("SSL_CERT_FILE")
-		for _, name := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "AWS_CA_BUNDLE"} {
+		for _, name := range []string{"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "AWS_CA_BUNDLE", "DENO_CERT", "GIT_SSL_CAINFO", "PIP_CERT", "NPM_CONFIG_CAFILE", "CARGO_HTTP_CAINFO"} {
 			if bundle == "" || os.Getenv(name) != bundle {
 				t.Fatalf("%s does not point to SSL_CERT_FILE", name)
 			}
 		}
-		if os.Getenv("NODE_EXTRA_CA_CERTS") != os.Getenv("GLITCHDECK_CA_CERT") {
-			t.Fatal("NODE_EXTRA_CA_CERTS does not point to the proxy CA")
+		if os.Getenv("NODE_EXTRA_CA_CERTS") == os.Getenv("GLITCHDECK_CA_CERT") {
+			t.Fatal("NODE_EXTRA_CA_CERTS must use the merged Node bundle")
 		}
 		data, err := os.ReadFile(bundle)
 		if err != nil {
@@ -489,7 +435,7 @@ func TestExecReportsTLSHandshakeFailure(t *testing.T) {
 	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{
 		TLS: true, JSON: true, Command: []string{os.Args[0], "-test.run=^TestExecReportsTLSHandshakeFailure$"},
 	})
-	if r.ExitCode != 0 || len(r.Diff) != 0 || len(r.Exec.TLSHandshakeFailures) != 1 ||
+	if r.ExitCode != 1 || !strings.Contains(strings.Join(r.Diff, "\n"), "tls_rejected_only") || len(r.Exec.TLSHandshakeFailures) != 1 ||
 		r.Exec.TLSHandshakeFailureCount != 1 || r.Exec.TLSHandshakeFailuresOmitted != 0 ||
 		!strings.Contains(string(r.Exec.TLSHandshakeFailures[0]), "bad certificate") {
 		t.Fatalf("missing TLS failure in report: %+v", r)
@@ -575,5 +521,98 @@ func TestExecWaitTimeoutSkipsAssertions(t *testing.T) {
 	}
 	if r.ExitCode != 3 || probes.Load() != 0 {
 		t.Fatalf("exit=%d probes=%d result=%+v", r.ExitCode, probes.Load(), r)
+	}
+}
+
+func TestMergeNoProxy(t *testing.T) {
+	target, _ := url.Parse("http://localhost:3000")
+	got, dropped := mergeNoProxy("internal.example.test,localhost", ".svc.test", "", "127.0.0.1:1234", target)
+	if got != "internal.example.test,.svc.test,127.0.0.1:1234" || strings.Join(dropped, ",") != "localhost" {
+		t.Fatalf("merge = %q, dropped %v", got, dropped)
+	}
+	got, dropped = mergeNoProxy("localhost", "", " LOCALHOST ", "127.0.0.1:1234", target)
+	if got != " LOCALHOST ,127.0.0.1:1234" || len(dropped) != 0 {
+		t.Fatalf("explicit merge = %q, dropped %v", got, dropped)
+	}
+	target, _ = url.Parse("http://example.com")
+	got, _ = mergeNoProxy("localhost", "", "", "127.0.0.1:1234", target)
+	if !strings.HasPrefix(got, "localhost,") {
+		t.Fatal(got)
+	}
+	target, _ = url.Parse("https://api.example.com")
+	got, dropped = mergeNoProxy("example.com,*.example.com,*.com,example.com:443", "api.EXAMPLE.com:443,.example.com:8443,*.other.test", "", "127.0.0.1:1234", target)
+	if got != ".example.com:8443,*.other.test,127.0.0.1:1234" || strings.Join(dropped, ",") != "example.com,*.example.com,*.com,example.com:443,api.EXAMPLE.com:443" {
+		t.Fatalf("domain merge = %q, dropped %v", got, dropped)
+	}
+}
+
+func TestExecTrafficChecks(t *testing.T) {
+	if mode := os.Getenv("GD_TRAFFIC_HELPER"); mode != "" {
+		p, _ := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(p), TLSClientConfig: &tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12}}}
+		if mode == "denied" || mode == "mixed" || mode == "oversized denial" {
+			target := "http://example.com/?token=do-not-print"
+			if mode == "mixed" {
+				target = "https://example.com/"
+			}
+			if mode == "oversized denial" {
+				target = "http://" + strings.Repeat("a", 64<<10) + ".test/"
+			}
+			resp, _ := client.Get(target)
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}
+		if mode == "rejected" || mode == "mixed" || mode == "rejected_nonzero" {
+			_, _ = client.Get("https://127.0.0.1:443/")
+		}
+		if mode == "mixed" {
+			resp, err := http.Get(os.Getenv("GLITCHDECK_PROXY_URL") + "/api/state")
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+		}
+		if mode == "rejected_nonzero" {
+			os.Exit(7)
+		}
+		return
+	}
+	for _, tc := range []struct {
+		mode, diff string
+		allow      bool
+		childExit  any
+		want       int
+		rejected   int64
+		denied     int64
+	}{
+		{mode: "denied", diff: "egress_denied_only: 1 request(s) blocked by the upstream allowlist (hosts: example.com)", want: 1, denied: 1},
+		{mode: "oversized denial", diff: "egress_denied_only:", want: 1, denied: 1},
+		{mode: "rejected", diff: "tls_rejected_only:", want: 1, rejected: 1},
+		{mode: "rejected_nonzero", allow: true, childExit: "nonzero", rejected: 1},
+		{mode: "mixed", rejected: 1, denied: 1},
+		{mode: "idle", diff: "Go net/http (and some other clients) never proxy localhost/127.0.0.1", want: 1},
+		{mode: "java", diff: "JVM ignores HTTP(S)_PROXY; set -Dhttps.proxyHost/-Dhttps.proxyPort via JAVA_TOOL_OPTIONS", want: 1},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			t.Setenv("GD_TRAFFIC_HELPER", tc.mode)
+			tp := tape.Tape{Version: 2, Target: "demo", Expect: tape.Expect{ChildExit: tc.childExit}}
+			command := []string{os.Args[0], "-test.run=^TestExecTrafficChecks$"}
+			if tc.mode == "java" {
+				if _, err := exec.LookPath("sh"); err != nil {
+					t.Skip("shell unavailable for java stub")
+				}
+				path := filepath.Join(t.TempDir(), "java")
+				if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				command = []string{path}
+			}
+			r := Run(context.Background(), tp, Options{TLS: true, JSON: true, AllowZeroTraffic: tc.allow, Command: command})
+			diff := strings.Join(r.Diff, " ")
+			if r.ExitCode != tc.want || !strings.Contains(diff, tc.diff) || strings.Contains(diff, "do-not-print") || tc.diff == "" && diff != "" || r.Exec.Traffic.TLSRejected != tc.rejected || r.Exec.Traffic.EgressDenied != tc.denied {
+				t.Fatalf("%+v; traffic %+v", r, r.Exec.Traffic)
+			}
+		})
 	}
 }

@@ -16,6 +16,30 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/tape"
 )
 
+func TestInheritedCARejectsNamedPipeWithoutWaitingForWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "roots.pem")
+	if err := syscall.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SSL_CERT_FILE", path)
+	done := make(chan []byte, 1)
+	go func() { done <- inheritedCerts("SSL_CERT_FILE") }()
+	select {
+	case data := <-done:
+		if len(data) != 0 {
+			t.Fatal("accepted named pipe as a certificate file")
+		}
+	case <-time.After(time.Second):
+		// Release a blocked open so the test cannot leave a reader behind.
+		w, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			w.Close()
+			<-done
+		}
+		t.Fatal("opening an inherited CA file blocked on the named pipe")
+	}
+}
+
 func TestExecReapsDetachedChild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pid")
 	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{"sh", "-c", `setsid sleep 300 & echo $! > "$1"; exec sleep 300`, "sh", path}, Timeout: 300 * time.Millisecond, Grace: 100 * time.Millisecond})

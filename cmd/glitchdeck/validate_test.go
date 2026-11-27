@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -259,5 +260,33 @@ func TestValidateAnthropicStatusWarning(t *testing.T) {
 	message, err := io.ReadAll(reader)
 	if err != nil || code != 0 || !strings.Contains(string(message), "warning") || !strings.Contains(string(message), "418") {
 		t.Fatalf("code=%d stderr=%q error=%v", code, message, err)
+	}
+}
+
+func TestValidateTLSPassthrough(t *testing.T) {
+	old := validateStdin
+	t.Cleanup(func() { validateStdin = old })
+	patterns := []string{"", "*", "any", "*.", "*.com", "api.*.com", "a*.example.com", "https://example.com", "example.com/path", "example.com?x", "user@example.com", "192.0.2.0/24", "example.com:0", "example.com:65536", strings.Repeat("a", 64) + ".test", strings.Repeat("a.", 126) + "aa", "[not-ip]:443"}
+	for _, pattern := range patterns {
+		t.Run(pattern, func(t *testing.T) {
+			input := "version: 2\ntls_passthrough: [" + strconv.Quote(pattern) + "]\n"
+			validateStdin = strings.NewReader(input)
+			if code, out := launchOutput(t, "validate", "-"); code != 2 || !strings.Contains(out, "tls_passthrough[0]") {
+				t.Fatalf("exit %d: %s", code, out)
+			}
+			path := filepath.Join(t.TempDir(), "invalid.tape.yaml")
+			if err := os.WriteFile(path, []byte(input), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if code, out := launchOutput(t, "validate", path); code != 2 || !strings.Contains(out, "tls_passthrough[0]") {
+				t.Fatalf("file exit %d: %s", code, out)
+			}
+		})
+	}
+	for _, input := range []string{"version: 1\ntls_passthrough: []\n", "version: 1\ntls_passthrough: [example.com]\n"} {
+		validateStdin = strings.NewReader(input)
+		if code, out := launchOutput(t, "validate", "-"); code != 2 || !strings.Contains(out, "new keys require version: 2") {
+			t.Fatalf("exit %d: %s", code, out)
+		}
 	}
 }

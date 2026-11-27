@@ -18,6 +18,7 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/cli"
 	"github.com/hardw00t/glitchdeck/internal/execrun"
 	"github.com/hardw00t/glitchdeck/internal/mcp"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 )
@@ -54,10 +55,12 @@ func execCommand(args []string) int {
 	f.BoolVar(&o.InsecureUpstream, "insecure-upstream", false, "skip upstream TLS verification")
 	f.BoolVar(&o.AllowRemote, "allow-remote", false, "permit non-loopback listener")
 	f.BoolVar(&o.AllowLoopbackEgress, "allow-loopback-egress", false, "allow loopback, link-local and unspecified upstream addresses on non-loopback proxy listeners")
-	f.BoolVar(&o.AllowZeroTraffic, "allow-zero-traffic", false, "allow zero requests or zero triggered faults")
+	f.BoolVar(&o.AllowZeroTraffic, "allow-zero-traffic", false, "allow zero, TLS-rejected-only or egress-denied-only traffic, or zero triggered faults")
 	f.BoolVar(&o.ProxyAuth, "proxy-auth", false, "enable proxy authentication")
 	var allow listFlag
 	f.Var(&allow, "upstream-allow", "allow upstream")
+	var passthrough listFlag
+	f.Var(&passthrough, "tls-passthrough", "tunnel matching TLS hosts without interception")
 	seed := f.Uint64("seed", 0, "override seed")
 	const execUsage = "usage: glitchdeck exec --tape <file> [flags] -- <command> [args...]"
 	f.Usage = func() {
@@ -91,7 +94,19 @@ func execCommand(args []string) int {
 				fmt.Fprintln(os.Stderr, e.Error)
 			}
 		} else {
-			fmt.Printf("exec exit %d\n", e.ExitCode)
+			fmt.Printf("exec exit %d", e.ExitCode)
+			if e.Exec != nil {
+				if e.Exec.Traffic.TLSRejected != 0 {
+					fmt.Printf(", tls rejected %d", e.Exec.Traffic.TLSRejected)
+				}
+				if e.Exec.Traffic.PassthroughOK != 0 {
+					fmt.Printf(", passthrough %d", e.Exec.Traffic.PassthroughOK)
+				}
+				if e.Exec.Traffic.EgressDenied != 0 {
+					fmt.Printf(", egress denied %d", e.Exec.Traffic.EgressDenied)
+				}
+			}
+			fmt.Println()
 			for _, diff := range e.Diff {
 				fmt.Println(diff)
 			}
@@ -115,6 +130,11 @@ func execCommand(args []string) int {
 	if *path == "" || f.NArg() != 0 || sep+1 == len(args) || o.Timeout <= 0 || o.Grace <= 0 {
 		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
 	}
+	for i, pattern := range passthrough {
+		if err := proxy.ValidatePassthrough(pattern); err != nil {
+			return fail("USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
+		}
+	}
 	file, err := os.Open(*path)
 	if err != nil {
 		return fail("TAPE_IO", err)
@@ -129,7 +149,7 @@ func execCommand(args []string) int {
 			o.Seed = seed
 		}
 	})
-	o.Command, o.TapePath, o.JSON, o.UpstreamAllow = args[sep+1:], *path, *asJSON, allow
+	o.Command, o.TapePath, o.JSON, o.UpstreamAllow, o.TLSPassthrough = args[sep+1:], *path, *asJSON, allow, passthrough
 	return emit(execrun.Run(context.Background(), t, o))
 }
 

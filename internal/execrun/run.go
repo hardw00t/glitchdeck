@@ -45,6 +45,7 @@ type Options struct {
 	CADir               string
 	NoProxy             string
 	UpstreamAllow       []string
+	TLSPassthrough      []string
 	UpstreamCA          string
 	InsecureUpstream    bool
 	ProxyAuth           bool
@@ -53,20 +54,24 @@ type Options struct {
 	AllowLoopbackEgress bool
 	AllowZeroTraffic    bool
 	Seed                *uint64
+	javaHome            bool
 }
 type Exec struct {
-	Cmd                         []string          `json:"cmd"`
-	ProxyURL                    string            `json:"proxy_url"`
-	UIURL                       string            `json:"ui_url,omitempty"`
-	ExitCode                    int               `json:"exit_code"`
-	TimedOut                    bool              `json:"timed_out"`
-	StdoutTail                  string            `json:"stdout_tail"`
-	StderrTail                  string            `json:"stderr_tail"`
-	PID                         int               `json:"pid,omitempty"`
-	LeakedPIDs                  []int             `json:"leaked_pids"`
-	TLSHandshakeFailures        []json.RawMessage `json:"tls_handshake_failures,omitempty"`
-	TLSHandshakeFailureCount    uint64            `json:"tls_handshake_failure_count,omitempty"`
-	TLSHandshakeFailuresOmitted uint64            `json:"tls_handshake_failures_omitted,omitempty"`
+	Cmd                         []string           `json:"cmd"`
+	ProxyURL                    string             `json:"proxy_url"`
+	UIURL                       string             `json:"ui_url,omitempty"`
+	ExitCode                    int                `json:"exit_code"`
+	TimedOut                    bool               `json:"timed_out"`
+	StdoutTail                  string             `json:"stdout_tail"`
+	StderrTail                  string             `json:"stderr_tail"`
+	PID                         int                `json:"pid,omitempty"`
+	LeakedPIDs                  []int              `json:"leaked_pids"`
+	TLSHandshakeFailures        []json.RawMessage  `json:"tls_handshake_failures,omitempty"`
+	TLSHandshakeFailureCount    uint64             `json:"tls_handshake_failure_count,omitempty"`
+	TLSHandshakeFailuresOmitted uint64             `json:"tls_handshake_failures_omitted,omitempty"`
+	NoProxy                     string             `json:"no_proxy"`
+	NoProxyDropped              []string           `json:"no_proxy_dropped,omitempty"`
+	Traffic                     proxy.TrafficStats `json:"traffic"`
 }
 type Summary struct {
 	AssertionsTotal  int    `json:"assertions_total"`
@@ -126,6 +131,7 @@ type helperReport struct {
 
 func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	start := time.Now()
+	o.javaHome = os.Getenv("JAVA_HOME") != ""
 	target := t.Target
 	if o.Target != "" {
 		target = o.Target
@@ -192,14 +198,24 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	bus := telemetry.New()
 	evidence := newAssertionEvidence(t)
 	var tlsFailures tlsFailureEvidence
+	var hosts trafficHosts
 	bus.SetObserver(func(event telemetry.Event) {
 		evidence.observe(event)
 		tlsFailures.observe(event)
+		hosts.observe(event)
 	})
 	p := proxy.New(parsed, fault.Config{Seed: seed, Rules: t.Rules}, bus)
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
-	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress}
+	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), TLSPassthrough: append(append([]string{}, t.TLSPassthrough...), o.TLSPassthrough...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress}
+	for i, pattern := range opts.TLSPassthrough {
+		if err := proxy.ValidatePassthrough(pattern); err != nil {
+			return finish(2, "USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
+		}
+	}
+	if len(opts.TLSPassthrough) > 0 && !o.TLS && !t.TLSMITM {
+		fmt.Fprintln(os.Stderr, "tls-passthrough has no effect without --tls")
+	}
 	var scheduleStart time.Time
 	var configMu sync.Mutex
 	applied := make([]bool, len(t.ConfigChanges))
@@ -265,10 +281,30 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 				break
 			}
 		}
-		if x = writeCABundle(bundle, data, ca.PEM); x != nil {
+		var inherited [][]byte
+		var node []byte
+		for _, name := range []string{"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"} {
+			certs := inheritedCerts(name)
+			if name == "SSL_CERT_FILE" && len(certs) > 0 && len(opts.TLSPassthrough) > 0 {
+				if _, set := os.LookupEnv("NODE_USE_SYSTEM_CA"); !set {
+					env = append(env, "NODE_USE_SYSTEM_CA=1")
+				}
+			}
+			inherited = append(inherited, certs)
+			if name == "NODE_EXTRA_CA_CERTS" {
+				node = certs
+			}
+		}
+		parts := append([][]byte{data}, inherited...)
+		parts = append(parts, ca.PEM)
+		nodePath := filepath.Join(dir, "node-extra.pem")
+		if x = os.WriteFile(bundle, certBundle(parts...), 0600); x != nil {
 			return finish(3, "CA_ERROR", x)
 		}
-		env = append(env, "GLITCHDECK_CA_CERT="+cert, "NODE_EXTRA_CA_CERTS="+cert, "SSL_CERT_FILE="+bundle, "REQUESTS_CA_BUNDLE="+bundle, "CURL_CA_BUNDLE="+bundle, "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH="+bundle, "AWS_CA_BUNDLE="+bundle)
+		if x = os.WriteFile(nodePath, certBundle(node, ca.PEM), 0600); x != nil {
+			return finish(3, "CA_ERROR", x)
+		}
+		env = append(env, "GLITCHDECK_CA_CERT="+cert, "NODE_EXTRA_CA_CERTS="+nodePath, "SSL_CERT_FILE="+bundle, "REQUESTS_CA_BUNDLE="+bundle, "CURL_CA_BUNDLE="+bundle, "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH="+bundle, "AWS_CA_BUNDLE="+bundle, "DENO_CERT="+bundle, "GIT_SSL_CAINFO="+bundle, "PIP_CERT="+bundle, "NPM_CONFIG_CAFILE="+bundle, "CARGO_HTTP_CAINFO="+bundle)
 	}
 	if opts.CA != nil && demoHandler != nil {
 		l, e := net.Listen("tcp", "127.0.0.1:0")
@@ -345,9 +381,14 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		}()
 	}
 	go p.Serve(listener)
-	noProxy := listenerAddr
-	if o.NoProxy != "" {
-		noProxy = o.NoProxy + "," + noProxy
+	noProxy, dropped := mergeNoProxy(os.Getenv("NO_PROXY"), os.Getenv("no_proxy"), o.NoProxy, listenerAddr, parsed)
+	e.Exec.NoProxy, e.Exec.NoProxyDropped = reportNoProxy(noProxy), dropped
+	safeTarget := ""
+	if parsed != nil {
+		safeTarget = parsed.Scheme + "://" + parsed.Host
+	}
+	for _, entry := range dropped {
+		fmt.Fprintf(os.Stderr, "no_proxy: dropped %q from inherited NO_PROXY; it would bypass glitchdeck for target %s (pass --no-proxy %s to keep it)\n", entry, safeTarget, entry)
 	}
 	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
 	if e.Exec.UIURL != "" {
@@ -460,7 +501,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if cmd.ProcessState != nil {
 		e.Exec.ExitCode = cmd.ProcessState.ExitCode()
 	}
-	childRequests := p.RequestsTotal()
+	var childStats proxy.TrafficStats
 	httpTape := t
 	httpTape.Assertions = nil
 	proxyAssertions := false
@@ -473,10 +514,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
 	defer cancelDrain()
 	var childFaults []proxy.AppliedFault
-	waitErr = nil
-	if proxyAssertions {
-		waitErr = p.Wait(drainCtx)
-		if waitErr == nil {
+	waitErr = p.Wait(drainCtx)
+	childStats = p.TrafficStats()
+	if waitErr == nil {
+		if proxyAssertions {
 			childFaults = p.AppliedFaults()
 		}
 	}
@@ -496,6 +537,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	e.Exec.TLSHandshakeFailureCount, e.Exec.TLSHandshakeFailures = tlsFailures.snapshot()
 	e.Exec.TLSHandshakeFailuresOmitted = e.Exec.TLSHandshakeFailureCount - uint64(len(e.Exec.TLSHandshakeFailures))
+	e.Exec.Traffic = childStats
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))
 	}
@@ -516,9 +558,31 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	results := append(httpResults, assertions(ctx, protocolTape, "", target, opts.ProxyAuth, evidence.history())...)
 	e.SetResults(results)
 	failed := e.Summary.AssertionsFailed > 0
+	innerOK := childStats.InnerRequests > childStats.InnerEgressDenied
+	// A denied CONNECT is not an inner request; subtract only denied HTTP requests.
+	tlsOnly := childStats.TLSRejected > 0 && !innerOK && childStats.PassthroughOK+childStats.BlindOK == 0
+	deniedOnly := childStats.EgressDenied > 0 && !innerOK && childStats.InterceptedOK+childStats.PassthroughOK+childStats.BlindOK == 0
+	hostList := func(kind string) string {
+		list := hosts.list(kind)
+		if opts.ProxyAuth != "" {
+			list = strings.ReplaceAll(list, opts.ProxyAuth, "[redacted]")
+		}
+		return list
+	}
+	if childStats.TLSRejected > 0 && innerOK {
+		fmt.Fprintf(os.Stderr, "warning: tls_rejected: %d handshake(s) failed for hosts %s\n", childStats.TLSRejected, hostList("tls"))
+	}
 	if !o.AllowZeroTraffic {
-		if childRequests == 0 {
-			e.Diff = append(e.Diff, "zero_traffic: no requests reached the proxy; check HTTP(S)_PROXY bypass (Go ignores proxies for localhost/127.0.0.1) and CA trust")
+		if tlsOnly {
+			line := fmt.Sprintf("tls_rejected_only: %d CONNECT tunnel(s) reached glitchdeck but the client rejected the interception certificate (hosts: %s); trust $GLITCHDECK_CA_CERT in the client, or add pinned hosts to --tls-passthrough", childStats.TLSRejected, hostList("tls"))
+			e.Diff = append(e.Diff, strings.Join(append([]string{line}, hint(o, o.Command, parsed, childStats)...), "; "))
+			failed = true
+		} else if deniedOnly {
+			e.Diff = append(e.Diff, fmt.Sprintf("egress_denied_only: %d request(s) blocked by the upstream allowlist (hosts: %s); add --upstream-allow <host> or tape upstream_allow", childStats.EgressDenied, hostList("denied")))
+			failed = true
+		} else if childStats.RequestsTotal == 0 {
+			line := "zero_traffic: no requests reached the proxy; check HTTP(S)_PROXY bypass (Go ignores proxies for localhost/127.0.0.1) and CA trust"
+			e.Diff = append(e.Diff, strings.Join(append([]string{line}, hint(o, o.Command, parsed, childStats)...), "; "))
 			failed = true
 		} else if len(childFaults) == 0 && len(t.Rules)+len(t.ConfigChanges) != 0 {
 			rules := make(map[string]bool)
@@ -585,13 +649,6 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		return finish(1, "", nil)
 	}
 	return finish(0, "", nil)
-}
-
-func writeCABundle(path string, data, ca []byte) error {
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		data = append(data, '\n')
-	}
-	return os.WriteFile(path, append(data, ca...), 0600)
 }
 
 type tail struct{ b []byte }

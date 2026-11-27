@@ -22,6 +22,61 @@ type tlsFailureEvidence struct {
 	details []json.RawMessage
 }
 
+type trafficHosts struct {
+	mu          sync.Mutex
+	tls, denied []string
+}
+
+func (c *trafficHosts) observe(e telemetry.Event) {
+	var data struct {
+		Host  string `json:"host"`
+		Error string `json:"error"`
+	}
+	if e.Type != "tls_handshake_failed" && e.Type != "http_req" {
+		return
+	}
+	if json.Unmarshal(e.Data, &data) != nil {
+		return
+	}
+	kind := ""
+	if e.Type == "tls_handshake_failed" {
+		kind = "tls"
+	} else if data.Error == "egress_denied" {
+		kind = "denied"
+	}
+	if kind == "" {
+		return
+	}
+	u, err := url.Parse("//" + data.Host)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil || u.Hostname() == "" {
+		return
+	}
+	host := u.Hostname()
+	list := &c.tls
+	if kind == "denied" {
+		list = &c.denied
+	}
+	for _, existing := range *list {
+		if existing == host {
+			return
+		}
+	}
+	if len(*list) < 5 {
+		*list = append(*list, host)
+	}
+}
+
+func (c *trafficHosts) list(kind string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if kind == "tls" {
+		return strings.Join(c.tls, ", ")
+	}
+	return strings.Join(c.denied, ", ")
+}
+
 func (c *tlsFailureEvidence) observe(e telemetry.Event) {
 	if e.Type != "tls_handshake_failed" {
 		return

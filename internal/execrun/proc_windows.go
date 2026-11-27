@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const caReadFlags = os.O_RDONLY
+
 func setupProcess(cmd *exec.Cmd, grace time.Duration) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 	cmd.WaitDelay = grace
