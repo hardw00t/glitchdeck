@@ -56,9 +56,23 @@ func execCommand(args []string) int {
 	var allow listFlag
 	f.Var(&allow, "upstream-allow", "allow upstream")
 	seed := f.Uint64("seed", 0, "override seed")
+	const execUsage = "usage: glitchdeck exec --tape <file> [flags] -- <command> [args...]"
+	f.Usage = func() {
+		fmt.Fprintln(f.Output(), execUsage)
+		f.PrintDefaults()
+	}
 	wantJSON := cli.JSONRequested(args)
 	if wantJSON {
 		f.SetOutput(io.Discard)
+	}
+	head := args
+	if i := slices.Index(args, "--"); i >= 0 {
+		head = args[:i]
+	}
+	if !wantJSON && (slices.Contains(head, "-h") || slices.Contains(head, "-help") || slices.Contains(head, "--help")) {
+		f.SetOutput(os.Stdout)
+		f.Usage()
+		return 0
 	}
 	emit := func(e execrun.Envelope) int {
 		if *report != "" {
@@ -70,7 +84,15 @@ func execCommand(args []string) int {
 		if wantJSON {
 			_ = json.NewEncoder(os.Stdout).Encode(e)
 		} else if e.Error != nil {
-			fmt.Fprintln(os.Stderr, e.Error)
+			if m, ok := e.Error.(map[string]string); ok {
+				fmt.Fprintln(os.Stderr, "glitchdeck exec: "+m["message"])
+				if m["code"] == "USAGE_ERROR" {
+					f.SetOutput(os.Stderr)
+					f.Usage()
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, e.Error)
+			}
 		} else {
 			fmt.Printf("exec exit %d\n", e.ExitCode)
 			for _, diff := range e.Diff {
