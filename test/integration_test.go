@@ -18,13 +18,13 @@ import (
 	"testing"
 	"time"
 
-	"glitchdeck/internal/demo"
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/proxy"
-	"glitchdeck/internal/tape"
-	"glitchdeck/internal/telemetry"
-	"glitchdeck/internal/ui"
-	"glitchdeck/internal/wsframe"
+	"github.com/hardw00t/glitchdeck/internal/demo"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/tape"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
+	"github.com/hardw00t/glitchdeck/internal/ui"
+	"github.com/hardw00t/glitchdeck/internal/wsframe"
 )
 
 func rule(kind, path string, params map[string]any) fault.Rule {

@@ -1,5 +1,8 @@
-module glitchdeck
+module github.com/hardw00t/glitchdeck
 
-go 1.22
+go 1.26.0
 
-require gopkg.in/yaml.v3 v3.0.1
+require (
+	golang.org/x/net v0.63.0
+	gopkg.in/yaml.v3 v3.0.1
+)

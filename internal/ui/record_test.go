@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
 )
 
 func TestStoppedTapeFreezesConfigChangesAndSequenceGaps(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -17,8 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/telemetry"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/grpcwire"
+	"github.com/hardw00t/glitchdeck/internal/h2tap"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
 
 const maxBody = 4 << 20
@@ -37,17 +40,22 @@ type Record struct {
 	Seq              uint64
 	Method, Path     string
 	Header           http.Header
+	URL              string
+	Proto            string
 	Body             []byte
 	WebSocket        bool
 	At               time.Time
+	MITM             bool
 	UnrecordableBody bool
 }
 type Proxy struct {
 	target             *url.URL
 	cfg                atomic.Pointer[fault.Config]
 	seq                atomic.Uint64
+	requests           atomic.Uint64
 	bus                *telemetry.Bus
 	transport          *http.Transport
+	h2c                *http.Transport
 	gate               sync.Mutex
 	generation         uint64
 	activeWS           int
@@ -57,6 +65,11 @@ type Proxy struct {
 	pending            int
 	done               chan struct{}
 	closed             bool
+	options            Options
+	server             *http.Server
+	front              *front
+	stats              map[string]RuleStats
+	OnSSE              func(uint64)
 	OnRequest          func(Record)
 	OnClientFrame      func(uint64, []byte)
 	OnServerFrame      func(uint64, string, byte)
@@ -65,13 +78,21 @@ type Proxy struct {
 }
 
 func ParseTarget(s string) (*url.URL, error) {
-	u, err := url.Parse(s)
-	if err != nil || u == nil || u.Scheme != "http" || u.User != nil || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("target must be a loopback HTTP URL")
+	u, err := ParseExplicitTarget(s)
+	if err != nil {
+		return nil, err
 	}
 	h := strings.ToLower(u.Hostname())
 	if h != "localhost" && (net.ParseIP(h) == nil || !net.ParseIP(h).IsLoopback()) {
 		return nil, errors.New("target must be loopback")
+	}
+	return u, nil
+}
+
+func ParseExplicitTarget(s string) (*url.URL, error) {
+	u, err := url.Parse(s)
+	if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Hostname() == "" || u.ForceQuery || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("target must be an HTTP or HTTPS URL without credentials, query, or fragment")
 	}
 	if u.Port() != "" {
 		p, e := strconv.Atoi(u.Port())
@@ -83,12 +104,13 @@ func ParseTarget(s string) (*url.URL, error) {
 }
 func New(target *url.URL, cfg fault.Config, bus *telemetry.Bus) *Proxy {
 	ctx, cancel := context.WithCancel(context.Background())
-	u := *target
-	p := &Proxy{target: &u, bus: bus, ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	p := &Proxy{bus: bus, ctx: ctx, cancel: cancel, done: make(chan struct{}), stats: make(map[string]RuleStats)}
+	if target != nil {
+		u := *target
+		p.target = &u
+	}
 	close(p.done)
-	p.transport = &http.Transport{DisableCompression: true, ForceAttemptHTTP2: false, DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
-	}}
+	p.transport, p.h2c = p.newTransport(false), p.newTransport(true)
 	p.SetConfig(cfg)
 	return p
 }
@@ -108,6 +130,7 @@ func (p *Proxy) SetConfigAt(c fault.Config) uint64 {
 	return p.seq.Load() + 1
 }
 func (p *Proxy) Seq() uint64           { return p.seq.Load() }
+func (p *Proxy) RequestsTotal() uint64 { return p.requests.Load() }
 func (p *Proxy) SetSeq(n uint64)       { p.gate.Lock(); p.seq.Store(n); p.gate.Unlock() }
 func (p *Proxy) ActiveWebSockets() int { p.gate.Lock(); defer p.gate.Unlock(); return p.activeWS }
 func (p *Proxy) CaptureBoundary(fn func(uint64, int)) {
@@ -130,6 +153,8 @@ func (p *Proxy) ResetWith(fn func()) {
 		p.ctx, p.cancel = context.WithCancel(context.Background())
 	}
 	p.seq.Store(0)
+	p.requests.Store(0)
+	clear(p.stats)
 	p.mu.Unlock()
 	if fn != nil {
 		fn()
@@ -139,9 +164,30 @@ func (p *Proxy) Close() {
 	p.mu.Lock()
 	p.closed = true
 	p.cancel()
+	s := p.server
 	p.mu.Unlock()
 	p.transport.CloseIdleConnections()
+	p.h2c.CloseIdleConnections()
+	if s != nil {
+		_ = s.Close()
+	}
 }
+func (p *Proxy) beginPendingLocked() {
+	if p.pending == 0 {
+		p.done = make(chan struct{})
+	}
+	p.pending++
+}
+
+func (p *Proxy) finishPending() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.pending--
+	if p.pending == 0 {
+		close(p.done)
+	}
+}
+
 func (p *Proxy) Wait(ctx context.Context) error {
 	p.mu.Lock()
 	ch := p.done
@@ -175,16 +221,30 @@ func (p *Proxy) callback(gen uint64, fn func()) {
 	}
 }
 func (p *Proxy) upstream(r *http.Request, body []byte, ctx context.Context) *http.Request {
-	u := *p.target
-	u.Path = strings.TrimRight(u.Path, "/") + r.URL.Path
-	u.RawPath = ""
-	if p.target.RawPath != "" || r.URL.RawPath != "" {
-		u.RawPath = strings.TrimRight(p.target.EscapedPath(), "/") + r.URL.EscapedPath()
+	var u url.URL
+	if r.URL.IsAbs() {
+		u = *r.URL
+	} else if p.target != nil {
+		u = *p.target
+		u.Path = strings.TrimRight(u.Path, "/") + r.URL.Path
+		u.RawPath = ""
+		if p.target.RawPath != "" || r.URL.RawPath != "" {
+			u.RawPath = strings.TrimRight(p.target.EscapedPath(), "/") + r.URL.EscapedPath()
+		}
+		u.RawQuery, u.ForceQuery = r.URL.RawQuery, r.URL.ForceQuery
+	} else {
+		return nil
 	}
-	u.RawQuery, u.ForceQuery = r.URL.RawQuery, r.URL.ForceQuery
 	q := r.Clone(ctx)
-	q.URL, q.RequestURI, q.Host = &u, "", p.target.Host
+	q.URL, q.RequestURI, q.Host = &u, "", u.Host
+	if p.options.Demo {
+		q.Header.Del("Origin")
+	}
+	trailers := headerToken(q.Header, "TE", "trailers")
 	stripHop(q.Header)
+	if trailers {
+		q.Header.Set("TE", "trailers")
+	}
 	q.Body, q.ContentLength = http.NoBody, int64(len(body))
 	q.TransferEncoding, q.Trailer = nil, nil
 	if len(body) != 0 {
@@ -193,12 +253,38 @@ func (p *Proxy) upstream(r *http.Request, body []byte, ctx context.Context) *htt
 	return q
 }
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !prepareProtocolRequest(r) {
+		http.Error(w, "request does not match CONNECT authority", http.StatusMisdirectedRequest)
+		return
+	}
+	if !p.authorize(w, r) {
+		return
+	}
+	p.requests.Add(1)
+	if r.Method == http.MethodConnect {
+		p.connect(w, r)
+		return
+	}
 	start := time.Now()
+	scheme, host := r.URL.Scheme, r.URL.Host
+	if r.URL.IsAbs() {
+		if r.URL.User != nil || (scheme != "http" && scheme != "https") || !p.allowed(r.URL.Hostname(), upstreamPort(scheme, r.URL.Port())) {
+			http.Error(w, "egress denied", http.StatusForbidden)
+			if seq, gen := p.tunnelSequence(); seq != 0 {
+				p.tunnelEvent(r, start, seq, gen, 403, "", "egress_denied", 0, 0)
+			}
+			return
+		}
+	} else if p.target != nil {
+		scheme, host = p.target.Scheme, p.target.Host
+	} else {
+		scheme, host = "http", r.Host
+	}
 	p.gate.Lock()
 	p.mu.Lock()
-	ctx, gen, closed := p.ctx, p.generation, p.closed
+	session, gen, closed := p.ctx, p.generation, p.closed
 	p.mu.Unlock()
-	if closed || ctx.Err() != nil {
+	if closed || session.Err() != nil {
 		p.gate.Unlock()
 		http.Error(w, "proxy closed", 503)
 		return
@@ -221,41 +307,170 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.gate.Unlock()
 		}()
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(r.Context(), cancel)
+	ctx, cancel := context.WithCancel(r.Context())
+	stop := context.AfterFunc(session, cancel)
 	defer stop()
 	defer cancel()
 	r = r.WithContext(ctx)
-	rule := fault.MatchRule(cfg, r.Method, r.URL.Path, seq, false)
-	var kind string
+	proto := "h1"
+	recordProto := ""
+	if r.ProtoMajor == 2 {
+		proto, recordProto = "h2", "h2c"
+		if r.TLS != nil {
+			recordProto = "h2"
+		}
+	}
+	meta := MetaFrom(ctx)
+	streamID := streamFrom(ctx)
+	ctype := r.Header.Get("Content-Type")
+	isGRPC := strings.HasPrefix(strings.ToLower(ctype), "application/grpc")
+	match := fault.Query{Method: r.Method, Path: r.URL.Path, Host: host, Scheme: scheme, Proto: proto, ContentType: ctype, Seq: seq, WS: ws}
+	rule := fault.MatchRequest(cfg, match)
+	var kind, action, skip, h2Error string
 	var params map[string]any
 	if rule != nil {
 		kind, params = rule.Fault.Type, rule.Fault.Params
+		if !ws {
+			p.countRule(gen, rule.ID, "matched", "")
+		}
 	}
-	status, n := 0, int64(0)
+	status, n, end := 0, int64(0), "complete"
+	runID := r.Header.Get("X-Glitchdeck-Run")
 	var body []byte
 	var streamedBytes atomic.Int64
 	var upstreamHeaders http.Header
+	var grpcStatus *int
+	grpcSource, grpcMessage := "proxy", ""
+	var grpcIn, grpcOut grpcwire.MsgCounter
+	var isSSE bool
+	sseEvents := 0
 	if !ws {
 		defer func() {
+			if isGRPC {
+				p.grpcEvent(gen, seq, r, status, grpcStatus, grpcSource, grpcMessage, kind, action, h2Error, grpcIn.Count(), grpcOut.Count(), start)
+			}
+			var tunnel string
+			if meta.MITM {
+				tunnel = "mitm"
+			}
+			protocol := ""
+			if proto == "h2" && !isGRPC {
+				protocol = "h2"
+			}
 			p.publish(gen, "http_req", map[string]any{
 				"seq": seq, "ts_ms": start.UnixMilli(), "method": r.Method, "path": r.URL.RequestURI(),
 				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": int64(len(body)) + streamedBytes.Load(), "resp_bytes": n,
 				"fault": kind, "replay_index": 0, "request_headers": inspectorHeaders(r.Header),
 				"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": string(body[:min(len(body), 256)]),
+				"proto": r.Proto, "protocol": protocol, "scheme": scheme, "host": host, "stream_id": streamID, "sse": isSSE,
+				"sse_events": sseEvents, "grpc_status": grpcStatus, "fault_action": action, "fault_skipped": skip, "end": end, "run_id": runID, "tunnel": tunnel,
 			})
 		}()
 	}
-	if !ws && kind == "tcp-rst" && fault.Bool(params, "before_headers", false) {
-		if p.OnRequest != nil {
-			p.callback(gen, func() {
-				p.OnRequest(Record{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header, At: start})
-			})
+	if runID != "" {
+		w.Header().Set("X-Glitchdeck-Seq", strconv.FormatUint(seq, 10))
+	}
+	record := func(captured []byte, missing bool) {
+		if p.OnRequest == nil {
+			return
 		}
-		resetWriter(w, func() { p.outcome(gen, Outcome{Seq: seq, Reset: true}) })
+		rec := Record{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header, Body: captured,
+			WebSocket: ws, At: start, Proto: recordProto, UnrecordableBody: missing, MITM: meta.MITM}
+		if r.URL.IsAbs() {
+			rec.URL = r.URL.String()
+		}
+		p.callback(gen, func() { p.OnRequest(rec) })
+	}
+	var plan h2tap.Plan
+	flushPlanned := false
+	cutsStream := false
+	if !ws && r.ProtoMajor == 2 && (kind == "h2-glitch" || kind == "tcp-rst") {
+		if kind == "h2-glitch" {
+			plan, action, end = h2Plan(params, streamID)
+		} else {
+			plan = h2tap.Plan{Kind: "rst", Code: 2, BeforeHdrs: fault.Bool(params, "before_headers", false), AfterBytes: int64(fault.Int(params, "after_bytes", 0))}
+			action, end = "rst_stream", "h2_rst"
+		}
+		h2Error = h2Names[plan.Code]
+		if meta.Tap == nil || streamID == 0 {
+			record(nil, false)
+			h2Error, end, skip = "INTERNAL_ERROR", "h2_rst", "untapped"
+			p.countRule(gen, rule.ID, "skipped", skip)
+			panic(http.ErrAbortHandler)
+		}
+		cutsStream = plan.Kind == "rst" || plan.LastStream < streamID
+		plan.Applied = new(atomic.Bool)
+		p.mu.Lock()
+		p.beginPendingLocked()
+		p.mu.Unlock()
+		defer p.finishPending()
+		planDone := meta.Tap.Arm(streamID, plan)
+		defer func() {
+			if flushPlanned && (plan.BeforeHdrs || n >= plan.AfterBytes) {
+				// HTTP/2 Flush can return before the buffered frame reaches the tap.
+				select {
+				case <-planDone:
+				case <-meta.Tap.Done():
+				case <-ctx.Done():
+				}
+			}
+			if plan.Applied.Load() {
+				p.countRule(gen, rule.ID, "applied", "")
+				if cutsStream {
+					n = min(n, plan.AfterBytes)
+					grpcStatus, grpcSource, grpcMessage = nil, "proxy", ""
+				}
+			} else {
+				h2Error, skip = "", "not_triggered"
+				if end == "h2_rst" || end == "h2_goaway" {
+					end = "complete"
+				}
+				p.countRule(gen, rule.ID, "skipped", skip)
+			}
+		}()
+		if plan.BeforeHdrs {
+			record(nil, false)
+			flushPlanned = true
+			_ = http.NewResponseController(w).Flush()
+			return
+		}
+	}
+	if !ws && kind == "tcp-rst" && fault.Bool(params, "before_headers", false) {
+		record(nil, false)
+		resetWriter(w, func() {
+			end = "rst"
+			p.countRule(gen, rule.ID, "applied", "")
+			p.outcome(gen, Outcome{Seq: seq, Reset: true})
+		})
 		return
 	}
-	buffered := r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch
+	grpcAfter := fault.Int(params, "after_messages", 0)
+	injectGRPC := func(code int, message, source string) {
+		status, grpcStatus, grpcSource, grpcMessage = 200, &code, source, message
+		w.Header().Set("Content-Type", ctype)
+		w.Header().Set("Grpc-Status", strconv.Itoa(code))
+		w.Header().Set("Grpc-Message", grpcwire.EncodeMessage(message))
+		w.WriteHeader(status)
+	}
+	if kind == "grpc-glitch" {
+		action = "status"
+		if !wait(ctx, time.Duration(fault.Int(params, "delay_ms", 0))*time.Millisecond) {
+			end = "client_cancel"
+			return
+		}
+		if grpcAfter == 0 {
+			record(nil, r.ContentLength != 0)
+			code, _ := fault.GRPCCode(params["code"])
+			if _, ok := params["code"]; !ok {
+				code = 14
+			}
+			injectGRPC(code, fault.String(params, "message", ""), "injected")
+			p.countRule(gen, rule.ID, "applied", "")
+			return
+		}
+	}
+	buffered := (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) &&
+		(!isGRPC || kind == "dup-webhook" || p.OnRequest != nil && r.ContentLength >= 0 && r.ContentLength <= maxBody)
 	if buffered {
 		var err error
 		body, err = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
@@ -266,14 +481,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "request body too large or unreadable", status)
 			return
 		}
+		if isGRPC {
+			_, _ = grpcIn.Write(body)
+		}
 	}
-	if p.OnRequest != nil {
-		p.callback(gen, func() {
-			p.OnRequest(Record{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header, Body: body, WebSocket: ws, At: start, UnrecordableBody: !buffered && r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0})
-		})
-	}
+	record(body, !buffered && r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0)
 	if ws {
-		p.serveWS(w, r, seq, gen)
+		p.serveWS(w, r, gen, match)
 		return
 	}
 	if kind == "rate-limit" {
@@ -284,58 +498,197 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		count, _ := io.WriteString(w, fault.String(params, "body", ""))
 		n = int64(count)
+		p.countRule(gen, rule.ID, "applied", "")
 		return
 	}
 	if kind == "latency-wave" && !wait(ctx, time.Duration(fault.Latency(cfg.Seed, seq, params))*time.Millisecond) {
+		end = "client_cancel"
 		panic(http.ErrAbortHandler)
 	}
 	q := p.upstream(r, body, ctx)
-	if !buffered && r.Body != nil && r.Body != http.NoBody {
-		q.Body, q.ContentLength = &countingBody{ReadCloser: r.Body, count: &streamedBytes}, r.ContentLength
+	if q == nil {
+		status, end = 502, "upstream_error"
+		http.Error(w, "no upstream target", status)
+		return
 	}
-	resp, err := p.transport.RoundTrip(q)
+	if kind == "sse-glitch" {
+		q.Header.Del("Accept-Encoding")
+	}
+	if !buffered && r.Body != nil && r.Body != http.NoBody {
+		b := &countingBody{ReadCloser: r.Body, count: &streamedBytes}
+		if isGRPC {
+			b.grpc = &grpcIn
+		}
+		q.Body, q.ContentLength = b, r.ContentLength
+	}
+	transport := p.transport
+	if r.ProtoMajor == 2 && q.URL.Scheme == "http" {
+		transport = p.h2c
+	}
+	resp, err := transport.RoundTrip(q)
 	if err != nil {
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
-		status = 502
+		status, end = 502, "upstream_error"
+		if isGRPC && r.ProtoMajor == 2 {
+			injectGRPC(14, "upstream unavailable", "proxy")
+			return
+		}
 		w.Header().Set(TransportErrorHeader, "1")
 		http.Error(w, "upstream unavailable", status)
 		return
 	}
 	defer resp.Body.Close()
-	resp.Header.Del(TransportErrorHeader)
-	status, upstreamHeaders = resp.StatusCode, resp.Header
-	if kind == "dup-webhook" && fault.Int(params, "count", 2) > 1 {
-		if buffered || r.Body == nil || r.Body == http.NoBody {
-			p.replays(r, body, seq, gen, params)
-		} else {
-			err := errors.New("cannot replay streamed request body")
-			p.outcome(gen, Outcome{Seq: seq, Err: err})
-			p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": "dup-webhook", "error": err.Error()})
-		}
-	}
-	if kind == "tcp-rst" {
-		n = resetResponse(w, resp, r.Method, fault.Int(params, "after_bytes", 0), cancel, func(err error) {
-			p.outcome(gen, Outcome{Seq: seq, Reset: err == nil, Err: err})
-		})
+	if isGRPC && resp.ProtoMajor != 2 {
+		injectGRPC(14, "upstream is not HTTP/2", "proxy")
 		return
 	}
-	stream := resp.ContentLength < 0 || strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
-	stripHop(resp.Header)
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(status)
-	if stream {
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
+	resp.Header.Del(TransportErrorHeader)
+	status, upstreamHeaders = resp.StatusCode, resp.Header
+	media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	encoding := resp.Header.Get("Content-Encoding")
+	isSSE = media == "text/event-stream" && (encoding == "" || strings.EqualFold(encoding, "identity"))
+	if isSSE && p.OnSSE != nil {
+		p.callback(gen, func() { p.OnSSE(seq) })
+	}
+	switch kind {
+	case "dup-webhook":
+		if fault.Int(params, "count", 2) > 1 {
+			if buffered || r.Body == nil || r.Body == http.NoBody {
+				p.replays(r, body, seq, gen, params)
+				p.countRule(gen, rule.ID, "applied", "")
+			} else {
+				err := errors.New("cannot replay streamed request body")
+				p.outcome(gen, Outcome{Seq: seq, Err: err})
+				p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": kind, "error": err.Error()})
+			}
+		}
+	case "tcp-rst":
+		if r.ProtoMajor != 2 {
+			n = resetResponse(w, resp, r.Method, fault.Int(params, "after_bytes", 0), cancel, func(err error) {
+				if err == nil {
+					end = "rst"
+					p.countRule(gen, rule.ID, "applied", "")
+				}
+				p.outcome(gen, Outcome{Seq: seq, Reset: err == nil, Err: err})
+			})
+			return
+		}
+	case "byte-trickle", "latency-wave":
+		p.countRule(gen, rule.ID, "applied", "")
+	case "sse-glitch":
+		action = fault.String(params, "action", "stall")
+		if action == "early_eof" {
+			action = "eof_early"
+		}
+		if !isSSE {
+			skip = "not_sse"
+			if media == "text/event-stream" {
+				skip = "encoded"
+			}
+			p.countRule(gen, rule.ID, "skipped", skip)
 		}
 	}
-	if kind == "byte-trickle" {
-		n, err = trickle(ctx, w, resp.Body, params)
-	} else if stream {
-		n, err = io.Copy(flushWriter{w}, resp.Body)
+	if isSSE && r.ProtoMajor == 1 && sseNeedsHijack(rule) {
+		result := p.relayHijackedSSE(ctx, w, resp, rule, cfg.Seed, seq, gen, start, runID)
+		n, sseEvents, end, skip = result.bytes, result.events, requestSSEEnd(result.end), result.skip
+		if result.err != nil {
+			p.outcome(gen, Outcome{Seq: seq, Err: result.err})
+		}
+		return
+	}
+	streaming := resp.ContentLength < 0 || isSSE || plan.Applied != nil || isGRPC
+	stripHop(resp.Header)
+	if isSSE && kind == "sse-glitch" || kind == "grpc-glitch" {
+		resp.Header.Del("Content-Length")
+	}
+	copyHeaders(w.Header(), resp.Header)
+	if isGRPC && resp.Header.Get("Grpc-Status") != "" && len(resp.Trailer) == 0 {
+		grpcSource = "upstream"
+		if g, err := strconv.Atoi(resp.Header.Get("Grpc-Status")); err == nil {
+			grpcStatus = &g
+		}
+		grpcMessage = grpcwire.DecodeMessage(resp.Header.Get("Grpc-Message"))
+		w.WriteHeader(status)
+		return
+	}
+	for k := range resp.Trailer {
+		w.Header().Add("Trailer", k)
+	}
+	w.WriteHeader(status)
+	rc := http.NewResponseController(w)
+	if streaming {
+		flushPlanned = plan.Applied != nil
+		_ = rc.Flush()
+	}
+	if cutsStream && plan.Applied != nil && plan.Applied.Load() {
+		return
+	}
+	if isSSE && kind != "byte-trickle" && plan.Applied == nil {
+		result := p.relaySSE(ctx, w, resp.Body, rule, cfg.Seed, seq, gen, start, runID)
+		n, sseEvents, end, skip = result.bytes, result.events, requestSSEEnd(result.end), result.skip
+		if r.ProtoMajor == 2 && (result.end == "rst" || result.end == "eof_early" && !fault.Bool(params, "http_clean", true)) {
+			code := uint32(0)
+			if result.end == "rst" {
+				code = 2
+				if !fault.Bool(params, "rst", true) {
+					code = 8
+				}
+			}
+			if !resetProtocolStream(ctx, code) {
+				panic(http.ErrAbortHandler)
+			}
+		}
+		if result.err != nil {
+			p.outcome(gen, Outcome{Seq: seq, Err: result.err})
+			if result.end == "upstream_error" {
+				panic(http.ErrAbortHandler)
+			}
+		}
+		return
+	}
+	var responseBody io.Reader = resp.Body
+	if isGRPC {
+		var count io.Writer = &grpcOut
+		if cutsStream && plan.Applied != nil {
+			count = &limitedGRPCCount{counter: &grpcOut, left: plan.AfterBytes}
+		}
+		responseBody = io.TeeReader(responseBody, count)
+	}
+	if kind == "grpc-glitch" && grpcAfter > 0 {
+		code, _ := fault.GRPCCode(params["code"])
+		if _, ok := params["code"]; !ok {
+			code = 14
+		}
+		message := fault.String(params, "message", "")
+		var injected bool
+		n, injected, err = relayGRPCMessages(flushWriter{w}, responseBody, grpcAfter, code, message)
+		if injected {
+			grpcStatus, grpcSource, grpcMessage = &code, "injected", message
+			p.countRule(gen, rule.ID, "applied", "")
+			return
+		}
+	} else if kind == "byte-trickle" {
+		n, err = trickle(ctx, w, responseBody, params)
+	} else if streaming {
+		n, err = io.Copy(flushWriter{w}, responseBody)
 	} else {
-		n, err = io.Copy(w, resp.Body)
+		n, err = io.Copy(w, responseBody)
+	}
+	for k, v := range resp.Trailer {
+		w.Header()[http.TrailerPrefix+k] = v
+	}
+	if isGRPC {
+		grpcSource = "upstream"
+		if g, e := strconv.Atoi(grpcHeader(resp, "Grpc-Status")); e == nil {
+			grpcStatus = &g
+		}
+		grpcMessage = grpcwire.DecodeMessage(grpcHeader(resp, "Grpc-Message"))
+	}
+	if plan.Applied != nil && plan.Applied.Load() {
+		return
 	}
 	if err != nil {
+		end = "upstream_error"
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		panic(http.ErrAbortHandler)
 	}
@@ -344,11 +697,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type countingBody struct {
 	io.ReadCloser
 	count *atomic.Int64
+	grpc  *grpcwire.MsgCounter
 }
 
 func (b *countingBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.count.Add(int64(n))
+	if b.grpc != nil {
+		_, _ = b.grpc.Write(p[:n])
+	}
 	return n, err
 }
 
@@ -451,7 +808,7 @@ func trickle(ctx context.Context, w http.ResponseWriter, body io.Reader, params 
 	}
 }
 func rst(c net.Conn) {
-	if t, ok := c.(interface{ SetLinger(int) error }); ok {
+	if t, ok := rawConn(c).(interface{ SetLinger(int) error }); ok {
 		_ = t.SetLinger(0)
 	}
 	_ = c.Close()
@@ -523,23 +880,13 @@ func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, params ma
 			overloaded = true
 			break
 		}
-		if p.pending == 0 {
-			p.done = make(chan struct{})
-		}
-		p.pending++
+		p.beginPendingLocked()
 		q := p.upstream(r, body, ctx)
 		if fault.Bool(params, "replay_header", false) {
 			q.Header.Set("X-Glitchdeck-Replay", strconv.Itoa(i))
 		}
 		go func(index int) {
-			defer func() {
-				p.mu.Lock()
-				p.pending--
-				if p.pending == 0 {
-					close(p.done)
-				}
-				p.mu.Unlock()
-			}()
+			defer p.finishPending()
 			if !wait(ctx, time.Duration(index)*time.Duration(delay)*time.Millisecond) {
 				return
 			}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -14,11 +15,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/wsframe"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/wsframe"
 )
 
-func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64) {
+func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, match fault.Query) {
+	seq := match.Seq
 	key := r.Header.Get("Sec-WebSocket-Key")
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if r.Method != "GET" || r.Header.Get("Sec-WebSocket-Version") != "13" || err != nil || len(decoded) != 16 {
@@ -27,11 +29,15 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	port := p.target.Port()
-	if port == "" {
-		port = "80"
+	q := p.upstream(r, nil, ctx)
+	if q == nil {
+		http.Error(w, "no upstream target", http.StatusBadGateway)
+		return
 	}
-	up, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(p.target.Hostname(), port))
+	dialCtx, stopDial := context.WithTimeout(ctx, 5*time.Second)
+	defer stopDial()
+	addr := net.JoinHostPort(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port()))
+	up, err := p.dial(dialCtx, "tcp", addr)
 	if err != nil {
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		w.Header().Set(TransportErrorHeader, "1")
@@ -39,10 +45,21 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 		return
 	}
 	defer up.Close()
-	stop := context.AfterFunc(ctx, func() { up.Close() })
+	rawUp := up
+	stop := context.AfterFunc(ctx, func() { _ = rawUp.Close() })
 	defer stop()
 	_ = up.SetDeadline(time.Now().Add(5 * time.Second))
-	q := p.upstream(r, nil, ctx)
+	if q.URL.Scheme == "https" {
+		cfg := p.transport.TLSClientConfig.Clone()
+		cfg.ServerName = q.URL.Hostname()
+		cfg.NextProtos = []string{"http/1.1"}
+		secure := tls.Client(up, cfg)
+		if err := secure.HandshakeContext(dialCtx); err != nil {
+			http.Error(w, "upstream handshake failed", http.StatusBadGateway)
+			return
+		}
+		up = secure
+	}
 	q.Header.Set("Connection", "Upgrade")
 	q.Header.Set("Upgrade", "websocket")
 	q.Header.Del("Sec-WebSocket-Extensions")
@@ -160,16 +177,17 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, seq, gen uint64)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		p.pump(ctx, buf.Reader, up, true, "c2s", seq, gen, r.URL.Path, closeBoth, beginClose)
+		p.pump(ctx, buf.Reader, up, true, "c2s", gen, match, closeBoth, beginClose)
 	}()
 	go func() {
 		defer wg.Done()
-		p.pump(ctx, reader, client, false, "s2c", seq, gen, r.URL.Path, closeBoth, beginClose)
+		p.pump(ctx, reader, client, false, "s2c", gen, match, closeBoth, beginClose)
 	}()
 	wg.Wait()
 	closeBoth("")
 }
-func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bool, dir string, seq, gen uint64, path string, closeBoth func(string), beginClose func()) {
+func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bool, dir string, gen uint64, match fault.Query, closeBoth func(string), beginClose func()) {
+	seq := match.Seq
 	normalClose := false
 	defer func() {
 		if !normalClose {
@@ -207,7 +225,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 		action := ""
 		var params map[string]any
 		cfg := *p.cfg.Load()
-		rule := fault.MatchRule(cfg, http.MethodGet, path, seq, true)
+		rule := fault.MatchRequest(cfg, match)
 		if rule != nil {
 			params = rule.Fault.Params
 			direction := fault.String(params, "dir", "both")
@@ -218,6 +236,8 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			every := fault.Int(params, "every", 1)
 			if (direction == "both" || direction == dir) && frameSeq >= uint64(after) && (frameSeq-uint64(after))%uint64(every) == 0 {
 				action = fault.String(params, "action", "drop")
+				p.countRule(gen, rule.ID, "matched", "")
+				p.countRule(gen, rule.ID, "applied", "")
 			}
 		}
 		if dir == "s2c" && p.OnServerFrame != nil {

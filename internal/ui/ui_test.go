@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/proxy"
-	"glitchdeck/internal/telemetry"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
 
 type blockedResponse struct {

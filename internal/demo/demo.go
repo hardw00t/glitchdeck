@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"glitchdeck/internal/localweb"
-	"glitchdeck/internal/wsframe"
+	"github.com/hardw00t/glitchdeck/internal/localweb"
+	"github.com/hardw00t/glitchdeck/internal/wsframe"
 )
 
 type entry struct {
@@ -23,16 +23,22 @@ type service struct {
 	orders  []entry
 	charges []entry
 	ticks   int
+	llm     map[string]int
 }
 
 func New() http.Handler {
-	s := &service{orders: []entry{}, charges: []entry{}}
+	s := &service{orders: []entry{}, charges: []entry{}, llm: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/checkout", s.checkout)
 	mux.HandleFunc("/webhooks/payment", s.payment)
 	mux.HandleFunc("/api/state", s.state)
 	mux.HandleFunc("/api/reset", s.reset)
 	mux.HandleFunc("/ws/ticker", s.ticker)
+	mux.HandleFunc("/api/chat/stream", s.stream)
+	mux.HandleFunc("/v1/chat/completions", s.stream)
+	mux.HandleFunc("/v1/messages", s.stream)
+	mux.HandleFunc("/api/stream-result", s.streamResult)
+	mux.HandleFunc("/glitchdeck.demo.v1.Quotes/Get", s.quote)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if (r.URL.Path == "/ws/ticker" || (r.Method != http.MethodGet && r.Method != http.MethodHead)) && !localweb.Allowed(r, "") {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -112,7 +118,7 @@ func (s *service) state(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"orders": s.orders, "charges": s.charges, "duplicate_charges": duplicates, "total_charged_cents": total, "ws_ticks_sent": s.ticks, "ws_broken": false})
+	json.NewEncoder(w).Encode(map[string]any{"orders": s.orders, "charges": s.charges, "duplicate_charges": duplicates, "total_charged_cents": total, "ws_ticks_sent": s.ticks, "ws_broken": false, "llm_runs": s.llm["runs"], "llm_completed": s.llm["complete"], "llm_wedged": s.llm["wedged"], "llm_truncated": s.llm["truncated"], "llm_parse_errors": s.llm["parse_error"], "llm_silent_truncations": s.llm["silent_truncation"]})
 }
 func (s *service) reset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -123,6 +129,7 @@ func (s *service) reset(w http.ResponseWriter, r *http.Request) {
 	s.orders = []entry{}
 	s.charges = []entry{}
 	s.ticks = 0
+	s.llm = map[string]int{}
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }

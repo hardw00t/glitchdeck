@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -49,5 +50,67 @@ func TestTapeExitCodes(t *testing.T) {
 				t.Fatalf("unexpected verdict %q", output)
 			}
 		})
+	}
+}
+
+func TestTapeErrorReplacesStaleReport(t *testing.T) {
+	dir := t.TempDir()
+	report := filepath.Join(dir, "report.json")
+	if err := os.WriteFile(report, []byte(`{"ok":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"test", filepath.Join(dir, "missing"), "--report", report}); code != 2 {
+		t.Fatalf("exit %d", code)
+	}
+	data, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		OK       bool `json:"ok"`
+		ExitCode int  `json:"exit_code"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil || got.OK || got.ExitCode != 2 {
+		t.Fatalf("stale or invalid report %q: %v", data, err)
+	}
+}
+
+func TestTapeReportIncludesChangedRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tape.yaml")
+	report := filepath.Join(dir, "report.json")
+	data := `version: 2
+target: demo
+config_changes:
+  - before_seq: 1
+    rules:
+      - id: changed
+        enabled: true
+        match: {method: POST, path_prefix: /webhooks/payment}
+        fault: {type: dup-webhook, params: {count: 2, delay_ms: 0}}
+script:
+  - name: payment
+    http:
+      method: POST
+      path: /webhooks/payment
+      body: '{"order_id":"ord-101","amount_cents":4900}'
+`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"test", path, "--report", report}); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	raw, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Summary struct {
+			FaultsTriggered uint64 `json:"faults_triggered"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil || got.Summary.FaultsTriggered != 1 {
+		t.Fatalf("report %s: %v", raw, err)
 	}
 }

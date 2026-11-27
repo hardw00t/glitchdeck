@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"glitchdeck/internal/wsframe"
+	"github.com/hardw00t/glitchdeck/internal/wsframe"
 	"net"
 	"net/http"
 	"net/http/httptest"

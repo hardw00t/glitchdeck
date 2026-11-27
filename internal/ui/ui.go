@@ -16,11 +16,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/localweb"
-	"glitchdeck/internal/proxy"
-	"glitchdeck/internal/tape"
-	"glitchdeck/internal/telemetry"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/localweb"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/tape"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
 
 //go:embed dist/*
@@ -28,16 +28,18 @@ var assets embed.FS
 
 const maxInput = 16 << 20
 
-type Options struct{ Target, Listen, UI, DemoURL string }
+type Options struct{ Target, Listen, UI, DemoURL, ProxyAuth string }
 
 type control struct {
 	Options
-	p      *proxy.Proxy
-	bus    *telemetry.Bus
-	client *http.Client
-	cfgMu  sync.Mutex
-	rec    recorder
-	broken atomic.Bool
+	p           *proxy.Proxy
+	bus         *telemetry.Bus
+	client      *http.Client
+	cfgMu       sync.Mutex
+	rec         recorder
+	broken      atomic.Bool
+	streamSlots chan struct{}
+	streamID    atomic.Uint64
 }
 
 func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
@@ -46,17 +48,29 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 		Transport:     &http.Transport{DisableCompression: true},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
-	p.OnRequest = c.rec.request
-	p.OnClientFrame = c.rec.clientFrame
-	p.OnServerFrame = c.rec.serverFrame
-	p.OnUnsupportedFrame = c.rec.unsupportedFrame
+	c.streamSlots = make(chan struct{}, 4)
+	c.rec.attach(p)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		cfg := c.p.Config()
-		respond(w, map[string]any{"target": c.Target, "listen": c.Listen, "ui": c.UI, "demo_mode": c.DemoURL != "", "seed": cfg.Seed, "seq": c.p.Seq(), "rules": rules(cfg)})
+		tls, fingerprint := c.p.TLSInfo()
+		var ca any
+		if fingerprint != "" {
+			ca = fingerprint
+		}
+		respond(w, map[string]any{
+			"target": c.Target, "listen": c.Listen, "ui": c.UI, "demo_mode": c.DemoURL != "",
+			"seed": cfg.Seed, "seq": c.p.Seq(), "rules": rules(cfg), "tls_mitm": tls,
+			"capabilities": map[string]any{"sse": true, "h2": true, "grpc": true, "tls_mitm": tls, "ca_fingerprint": ca},
+		})
 	})
 	mux.HandleFunc("GET /api/history", c.history)
 	mux.HandleFunc("GET /api/events", c.events)
+	mux.HandleFunc("GET /api/faults", c.faults)
+	mux.HandleFunc("GET /api/faults/schema", faultSchema)
+	mux.HandleFunc("POST /api/faults", c.mutateFault)
+	mux.HandleFunc("PUT /api/faults/{id}", c.mutateFault)
+	mux.HandleFunc("DELETE /api/faults/{id}", c.mutateFault)
 	mux.HandleFunc("PUT /api/faults", c.replace)
 	mux.HandleFunc("PATCH /api/faults/{id}", c.patch)
 	mux.HandleFunc("POST /api/reset", c.reset)
@@ -65,6 +79,8 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	mux.HandleFunc("POST /api/tape/stop", c.stopRecording)
 	mux.HandleFunc("GET /api/tape/export", c.export)
 	mux.HandleFunc("POST /api/tape/import", c.importTape)
+	mux.HandleFunc("POST /api/demo/stream", c.demoStream)
+	mux.HandleFunc("POST /api/demo/grpc", c.demoGRPC)
 	if c.DemoURL != "" {
 		mux.HandleFunc("GET /api/demo/state", c.demoState)
 		mux.HandleFunc("POST /api/demo/trigger", c.trigger)
@@ -75,6 +91,7 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 			req.Header.Del("Origin")
 			req.URL.Path, req.URL.RawPath, req.URL.RawQuery = "/ws/ticker", "", ""
 			req.RequestURI = req.URL.Path
+			c.authenticateProxy(req)
 			c.p.ServeHTTP(w, req)
 		})
 		mux.HandleFunc("POST /api/demo/ticker-state", func(w http.ResponseWriter, r *http.Request) {
@@ -131,20 +148,31 @@ func (c *control) stopRecording(w http.ResponseWriter, r *http.Request) {
 }
 
 func respond(w http.ResponseWriter, value any) {
+	respondStatus(w, http.StatusOK, value)
+}
+
+func respondStatus(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func decode(w http.ResponseWriter, r *http.Request, dest any) bool {
+func readJSON(w http.ResponseWriter, r *http.Request, dest any) error {
 	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxInput))
 	d.DisallowUnknownFields()
 	if err := d.Decode(dest); err != nil {
-		http.Error(w, err.Error(), 400)
-		return false
+		return err
 	}
 	if err := d.Decode(new(any)); err != io.EOF {
-		http.Error(w, "expected one JSON value", 400)
+		return errors.New("expected one JSON value")
+	}
+	return nil
+}
+
+func decode(w http.ResponseWriter, r *http.Request, dest any) bool {
+	if err := readJSON(w, r, dest); err != nil {
+		http.Error(w, err.Error(), 400)
 		return false
 	}
 	return true
@@ -238,11 +266,12 @@ func (c *control) replace(w http.ResponseWriter, r *http.Request) {
 		Rules []fault.Rule `json:"rules"`
 		Seed  *uint64      `json:"seed"`
 	}
-	if !decode(w, r, &req) {
+	if err := readJSON(w, r, &req); err != nil {
+		faultError(w, r, 400, "invalid_rule", "", "", err)
 		return
 	}
 	if req.Rules == nil {
-		http.Error(w, "rules array is required", 400)
+		faultError(w, r, 400, "invalid_rule", "", "", errors.New("rules array is required"))
 		return
 	}
 	c.cfgMu.Lock()
@@ -253,7 +282,11 @@ func (c *control) replace(w http.ResponseWriter, r *http.Request) {
 	}
 	state, err := c.set(cfg)
 	c.cfgMu.Unlock()
-	respondConfig(w, state, err)
+	if err != nil {
+		invalidFault(w, r, "", err)
+		return
+	}
+	respond(w, state)
 }
 
 func (c *control) patch(w http.ResponseWriter, r *http.Request) {
@@ -262,17 +295,23 @@ func (c *control) patch(w http.ResponseWriter, r *http.Request) {
 		Match   json.RawMessage `json:"match"`
 		Params  map[string]any  `json:"params"`
 	}
-	if !decode(w, r, &patch) {
+	id := r.PathValue("id")
+	if err := readJSON(w, r, &patch); err != nil {
+		faultError(w, r, 400, "invalid_rule", id, "", err)
 		return
 	}
 	c.cfgMu.Lock()
-	state, err := c.patchConfig(r.PathValue("id"), patch.Enabled, patch.Match, patch.Params)
+	state, err := c.patchConfig(id, patch.Enabled, patch.Match, patch.Params)
 	c.cfgMu.Unlock()
 	if errors.Is(err, errRuleNotFound) {
-		http.NotFound(w, r)
+		faultError(w, r, 404, "not_found", id, "", err)
 		return
 	}
-	respondConfig(w, state, err)
+	if err != nil {
+		invalidFault(w, r, id, err)
+		return
+	}
+	respond(w, state)
 }
 
 var errRuleNotFound = errors.New("rule not found")
@@ -330,7 +369,7 @@ func (c *control) export(w http.ResponseWriter, r *http.Request) {
 	c.cfgMu.Lock()
 	doc := c.rec.tape(c.p.Config())
 	c.cfgMu.Unlock()
-	doc.Version, doc.Name, doc.Target = 1, "glitchdeck-recording", c.Target
+	doc.Name, doc.Target = "glitchdeck-recording", c.Target
 	if c.DemoURL != "" {
 		doc.Target = "demo"
 		doc.Assertions = []tape.Assertion{{Name: "demo invariants", HTTPGet: "/api/state", Direct: true, ExpectStatus: 200, JSONEq: map[string]any{"duplicate_charges": 0, "ws_broken": false}}}
@@ -366,6 +405,9 @@ func (c *control) call(ctx context.Context, method, endpoint string, body []byte
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if req.URL.Host == c.Listen {
+		c.authenticateProxy(req)
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -373,6 +415,12 @@ func (c *control) call(ctx context.Context, method, endpoint string, body []byte
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	return resp.StatusCode, data, err
+}
+
+func (c *control) authenticateProxy(r *http.Request) {
+	if c.ProxyAuth != "" {
+		r.SetBasicAuth("glitchdeck", c.ProxyAuth)
+	}
 }
 
 func (c *control) demoState(w http.ResponseWriter, r *http.Request) {

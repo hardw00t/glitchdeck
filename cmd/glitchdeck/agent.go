@@ -1,0 +1,270 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/hardw00t/glitchdeck/internal/cli"
+	"github.com/hardw00t/glitchdeck/internal/execrun"
+	"github.com/hardw00t/glitchdeck/internal/mcp"
+	"github.com/hardw00t/glitchdeck/internal/tape"
+	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
+)
+
+var version = "dev"
+var commit = "unknown"
+
+type listFlag []string
+
+func (l *listFlag) String() string { return strings.Join(*l, ",") }
+func (l *listFlag) Set(s string) error {
+	*l = append(*l, strings.Split(s, ",")...)
+	return nil
+}
+
+func execCommand(args []string) int {
+	f := flag.NewFlagSet("exec", flag.ContinueOnError)
+	path := f.String("tape", "", "tape file")
+	report := f.String("report", "", "report file")
+	asJSON := f.Bool("json", false, "JSON output")
+	var o execrun.Options
+	f.StringVar(&o.Target, "target", "", "target override")
+	f.StringVar(&o.Listen, "listen", "127.0.0.1:0", "proxy listener")
+	f.StringVar(&o.UI, "ui", "", "UI listener")
+	f.DurationVar(&o.Timeout, "timeout", 10*time.Minute, "child timeout")
+	f.DurationVar(&o.Grace, "grace", 5*time.Second, "shutdown grace")
+	f.BoolVar(&o.TLS, "tls", false, "enable TLS MITM")
+	f.StringVar(&o.CADir, "ca-dir", "", "CA directory")
+	f.StringVar(&o.NoProxy, "no-proxy", "", "proxy bypass list")
+	f.StringVar(&o.UpstreamCA, "upstream-ca", "", "upstream CA")
+	f.BoolVar(&o.InsecureUpstream, "insecure-upstream", false, "skip upstream TLS verification")
+	f.BoolVar(&o.AllowRemote, "allow-remote", false, "permit non-loopback listener")
+	f.BoolVar(&o.ProxyAuth, "proxy-auth", false, "enable proxy authentication")
+	var allow listFlag
+	f.Var(&allow, "upstream-allow", "allow upstream")
+	seed := f.Uint64("seed", 0, "override seed")
+	wantJSON := cli.JSONRequested(args)
+	if wantJSON {
+		f.SetOutput(io.Discard)
+	}
+	emit := func(e execrun.Envelope) int {
+		if *report != "" {
+			data, _ := json.Marshal(e)
+			if err := os.WriteFile(*report, append(data, '\n'), 0600); err != nil {
+				e.ExitCode, e.OK = 3, false
+				e.Error = map[string]string{"code": "TAPE_IO", "message": err.Error()}
+			}
+		}
+		if wantJSON {
+			_ = json.NewEncoder(os.Stdout).Encode(e)
+		} else if e.Error != nil {
+			fmt.Fprintln(os.Stderr, e.Error)
+		} else {
+			fmt.Printf("exec exit %d\n", e.ExitCode)
+			for _, diff := range e.Diff {
+				fmt.Println(diff)
+			}
+		}
+		return e.ExitCode
+	}
+	fail := func(code string, err error) int {
+		e := execrun.NewEnvelope("exec", *path, o.Target)
+		e.ExitCode = 2
+		e.Error = map[string]string{"code": code, "message": err.Error()}
+		e.Exec = &execrun.Exec{Cmd: f.Args(), LeakedPIDs: []int{}}
+		return emit(e)
+	}
+	sep := slices.Index(args, "--")
+	if err := f.Parse(args); err != nil {
+		return fail("USAGE_ERROR", err)
+	}
+	if sep < 0 || *path == "" || f.NArg() == 0 || o.Timeout <= 0 || o.Grace <= 0 {
+		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
+	}
+	file, err := os.Open(*path)
+	if err != nil {
+		return fail("TAPE_IO", err)
+	}
+	t, err := tape.Decode(file)
+	_ = file.Close()
+	if err != nil {
+		return fail("TAPE_INVALID", err)
+	}
+	f.Visit(func(option *flag.Flag) {
+		if option.Name == "seed" {
+			o.Seed = seed
+		}
+	})
+	o.Command, o.TapePath, o.JSON, o.UpstreamAllow = f.Args(), *path, *asJSON, allow
+	return emit(execrun.Run(context.Background(), t, o))
+}
+
+func mcpCommand(args []string) int {
+	f := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	workdir := f.String("workdir", ".", "working directory")
+	if f.Parse(args) != nil || f.NArg() != 0 {
+		return 2
+	}
+	if err := mcp.NewServer(os.Stdin, os.Stdout, mcp.Options{Workdir: *workdir, Version: buildVersion()}).Serve(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 3
+	}
+	return 0
+}
+
+func caCommand(args []string) int {
+	flags, pos := cli.SplitArgs(args, "ca-dir")
+	f := flag.NewFlagSet("ca", flag.ContinueOnError)
+	dir := f.String("ca-dir", tlsmitm.DefaultDir(), "CA directory")
+	force := f.Bool("force", false, "replace CA")
+	asJSON := f.Bool("json", false, "JSON output")
+	wantJSON := cli.JSONRequested(flags)
+	if wantJSON {
+		f.SetOutput(io.Discard)
+	}
+	fail := func(code string, err error, exit int) int {
+		if wantJSON {
+			cli.Error(os.Stderr, code, err, exit)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		return exit
+	}
+	if err := f.Parse(flags); err != nil {
+		return fail("usage", err, 2)
+	}
+	if len(pos) != 1 {
+		return fail("usage", errors.New("usage: glitchdeck ca init|path|print [--ca-dir path]"), 2)
+	}
+	store := tlsmitm.Store{Dir: *dir}
+	var ca *tlsmitm.CA
+	var err error
+	switch pos[0] {
+	case "init":
+		ca, err = store.Init(*force)
+	case "path":
+	case "print":
+		ca, err = store.Load()
+	default:
+		return fail("usage", errors.New("unknown CA operation"), 2)
+	}
+	if err != nil {
+		code := "ca_missing"
+		if errors.Is(err, tlsmitm.ErrInsecurePerms) {
+			code = "ca_insecure_perms"
+		}
+		return fail(code, err, 3)
+	}
+	if pos[0] == "print" {
+		if _, err := os.Stdout.Write(ca.PEM); err != nil {
+			return fail("internal", err, 3)
+		}
+		return 0
+	}
+	if *asJSON {
+		data := map[string]string{"path": store.CertPath()}
+		if ca != nil {
+			data["fingerprint"] = ca.Fingerprint()
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": "glitchdeck.v2", "command": "ca." + pos[0], "ok": true, "data": data})
+	} else {
+		fmt.Println(store.CertPath())
+	}
+	return 0
+}
+
+func buildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok && version == "dev" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
+}
+
+func versionCommand(args []string) int {
+	f := flag.NewFlagSet("version", flag.ContinueOnError)
+	asJSON := f.Bool("json", false, "JSON output")
+	if f.Parse(args) != nil || f.NArg() != 0 {
+		return 2
+	}
+	if *asJSON {
+		rev := commit
+		if info, ok := debug.ReadBuildInfo(); ok && rev == "unknown" {
+			for _, setting := range info.Settings {
+				if setting.Key == "vcs.revision" {
+					rev = setting.Value
+					break
+				}
+			}
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": "glitchdeck.v2", "command": "version", "ok": true, "data": map[string]string{"version": buildVersion(), "commit": rev, "go": runtime.Version()}})
+	} else {
+		fmt.Println(buildVersion())
+	}
+	return 0
+}
+
+func reportCommand(args []string) int {
+	flags, pos := cli.SplitArgs(args)
+	f := flag.NewFlagSet("report", flag.ContinueOnError)
+	github := f.Bool("github", false, "GitHub annotations")
+	asJSON := f.Bool("json", false, "JSON output")
+	if f.Parse(flags) != nil || len(pos) != 1 || *github && *asJSON {
+		return 2
+	}
+	data, err := os.ReadFile(pos[0])
+	var e execrun.Envelope
+	if err == nil {
+		err = json.Unmarshal(data, &e)
+	}
+	if err != nil {
+		if *asJSON {
+			cli.Error(os.Stderr, "tape_io", err, 3)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		return 3
+	}
+	if *asJSON {
+		_ = json.NewEncoder(os.Stdout).Encode(e)
+		return 0
+	}
+	for _, line := range e.Diff {
+		if *github {
+			escape := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
+			fmt.Printf("::error::%s\n", escape.Replace(line))
+		} else {
+			fmt.Println(line)
+		}
+	}
+	if *github {
+		if e.OK {
+			fmt.Println("::notice::Glitchdeck expectations passed")
+		}
+		if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
+			out, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				return 3
+			}
+			_, err = fmt.Fprintf(out, "## Glitchdeck\n\n| Exit | Assertions passed | Assertions failed |\n| --- | --- | --- |\n| %d | %d | %d |\n", e.ExitCode, e.Summary.AssertionsPassed, e.Summary.AssertionsFailed)
+			closeErr := out.Close()
+			if err != nil || closeErr != nil {
+				fmt.Fprintln(os.Stderr, errors.Join(err, closeErr))
+				return 3
+			}
+		}
+	} else {
+		fmt.Printf("Exit code: %d\n", e.ExitCode)
+	}
+	return 0
+}

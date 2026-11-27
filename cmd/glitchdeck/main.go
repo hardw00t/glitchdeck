@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -16,19 +18,21 @@ import (
 	"syscall"
 	"time"
 
-	"glitchdeck/internal/demo"
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/localweb"
-	"glitchdeck/internal/proxy"
-	"glitchdeck/internal/tape"
-	"glitchdeck/internal/telemetry"
-	"glitchdeck/internal/ui"
+	"github.com/hardw00t/glitchdeck/internal/cli"
+	"github.com/hardw00t/glitchdeck/internal/demo"
+	"github.com/hardw00t/glitchdeck/internal/execrun"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/tape"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
+	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
+	"github.com/hardw00t/glitchdeck/internal/ui"
 )
 
 func main() { os.Exit(run(os.Args[1:])) }
 func run(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: glitchdeck demo|proxy|test")
+		fmt.Fprintln(os.Stderr, "usage: glitchdeck demo|proxy|test|exec|mcp|ca|report|version")
 		return 2
 	}
 	switch args[0] {
@@ -38,6 +42,16 @@ func run(args []string) int {
 		return serve(args[1:], false)
 	case "test":
 		return testTape(args[1:])
+	case "exec":
+		return execCommand(args[1:])
+	case "mcp":
+		return mcpCommand(args[1:])
+	case "ca":
+		return caCommand(args[1:])
+	case "version":
+		return versionCommand(args[1:])
+	case "report":
+		return reportCommand(args[1:])
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command:", args[0])
 		return 2
@@ -45,48 +59,63 @@ func run(args []string) int {
 }
 func testTape(args []string) int {
 	f := flag.NewFlagSet("test", flag.ContinueOnError)
+	wantJSON := cli.JSONRequested(args)
+	if wantJSON {
+		f.SetOutput(io.Discard)
+	}
 	target := f.String("target", "", "override target")
 	timeout := f.Duration("timeout", 30*time.Second, "run timeout")
 	asJSON := f.Bool("json", false, "JSON output")
-	var flags []string
-	var filename string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if strings.HasPrefix(a, "-") {
-			flags = append(flags, a)
-			key := strings.TrimLeft(strings.SplitN(a, "=", 2)[0], "-")
-			if !strings.Contains(a, "=") && (key == "target" || key == "timeout") && i+1 < len(args) {
-				i++
-				flags = append(flags, args[i])
-			}
-		} else if filename == "" {
-			filename = a
-		} else {
-			fmt.Fprintln(os.Stderr, "expected one tape file")
-			return 2
-		}
+	report := f.String("report", "", "write JSON report")
+	tlsEnabled := f.Bool("tls", false, "enable TLS")
+	caDir := f.String("ca-dir", "", "CA directory")
+	flags, files := cli.SplitArgs(args, "target", "timeout", "report", "ca-dir")
+	filename := ""
+	if len(files) == 1 {
+		filename = files[0]
 	}
-	if f.Parse(flags) != nil || filename == "" || *timeout <= 0 {
-		fmt.Fprintln(os.Stderr, "usage: glitchdeck test [flags] tape.yaml")
+	fail := func(machine string, err error) int {
+		e := execrun.NewEnvelope("test", filename, *target)
+		e.ExitCode = 2
+		e.Error = map[string]string{"code": machine, "message": err.Error()}
+		if *report != "" {
+			data, marshalErr := json.Marshal(e)
+			if marshalErr == nil {
+				marshalErr = os.WriteFile(*report, append(data, '\n'), 0600)
+			}
+			if marshalErr != nil {
+				fmt.Fprintln(os.Stderr, marshalErr)
+			}
+		}
+		if wantJSON {
+			_ = json.NewEncoder(os.Stdout).Encode(e)
+			cli.Error(os.Stderr, strings.ToLower(machine), err, 2)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
 		return 2
+	}
+	if err := f.Parse(flags); err != nil {
+		return fail("USAGE", err)
+	}
+	if filename == "" || *timeout <= 0 {
+		return fail("USAGE", errors.New("usage: glitchdeck test [flags] tape.yaml"))
 	}
 	file, err := os.Open(filename)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+		return fail("TAPE_IO", err)
 	}
 	t, err := tape.Decode(file)
 	file.Close()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+		return fail("TAPE_INVALID", err)
 	}
+	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	results, err := tape.Run(ctx, t, *target)
+	results, runReport, err := tape.RunWithTLS(ctx, t, *target, *caDir, *tlsEnabled)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+		return fail("INTERNAL", err)
 	}
 	failed := false
 	for _, r := range results {
@@ -94,8 +123,50 @@ func testTape(args []string) int {
 			failed = true
 		}
 	}
+	code := 0
+	if failed {
+		code = 1
+	}
+	envelope := execrun.NewEnvelope("test", filename, t.Target)
+	if *target != "" {
+		envelope.Target = *target
+	}
+	envelope.ExitCode = code
+	envelope.OK = !failed
+	envelope.DurationMS = time.Since(started).Milliseconds()
+	envelope.SetResults(results)
+	envelope.Summary.RequestsTotal = runReport.RequestsTotal
+	rules := append([]fault.Rule(nil), t.Rules...)
+	for _, change := range t.ConfigChanges {
+		rules = append(rules, change.Rules...)
+	}
+	seenRules := make(map[string]bool)
+	for _, rule := range rules {
+		if seenRules[rule.ID] {
+			continue
+		}
+		seenRules[rule.ID] = true
+		n := runReport.Rules[rule.ID].Applied
+		if n > 0 {
+			envelope.FaultsTriggered = append(envelope.FaultsTriggered, map[string]any{"rule_id": rule.ID, "type": rule.Fault.Type, "count": n})
+			envelope.Summary.FaultsTriggered += n
+		}
+	}
+	if *report != "" {
+		data, e := json.Marshal(envelope)
+		if e == nil {
+			e = os.WriteFile(*report, append(data, '\n'), 0600)
+		}
+		if e != nil {
+			return fail("TAPE_IO", e)
+		}
+	}
 	if *asJSON {
-		if err := json.NewEncoder(os.Stdout).Encode(results); err != nil {
+		var output any = results
+		if t.Version >= 2 {
+			output = envelope
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 2
 		}
@@ -119,6 +190,18 @@ func serve(args []string, isDemo bool) int {
 		name = "demo"
 	}
 	f := flag.NewFlagSet(name, flag.ContinueOnError)
+	wantJSON := cli.JSONRequested(args)
+	if wantJSON {
+		f.SetOutput(io.Discard)
+	}
+	fail := func(machine string, err error) int {
+		if wantJSON {
+			cli.Error(os.Stderr, machine, err, 2)
+		} else {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		return 2
+	}
 	listen := f.String("listen", "127.0.0.1:8080", "proxy listener")
 	uiAddr := f.String("ui", "127.0.0.1:8081", "control listener")
 	app := f.String("app", "127.0.0.1:3000", "demo listener")
@@ -126,8 +209,30 @@ func serve(args []string, isDemo bool) int {
 	tapePath := f.String("tape", "", "initial tape")
 	seed := f.Uint64("seed", 1, "fault seed")
 	open := f.Bool("open", false, "open control UI")
-	if f.Parse(args) != nil || f.NArg() != 0 {
-		return 2
+	tlsEnabled := f.Bool("tls", isDemo, "enable TLS interception")
+	caDir := f.String("ca-dir", "", "CA directory")
+	asJSON := f.Bool("json", false, "stream JSON events")
+	var upstreamAllow listFlag
+	f.Var(&upstreamAllow, "upstream-allow", "allow upstream")
+	upstreamCA := f.String("upstream-ca", "", "upstream CA")
+	insecure := f.Bool("insecure-upstream", false, "skip upstream TLS verification")
+	alpn := f.String("mitm-alpn", "", "MITM ALPN")
+	h2tap := f.String("h2-tap", "on", "HTTP/2 tap")
+	sseMax := f.Int("sse-telemetry-max", 512, "SSE telemetry limit")
+	allowRemote := f.Bool("allow-remote", false, "allow remote listener")
+	if err := f.Parse(args); err != nil {
+		return fail("usage", err)
+	}
+	if f.NArg() != 0 || *sseMax < 0 || (*alpn != "" && *alpn != "h1" && *alpn != "h2") || (*h2tap != "on" && *h2tap != "off") {
+		return fail("usage", errors.New("unexpected argument or invalid protocol option"))
+	}
+	for _, endpoint := range []string{*listen, *uiAddr} {
+		if !cli.Loopback(endpoint) {
+			if *tlsEnabled && !*allowRemote {
+				return fail("listen_not_loopback", errors.New("TLS listeners must be loopback unless --allow-remote is set"))
+			}
+			fmt.Fprintln(os.Stderr, "warning: non-loopback listener:", endpoint)
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -137,57 +242,79 @@ func serve(args []string, isDemo bool) int {
 		host, port, e := net.SplitHostPort(*app)
 		n, portErr := strconv.Atoi(port)
 		if e != nil || portErr != nil || n < 0 || n > 65535 {
-			fmt.Fprintln(os.Stderr, "invalid demo listener")
-			return 2
+			return fail("usage", errors.New("invalid demo listener"))
 		}
 		if _, e = proxy.ParseTarget("http://" + net.JoinHostPort(host, "1")); e != nil {
-			fmt.Fprintln(os.Stderr, e)
-			return 2
+			return fail("listen_not_loopback", e)
 		}
 		appListener, err = net.Listen("tcp", *app)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
+			return fail("listen_failed", err)
 		}
 		defer appListener.Close()
 		*target = "http://" + appListener.Addr().String()
 	}
-	u, err := proxy.ParseTarget(*target)
+	u, err := proxy.ParseExplicitTarget(*target)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+		return fail("usage", err)
 	}
 	cfg := fault.Config{Seed: *seed}
 	var startSeq uint64
 	if *tapePath != "" {
 		file, e := os.Open(*tapePath)
 		if e != nil {
-			fmt.Fprintln(os.Stderr, e)
-			return 2
+			return fail("tape_io", e)
 		}
 		t, e := tape.Decode(file)
 		file.Close()
 		if e != nil {
-			fmt.Fprintln(os.Stderr, e)
-			return 2
+			return fail("tape_invalid", e)
 		}
 		cfg = fault.Config{Seed: t.Seed, Rules: t.Rules}
 		startSeq = t.StartSeq
 	}
 	pl, err := net.Listen("tcp", *listen)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+		return fail("listen_failed", err)
 	}
 	defer pl.Close()
 	ul, err := net.Listen("tcp", *uiAddr)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 2
+		return fail("listen_failed", err)
 	}
 	defer ul.Close()
 	bus := telemetry.New()
 	p := proxy.New(u, cfg, bus)
+	opts := proxy.Options{Demo: isDemo, UpstreamAllow: upstreamAllow, InsecureUpstream: *insecure, MITMALPN: *alpn, H2TapOff: *h2tap == "off", SSETelemetryMax: *sseMax}
+	if *upstreamCA != "" {
+		data, e := os.ReadFile(*upstreamCA)
+		if e != nil {
+			return fail("ca_missing", e)
+		}
+		pool, e := x509.SystemCertPool()
+		if e != nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(data) {
+			return fail("usage", errors.New("invalid upstream CA"))
+		}
+		opts.UpstreamCA = pool
+	}
+	if *tlsEnabled {
+		if *caDir == "" {
+			opts.CA, err = tlsmitm.Ephemeral()
+		} else {
+			opts.CA, err = (tlsmitm.Store{Dir: *caDir}).Load()
+		}
+		if err != nil {
+			code := "ca_missing"
+			if errors.Is(err, tlsmitm.ErrInsecurePerms) {
+				code = "ca_insecure_perms"
+			}
+			return fail(code, err)
+		}
+	}
+	p.SetOptions(opts)
 	p.SetSeq(startSeq)
 	defer p.Close()
 	demoURL := ""
@@ -195,34 +322,49 @@ func serve(args []string, isDemo bool) int {
 		demoURL = *target
 	}
 	handler := ui.New(p, bus, ui.Options{Target: *target, Listen: pl.Addr().String(), UI: ul.Addr().String(), DemoURL: demoURL})
-	var proxyHandler http.Handler = p
+	servers := []*http.Server{{Handler: handler}}
+	listeners := []net.Listener{ul}
 	if isDemo {
-		proxyHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !localweb.Allowed(r, pl.Addr().String()) {
-				http.Error(w, "forbidden", http.StatusForbidden)
-				return
-			}
-			if r.Header.Get("Origin") != "" && (r.Header.Get("Upgrade") != "" || (r.Method != http.MethodGet && r.Method != http.MethodHead)) {
-				r = r.Clone(r.Context())
-				r.Header.Del("Origin")
-			}
-			p.ServeHTTP(w, r)
-		})
-	}
-	servers := []*http.Server{{Handler: proxyHandler}, {Handler: handler}}
-	listeners := []net.Listener{pl, ul}
-	if isDemo {
-		servers = append(servers, &http.Server{Handler: demo.New()})
+		servers = append(servers, &http.Server{Handler: demo.New(), Protocols: demo.Protocols()})
 		listeners = append(listeners, appListener)
 	}
-	errs := make(chan error, len(servers))
+	errs := make(chan error, len(servers)+1)
+	go func() { errs <- p.Serve(pl) }()
 	for i, s := range servers {
 		l := listeners[i]
 		go func(s *http.Server) { errs <- s.Serve(l) }(s)
 	}
-	fmt.Printf("Proxy: http://%s\nUI: http://%s\n", pl.Addr(), ul.Addr())
-	if isDemo {
-		fmt.Printf("Demo: %s\nOpen the UI and run a checkout.\n", demoURL)
+	var stopEvents func()
+	var eventsDone chan struct{}
+	if *asJSON {
+		var fingerprint any
+		var certPath any
+		if opts.CA != nil {
+			fingerprint = opts.CA.Fingerprint()
+			if *caDir != "" {
+				certPath = (tlsmitm.Store{Dir: *caDir}).CertPath()
+			}
+		}
+		var demoValue any
+		if demoURL != "" {
+			demoValue = demoURL
+		}
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "ready", "proxy": "http://" + pl.Addr().String(), "ui": "http://" + ul.Addr().String(), "demo": demoValue, "tls": map[string]any{"enabled": *tlsEnabled, "ca_cert": certPath, "fingerprint": fingerprint}})
+		_, events, unsubscribe := bus.Subscribe()
+		stopEvents = unsubscribe
+		eventsDone = make(chan struct{})
+		go func() {
+			defer close(eventsDone)
+			enc := json.NewEncoder(os.Stdout)
+			for event := range events {
+				_ = enc.Encode(map[string]any{"type": "event", "event": event})
+			}
+		}()
+	} else {
+		fmt.Printf("Proxy: http://%s\nUI: http://%s\n", pl.Addr(), ul.Addr())
+		if isDemo {
+			fmt.Printf("Demo: %s\nOpen the UI and run a checkout.\n", demoURL)
+		}
 	}
 	if *open {
 		_ = exec.Command("xdg-open", "http://"+ul.Addr().String()).Start()
@@ -242,6 +384,12 @@ func serve(args []string, isDemo bool) int {
 		if s.Shutdown(shutdown) != nil {
 			_ = s.Close()
 		}
+	}
+	p.Close()
+	if *asJSON {
+		stopEvents()
+		<-eventsDone
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "shutdown", "exit_code": code})
 	}
 	return code
 }

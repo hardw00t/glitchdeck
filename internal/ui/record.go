@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"glitchdeck/internal/fault"
-	"glitchdeck/internal/proxy"
-	"glitchdeck/internal/tape"
+	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/tape"
 )
 
 const (
@@ -33,6 +33,8 @@ type recorded struct {
 	ws            *tape.WS
 	bytes, events int
 	done          bool
+	sse           bool
+	mitm          bool
 }
 
 type recordedChange struct {
@@ -53,6 +55,59 @@ type recorder struct {
 	changes          []recordedChange
 	incompleteReason string
 	lastFrame        time.Time
+}
+
+// Recording captures traffic and configuration changes from a single proxy.
+type Recording struct {
+	rec recorder
+	p   *proxy.Proxy
+}
+
+func NewRecorder() *Recording { return new(Recording) }
+
+// Start attaches hooks before the proxy is served.
+func (r *Recording) Start(p *proxy.Proxy) {
+	r.p = p
+	r.rec.attach(p)
+	p.CaptureBoundary(func(next uint64, active int) {
+		r.rec.start(next-1, active, p.Config())
+	})
+}
+
+func (r *Recording) Stop() { r.rec.stop() }
+
+func (r *Recording) ConfigChanged(before uint64, cfg fault.Config) { r.rec.changed(before, cfg) }
+
+func (r *Recording) Export(name string) (tape.Tape, error) {
+	var cfg fault.Config
+	if r.p != nil {
+		cfg = r.p.Config()
+	}
+	doc := r.rec.tape(cfg)
+	doc.Name = name
+	return doc, nil
+}
+
+func (r *recorder) attach(p *proxy.Proxy) {
+	p.OnRequest = r.request
+	p.OnClientFrame = r.clientFrame
+	p.OnServerFrame = r.serverFrame
+	p.OnUnsupportedFrame = r.unsupportedFrame
+	p.OnSSE = r.markSSE
+}
+
+func (r *recorder) markSSE(seq uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running {
+		return
+	}
+	for i := len(r.entries) - 1; i >= 0; i-- {
+		if e := r.entries[i]; e.seq == seq {
+			e.sse = true
+			return
+		}
+	}
 }
 
 func (r *recorder) clear() {
@@ -192,7 +247,7 @@ func (r *recorder) request(req proxy.Record) {
 	if req.UnrecordableBody {
 		r.markIncomplete("streamed request body was not captured")
 	}
-	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path)}
+	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM}
 	if req.WebSocket {
 		if req.Header.Get("Sec-WebSocket-Protocol") != "" {
 			r.markIncomplete("WebSocket subprotocol offers were not captured")
@@ -200,11 +255,14 @@ func (r *recorder) request(req proxy.Record) {
 		e.ws = &tape.WS{Path: req.Path}
 		r.streams[req.Seq] = e
 	} else {
-		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, Body: string(req.Body)}
-		e.bytes += len(req.Body)
+		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body)}
+		if req.URL != "" {
+			e.http.Path = ""
+		}
+		e.bytes += len(req.Body) + len(req.URL) + len(req.Proto)
 		for k, v := range req.Header {
 			switch strings.ToLower(k) {
-			case "authorization", "proxy-authorization", "cookie", "connection", "upgrade", "transfer-encoding", "content-length", "expect", "te", "trailer":
+			case "authorization", "proxy-authorization", "cookie", "set-cookie", "connection", "upgrade", "transfer-encoding", "content-length", "expect", "te", "trailer", "x-glitchdeck-run", "x-glitchdeck-seq":
 				continue
 			}
 			if e.http.Headers == nil {
@@ -298,11 +356,15 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 		}
 	})
 	doc := tape.Tape{
-		Seed: fallback.Seed, Rules: fallback.Rules,
+		Version: 1,
+		Seed:    fallback.Seed, Rules: fallback.Rules,
 		Incomplete: r.incompleteReason != "", IncompleteReason: r.incompleteReason,
 		Script: make([]tape.Step, 0, len(entries)),
 	}
 	if r.started.IsZero() {
+		if v2Rules(doc.Rules) {
+			doc.Version = 2
+		}
 		return doc
 	}
 	doc.Seed, doc.Rules, doc.StartSeq = r.config.Seed, r.config.Rules, r.startSeq
@@ -324,8 +386,30 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 			}
 		}
 	}
+	if v2Rules(doc.Rules) {
+		doc.Version = 2
+	}
+	for _, change := range doc.ConfigChanges {
+		if v2Rules(change.Rules) {
+			doc.Version = 2
+			break
+		}
+	}
 	for _, e := range entries {
 		step := tape.Step{Seq: e.seq, AtMS: max(e.at.Sub(entries[0].at).Milliseconds(), 0), HTTP: e.http}
+		if e.mitm {
+			doc.Version, doc.TLSMITM = 2, true
+		}
+		if e.http != nil {
+			if e.http.URL != "" || e.http.Proto != "" || e.sse {
+				doc.Version = 2
+			}
+			if e.sse {
+				h := e.http
+				step.HTTP = nil
+				step.Stream = &tape.Stream{Method: h.Method, Path: h.Path, URL: h.URL, Headers: h.Headers, Body: h.Body}
+			}
+		}
 		if e.ws != nil {
 			ws := *e.ws
 			ws.Frames = max(ws.Frames, 1)
@@ -335,4 +419,17 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 		doc.Script = append(doc.Script, step)
 	}
 	return doc
+}
+
+func v2Rules(rules []fault.Rule) bool {
+	for _, r := range rules {
+		switch r.Fault.Type {
+		case "sse-glitch", "grpc-glitch", "h2-glitch":
+			return true
+		}
+		if r.Match.Host != "" || r.Match.Scheme != "" || r.Match.Proto != "" {
+			return true
+		}
+	}
+	return false
 }
