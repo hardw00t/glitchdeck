@@ -83,7 +83,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	dialCtx, stopDial := context.WithTimeout(ctx, 5*time.Second)
 	defer stopDial()
 	addr := net.JoinHostPort(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port()))
-	if !r.URL.IsAbs() && !MetaFrom(r.Context()).MITM && !p.options.RequireUpstreamAllow {
+	if !r.URL.IsAbs() && !MetaFrom(r.Context()).MITM && p.target != nil {
 		dialCtx = context.WithValue(dialCtx, reverseTargetKey{}, true)
 	}
 	up, err := p.dial(dialCtx, "tcp", addr)

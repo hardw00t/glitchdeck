@@ -62,6 +62,11 @@ type Options struct {
 	RequireUpstreamAllow bool
 	javaHome             bool
 }
+type execTrafficSummary struct {
+	proxy.TrafficStats
+	EgressDeniedHosts []string `json:"egress_denied_hosts,omitempty"`
+}
+
 type Exec struct {
 	Cmd                         []string           `json:"cmd"`
 	ProxyURL                    string             `json:"proxy_url"`
@@ -82,7 +87,7 @@ type Exec struct {
 	TLSHandshakeFailuresOmitted uint64             `json:"tls_handshake_failures_omitted,omitempty"`
 	NoProxy                     string             `json:"no_proxy"`
 	NoProxyDropped              []string           `json:"no_proxy_dropped,omitempty"`
-	Traffic                     proxy.TrafficStats `json:"traffic"`
+	Traffic                     execTrafficSummary `json:"traffic"`
 }
 type Summary struct {
 	AssertionsTotal  int    `json:"assertions_total"`
@@ -212,9 +217,15 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	var parsed *url.URL
 	if target != "" {
-		parsed, err = proxy.ParseTarget(target)
 		if o.Target != "" {
 			parsed, err = proxy.ParseExplicitTarget(target)
+		} else {
+			parsed, err = proxy.ParseTarget(target)
+			if err != nil {
+				if _, explicitErr := proxy.ParseExplicitTarget(target); explicitErr == nil {
+					err = fmt.Errorf("%w; for forward mode, omit target and use --tls with tape upstream_allow or --upstream-allow", err)
+				}
+			}
 		}
 		if err != nil {
 			return finish(2, "TARGET_INVALID", err)
@@ -275,6 +286,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	opts.BeforeRequest = applyChanges
 	opts.OnAdmission = evidence.admit
+	opts.OnEgressDenied = hosts.addDenied
 	opts.OnReset = func() {
 		tlsFailures.reset()
 		hosts.reset()
@@ -620,6 +632,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	defer cancelDrain()
 	waitErr = p.Drain(drainCtx)
 	childStats := p.TrafficStats()
+	deniedHosts := hosts.deniedSnapshot(opts.ProxyAuth)
 	childFaults := p.AppliedFaults()
 	var httpResults []tape.Result
 	if waitErr == nil {
@@ -647,7 +660,12 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	e.FrameErrors, e.FrameErrorsOmitted = frameErrors.Snapshot()
 	e.Exec.TLSHandshakeFailureCount, e.Exec.TLSHandshakeFailures = tlsFailures.snapshot()
 	e.Exec.TLSHandshakeFailuresOmitted = e.Exec.TLSHandshakeFailureCount - uint64(len(e.Exec.TLSHandshakeFailures))
-	e.Exec.Traffic = childStats
+	e.Exec.Traffic.TrafficStats = childStats
+	e.Exec.Traffic.EgressDeniedHosts = deniedHosts
+	deniedList := strings.Join(deniedHosts, ", ")
+	if deniedList != "" {
+		warn(fmt.Sprintf("warning: egress denied %d (hosts: %s)", childStats.EgressDenied, deniedList))
+	}
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))
 	}
@@ -675,26 +693,38 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		e.Diff = append(e.Diff, fmt.Sprintf("diagnostics omitted for %d assertions", limits.omitted))
 	}
 	failed := e.Summary.AssertionsFailed > 0
+	if childStats.ReverseDialFailed > 0 {
+		port := parsed.Port()
+		if port == "" {
+			port = "80"
+			if parsed.Scheme == "https" {
+				port = "443"
+			}
+		}
+		targetHost := ""
+		if host := diagnosticHostname(parsed.Host); host != "" {
+			targetHost = " " + net.JoinHostPort(host, port)
+		}
+		e.Diff = append(e.Diff, fmt.Sprintf("target%s unreachable: is your app running / is the port right? (%d dial failure(s))", targetHost, childStats.ReverseDialFailed))
+		failed = true
+	}
 	innerOK := childStats.InnerUsable > 0
 	tlsOnly := childStats.TLSRejected > 0 && !innerOK && childStats.PassthroughOK+childStats.BlindOK == 0
 	deniedOnly := childStats.EgressDenied > 0 && !innerOK && childStats.InterceptedOK+childStats.PassthroughOK+childStats.BlindOK == 0
-	hostList := func(kind string) string {
-		list := hosts.list(kind)
-		if opts.ProxyAuth != "" {
-			list = strings.ReplaceAll(list, opts.ProxyAuth, "[redacted]")
-		}
-		return list
+	tlsHosts := hosts.tlsList()
+	if opts.ProxyAuth != "" {
+		tlsHosts = strings.ReplaceAll(tlsHosts, opts.ProxyAuth, "[redacted]")
 	}
 	if childStats.TLSRejected > 0 && innerOK {
-		warn(fmt.Sprintf("warning: tls_rejected: %d handshake(s) failed for hosts %s", childStats.TLSRejected, hostList("tls")))
+		warn(fmt.Sprintf("warning: tls_rejected: %d handshake(s) failed for hosts %s", childStats.TLSRejected, tlsHosts))
 	}
 	if !o.AllowZeroTraffic {
 		if tlsOnly {
-			line := fmt.Sprintf("tls_rejected_only: %d CONNECT tunnel(s) reached glitchdeck but the client rejected the interception certificate (hosts: %s); trust $GLITCHDECK_CA_CERT in the client, or add pinned hosts to --tls-passthrough", childStats.TLSRejected, hostList("tls"))
+			line := fmt.Sprintf("tls_rejected_only: %d CONNECT tunnel(s) reached glitchdeck but the client rejected the interception certificate (hosts: %s); trust $GLITCHDECK_CA_CERT in the client, or add pinned hosts to --tls-passthrough", childStats.TLSRejected, tlsHosts)
 			e.Diff = append(e.Diff, strings.Join(append([]string{line}, hint(o, o.Command, parsed, childStats)...), "; "))
 			failed = true
 		} else if deniedOnly {
-			e.Diff = append(e.Diff, fmt.Sprintf("egress_denied_only: %d request(s) blocked by the upstream allowlist (hosts: %s); add --upstream-allow <host> or tape upstream_allow", childStats.EgressDenied, hostList("denied")))
+			e.Diff = append(e.Diff, fmt.Sprintf("egress_denied_only: %d request(s) blocked by the upstream allowlist (hosts: %s); add --upstream-allow <host> or tape upstream_allow", childStats.EgressDenied, deniedList))
 			failed = true
 		} else if childStats.RequestsTotal == 0 {
 			line := "zero_traffic: no requests reached the proxy; check HTTP(S)_PROXY bypass (Go ignores proxies for localhost/127.0.0.1) and CA trust"

@@ -300,11 +300,11 @@ func TestHTTPSAssertionUsesProvidedRoots(t *testing.T) {
 
 func TestTrafficHostsKeepSmallestNormalizedNames(t *testing.T) {
 	var hosts trafficHosts
-	for _, host := range []string{"Z.test:443", "b.test", "A.TEST.", "c.test", "d.test", "e.test", "a.test", "f.test"} {
-		data, _ := json.Marshal(map[string]string{"host": host, "error": "egress_denied"})
-		hosts.observe(telemetry.Event{Type: "http_req", Data: data})
+	for _, authority := range []string{"z.test:443", "I.TEST.", "h.test", "g.test", "f.test", "e.test", "d.test", "c.test", "B.test",
+		"a.test", "b.test", "user@J.\ntest:443/path?query=value", strings.Repeat("a", 254) + ".test"} {
+		hosts.addDenied(authority)
 	}
-	if got := hosts.list("denied"); got != "a.test, b.test, c.test, d.test, e.test" {
+	if got := strings.Join(hosts.deniedSnapshot(""), ", "); got != "a.test, b.test, c.test, d.test, e.test, f.test, g.test, h.test, i.test, j.test" {
 		t.Fatalf("hosts = %q", got)
 	}
 }
@@ -313,13 +313,12 @@ func TestTrafficEvidenceReset(t *testing.T) {
 	var hosts trafficHosts
 	var failures tlsFailureEvidence
 	tls := telemetry.Event{Type: "tls_handshake_failed", Data: json.RawMessage(`{"host":"old.test"}`)}
-	denied := telemetry.Event{Type: "http_req", Data: json.RawMessage(`{"host":"denied.test","error":"egress_denied"}`)}
+	hosts.addDenied("denied.test")
 	hosts.observe(tls)
-	hosts.observe(denied)
 	failures.observe(tls)
 	hosts.reset()
 	failures.reset()
-	if hosts.list("tls") != "" || hosts.list("denied") != "" {
+	if hosts.tlsList() != "" || len(hosts.deniedSnapshot("")) != 0 {
 		t.Fatal("reset retained old hosts")
 	}
 	if count, details := failures.snapshot(); count != 0 || len(details) != 0 {
@@ -327,7 +326,7 @@ func TestTrafficEvidenceReset(t *testing.T) {
 	}
 	hosts.observe(tls)
 	failures.observe(tls)
-	if count, _ := failures.snapshot(); count != 1 || hosts.list("tls") != "old.test" {
+	if count, _ := failures.snapshot(); count != 1 || hosts.tlsList() != "old.test" {
 		t.Fatal("evidence not recorded after reset")
 	}
 }

@@ -35,6 +35,7 @@ type Options struct {
 	ProxyAuth            string
 	BeforeRequest        func(uint64)
 	OnAdmission          func(seq uint64, method, path, host string)
+	OnEgressDenied       func(host string)
 	OnReset              func()
 	RequireUpstreamAllow bool
 	AllowLoopbackEgress  bool
@@ -305,14 +306,22 @@ func (p *Proxy) DialContext(ctx context.Context, network, addr string) (net.Conn
 	return p.dialWithPolicy(ctx, network, addr, false)
 }
 
-func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restrict bool) (net.Conn, error) {
+func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restrict bool) (_ net.Conn, err error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	reverseTarget := ctx.Value(reverseTargetKey{}) == true && p.target != nil && !p.options.RequireUpstreamAllow && strings.EqualFold(host, p.target.Hostname()) && port == upstreamPort(p.target.Scheme, p.target.Port())
+	configuredTarget := ctx.Value(reverseTargetKey{}) == true && p.target != nil && strings.EqualFold(host, p.target.Hostname()) && port == upstreamPort(p.target.Scheme, p.target.Port())
+	reverseTarget := configuredTarget && !p.options.RequireUpstreamAllow
 	if !p.allowed(host, port) && !reverseTarget {
 		return nil, errEgressDenied
+	}
+	if configuredTarget {
+		defer func() {
+			if err != nil && !errors.Is(err, errEgressDenied) && !errors.Is(err, context.Canceled) {
+				p.reverseDialFailed.Add(1)
+			}
+		}()
 	}
 	// The operator-configured reverse target is reachable on any listener; clients
 	// cannot choose it, so exposing the proxy does not turn it into an open relay.

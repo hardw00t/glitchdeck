@@ -9,11 +9,17 @@ import (
 )
 
 func rateLimitResponse(h http.Header, params map[string]any, status int, seq uint64, now time.Time) string {
-	h.Set("Retry-After", strconv.Itoa(fault.Int(params, "retry_after_sec", 5)))
+	ms := fault.Int(params, "retry_after_ms", 0)
+	seconds := 5
+	if _, ok := params["retry_after_ms"]; ok {
+		seconds = max(1, (ms+999)/1000)
+	}
+	h.Set("Retry-After", strconv.Itoa(fault.Int(params, "retry_after_sec", seconds)))
 	h.Set("X-Glitchdeck-Fault", "rate-limit")
 	provider := fault.String(params, "provider", "none")
 	if _, ok := params["retry_after_ms"]; ok && provider != "gemini" {
-		h.Set("Retry-After-Ms", strconv.Itoa(fault.Int(params, "retry_after_ms", 0)))
+		// Retry-After-Ms is not yet verified against the live Anthropic API.
+		h.Set("Retry-After-Ms", strconv.Itoa(ms))
 	}
 	body := fault.String(params, "body", "")
 	reset := fault.Int(params, "reset_sec", 0)

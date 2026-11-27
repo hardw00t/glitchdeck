@@ -72,11 +72,15 @@ The checkout regression tape exits `1` and reports `duplicate_charges: expected 
 
 `exec` injects `GLITCHDECK_PROXY_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and lowercase proxy variants. Both `NO_PROXY` cases receive the same deduplicated list: inherited entries are kept unless they would bypass the target (dropped with a warning), `--no-proxy` entries are kept verbatim, and the listener address is included. Passthrough is not added to `NO_PROXY`: the connection still goes through glitchdeck. Use `GLITCHDECK_PROXY_URL` as the client base URL for reverse mode, including with Go clients that skip environment proxies for loopback.
 
+If the client keeps its base URL in a config file, pin the proxy with `--listen 127.0.0.1:8080` and set that file's base URL to `http://127.0.0.1:8080`.
+
 `exec` sets `NODE_USE_ENV_PROXY=1`. With TLS enabled, it merges inherited `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `NODE_EXTRA_CA_CERTS` certificates into the temporary CA bundle. It sets `GLITCHDECK_CA_CERT` to the interception CA, `NODE_EXTRA_CA_CERTS` to the inherited Node roots plus that CA, and `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`, `AWS_CA_BUNDLE`, [`DENO_CERT`](https://docs.deno.com/runtime/reference/env_variables/#special-environment-variables), [`GIT_SSL_CAINFO`](https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpsslCAInfo), [`PIP_CERT`](https://pip.pypa.io/en/stable/topics/https-certificates/#using-a-specific-certificate-store), [`NPM_CONFIG_CAFILE`](https://docs.npmjs.com/cli/v11/using-npm/config/#cafile), and [`CARGO_HTTP_CAINFO`](https://doc.rust-lang.org/cargo/reference/config.html#httpcainfo) to the merged bundle. Java needs a JVM truststore; .NET on Linux can use the OpenSSL bundle, while macOS and Windows use the OS trust store.
 
 Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers the process group; detached descendants can escape. Windows cleanup is best-effort and does not guarantee stopping grandchildren.
 
 `exec` exits `1` for TLS-rejected-only traffic (`tls_rejected_only`), upstream-allowlist-denied-only traffic (`egress_denied_only`), no requests (`zero_traffic`), or enabled fault rules that never apply and do not all explicitly permit zero (`zero_faults`). `--allow-zero-traffic` skips all four checks; explicit fault and child-exit expectations still apply. `exec.traffic` reports CONNECT and inner-request counts, successful interception and tunnel counts, TLS rejections, egress denials, and dial failures. TLS handshake failures appear on stderr and in the wire log; `exec.tls_handshake_failure_count` counts them even if report details are omitted.
+
+A reverse-target dial failure makes `exec` fail even with `--allow-zero-traffic`; it increments `exec.traffic.dial_failed` and names the target's host and port. `exec.traffic.egress_denied_hosts` and stderr list up to 10 denied hostnames, including in runs that also reach allowed hosts.
 
 | Exit | Meaning |
 | --- | --- |
@@ -91,7 +95,7 @@ Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers
 
 ## Real-world use cases
 
-Run these from the repository root with the named local services running. Starter tapes contain no demo traffic; change paths and payloads to match your app. `glitchdeck validate examples/tapes/your-app-*.tape.yaml` checks them without running traffic.
+Run these from the repository root with the named local services running. Starter tapes contain no demo traffic. If your app uses a different port, pass `--target http://127.0.0.1:<port>` to `exec`. For a different route, copy the tape, edit the rule's `match.path_prefix`, and point the sender at the same route with a payload your app accepts. `glitchdeck validate examples/tapes/your-app-*.tape.yaml` checks the tapes without running traffic.
 
 ### LLM stream disconnect
 
@@ -135,6 +139,7 @@ glitchdeck exec --tape examples/tapes/your-app-stripe-concurrent-race.tape.yaml 
 
 - **Concurrent delivery:** `mode: concurrent` starts the original and four copies together. Use it to test whether a check-then-insert handler can process the same event twice.
 - **Commit then retry:** switch to `examples/tapes/your-app-stripe-timeout-retry.tape.yaml` to observe the injected `504`. The original reaches the receiver before the timeout response; the same event is then retried.
+  The tape accepts both zero and nonzero sender exits because some senders treat the `504` as a failure.
 - **Read the original status, copy histogram, and database together:** `faults_triggered[].replays.status` counts copy responses and `outcomes` groups their results. The original can receive `409` if a copy inserts first. Across all five deliveries, five `200`s and five rows means duplicate processing; one `200` and four `409`s, or five `200`s and one row, means deduplication.
 
 ### WebSocket silent drop
@@ -203,7 +208,7 @@ These examples opt in to command execution; omit `--allow-exec` to leave it disa
 | --- | --- |
 | `tcp-rst` | Reset the TCP connection before headers or after a byte budget |
 | `dup-webhook` | Replay a buffered request in staggered (`sequential`), simultaneous (`concurrent`), or commit-then-retry (`timeout_retry`) mode |
-| `rate-limit` | Return a status and `Retry-After`; `provider`, `retry_after_ms`, `reset_sec`, and `burst` add provider envelopes and retry-storm behavior |
+| `rate-limit` | Return a status and `Retry-After`. Explicit `retry_after_sec` wins; otherwise round `retry_after_ms` up to whole seconds (minimum 1), or use 5 seconds if neither is set. `provider`, `reset_sec`, and `burst` add provider envelopes and retry-storm behavior. |
 | `byte-trickle` | Pace response chunks and optionally stall once |
 | `latency-wave` | Add seeded sine, spike, or jitter delay |
 | `ws-glitch` | Drop, delay, corrupt, truncate, or abnormally close `data`, `control`, or `all` frames |

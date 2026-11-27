@@ -69,6 +69,7 @@ type Proxy struct {
 	connectEgressDenied atomic.Int64
 	innerEgressDenied   atomic.Int64
 	dialFailed          atomic.Int64
+	reverseDialFailed   atomic.Int64
 	innerUsable         atomic.Int64
 	interceptedEmpty    atomic.Int64
 	bus                 *telemetry.Bus
@@ -195,6 +196,7 @@ type TrafficStats struct {
 	EgressDenied      int64 `json:"egress_denied"`
 	InnerEgressDenied int64 `json:"-"`
 	DialFailed        int64 `json:"dial_failed"`
+	ReverseDialFailed int64 `json:"-"`
 }
 
 func (p *Proxy) TrafficStats() TrafficStats {
@@ -202,11 +204,13 @@ func (p *Proxy) TrafficStats() TrafficStats {
 	defer p.mu.Unlock()
 	connects, requests := p.connects.Load(), int64(p.requests.Load())
 	innerDenied := p.innerEgressDenied.Load()
+	reverseFailed := p.reverseDialFailed.Load()
 	return TrafficStats{RequestsTotal: requests, Connects: connects, InnerRequests: requests - connects,
 		InterceptedOK: p.interceptedOK.Load(), TLSRejected: p.tlsRejected.Load(),
 		InnerUsable: p.innerUsable.Load(), InterceptedEmpty: p.interceptedEmpty.Load(),
 		PassthroughOK: p.passthroughOK.Load(), BlindOK: p.blindOK.Load(),
-		EgressDenied: p.connectEgressDenied.Load() + innerDenied, InnerEgressDenied: innerDenied, DialFailed: p.dialFailed.Load()}
+		EgressDenied: p.connectEgressDenied.Load() + innerDenied, InnerEgressDenied: innerDenied,
+		DialFailed: p.dialFailed.Load() + reverseFailed, ReverseDialFailed: reverseFailed}
 }
 func (p *Proxy) SetSeq(n uint64)       { p.gate.Lock(); p.seq.Store(n); p.gate.Unlock() }
 func (p *Proxy) ActiveWebSockets() int { p.gate.Lock(); defer p.gate.Unlock(); return p.activeWS }
@@ -276,6 +280,7 @@ func (p *Proxy) ResetWith(fn func()) {
 	p.connectEgressDenied.Store(0)
 	p.innerEgressDenied.Store(0)
 	p.dialFailed.Store(0)
+	p.reverseDialFailed.Store(0)
 	p.innerUsable.Store(0)
 	p.interceptedEmpty.Store(0)
 	clear(p.stats)
@@ -524,6 +529,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.IsAbs() {
 		if r.URL.User != nil || (scheme != "http" && scheme != "https") || !p.allowed(r.URL.Hostname(), upstreamPort(scheme, r.URL.Port())) {
 			p.innerEgressDenied.Add(1)
+			if p.options.OnEgressDenied != nil {
+				p.options.OnEgressDenied(r.URL.Host)
+			}
 			http.Error(w, "egress denied", http.StatusForbidden)
 			if seq, gen := p.tunnelSequence(); seq != 0 {
 				p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", 0, 0)
@@ -533,6 +541,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if p.target != nil {
 		if p.options.RequireUpstreamAllow && !p.allowed(p.target.Hostname(), upstreamPort(p.target.Scheme, p.target.Port())) {
 			p.innerEgressDenied.Add(1)
+			if p.options.OnEgressDenied != nil {
+				p.options.OnEgressDenied(p.target.Host)
+			}
 			http.Error(w, "egress denied", http.StatusForbidden)
 			return
 		}
@@ -872,7 +883,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		end = "client_cancel"
 		panic(http.ErrAbortHandler)
 	}
-	if !r.URL.IsAbs() && !meta.MITM && !p.options.RequireUpstreamAllow {
+	if !r.URL.IsAbs() && !meta.MITM && p.target != nil {
 		ctx = context.WithValue(ctx, reverseTargetKey{}, true)
 	}
 	mode := fault.String(params, "mode", "sequential")

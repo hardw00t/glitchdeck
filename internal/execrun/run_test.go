@@ -708,6 +708,11 @@ func TestExecTrafficChecks(t *testing.T) {
 			if logs != nil {
 				data, err := os.ReadFile(logs.Name())
 				const warning = "warning: tls_rejected: 1 handshake(s) failed for hosts 127.0.0.1\n"
+				report, marshalErr := json.Marshal(r.Exec.Traffic)
+				if marshalErr != nil || !strings.Contains(string(report), `"egress_denied_hosts":["example.com"]`) ||
+					!strings.Contains(string(data), "egress denied 1 (hosts: example.com)") {
+					t.Errorf("missing denied host: traffic=%s, stderr=%q, err=%v", report, data, marshalErr)
+				}
 				if err != nil || strings.Count(string(data), warning) != 1 || strings.Count(string(data), "tls_handshake_failed:") != 1 ||
 					r.Exec.Traffic.InterceptedOK != 1 || r.Exec.TLSHandshakeFailureCount != 1 {
 					t.Fatalf("mixed HTTPS traffic: %+v, stderr=%q, err=%v", r.Exec.Traffic, data, err)
@@ -718,6 +723,99 @@ func TestExecTrafficChecks(t *testing.T) {
 				t.Fatalf("%+v; traffic %+v", r, r.Exec.Traffic)
 			}
 		})
+	}
+}
+
+func TestExecRefusedReverseTarget(t *testing.T) {
+	if os.Getenv("GD_REFUSED_HELPER") == "1" {
+		client := &http.Client{Timeout: 3 * time.Second}
+		for _, upgrade := range []bool{false, true} {
+			req, err := http.NewRequest(http.MethodGet, os.Getenv("GLITCHDECK_PROXY_URL")+"/ws/test", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if upgrade {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "websocket")
+				req.Header.Set("Sec-WebSocket-Version", "13")
+				req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d", resp.StatusCode)
+			}
+		}
+		return
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	t.Setenv("GD_REFUSED_HELPER", "1")
+	r := Run(context.Background(), tape.Tape{Version: 2}, Options{
+		Target: "http://" + addr + "/upstream-only", AllowZeroTraffic: true,
+		Command: []string{os.Args[0], "-test.run=^TestExecRefusedReverseTarget$"},
+	})
+	diff := strings.Join(r.Diff, " ")
+	if r.ExitCode != 1 || r.Exec.ExitCode != 0 || r.Exec.Traffic.DialFailed != 2 ||
+		!strings.Contains(diff, "target "+addr+" unreachable") || strings.Contains(diff, "upstream-only") {
+		t.Fatalf("exit=%d child=%d traffic=%+v diff=%q", r.ExitCode, r.Exec.ExitCode, r.Exec.Traffic, diff)
+	}
+}
+
+func TestExecRemoteTapeTargetSuggestsForwardMode(t *testing.T) {
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "https://example.test"}, Options{Command: []string{"unused"}})
+	problem, _ := r.Error.(map[string]string)
+	msg := problem["message"]
+	if r.ExitCode != 2 || problem["code"] != "TARGET_INVALID" || !strings.Contains(msg, "forward mode") ||
+		!strings.Contains(msg, "--tls") || !strings.Contains(msg, "upstream_allow") || !strings.Contains(msg, "--upstream-allow") {
+		t.Fatalf("exit=%d error=%v", r.ExitCode, r.Error)
+	}
+}
+
+func TestExecStripeTimeoutStarterAcceptsSenderFailure(t *testing.T) {
+	if os.Getenv("GD_STRIPE_TIMEOUT_HELPER") == "1" {
+		resp, err := http.Post(os.Getenv("GLITCHDECK_PROXY_URL")+"/webhooks/stripe", "application/json", strings.NewReader(`{"id":"evt_fixture"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusGatewayTimeout {
+			t.Fatalf("status = %d, want 504", resp.StatusCode)
+		}
+		os.Exit(7)
+	}
+	f, err := os.Open("../../examples/tapes/your-app-stripe-timeout-retry.tape.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	tp, err := tape.Decode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deliveries atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/webhooks/stripe" {
+			http.NotFound(w, r)
+			return
+		}
+		deliveries.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	t.Setenv("GD_STRIPE_TIMEOUT_HELPER", "1")
+	r := Run(context.Background(), tp, Options{
+		Target: up.URL, Command: []string{os.Args[0], "-test.run=^TestExecStripeTimeoutStarterAcceptsSenderFailure$"},
+	})
+	if !r.OK || r.Exec.ExitCode != 7 || r.Summary.FaultsTriggered != 1 || deliveries.Load() != 2 {
+		t.Fatalf("exit=%d child=%d deliveries=%d diff=%v", r.ExitCode, r.Exec.ExitCode, deliveries.Load(), r.Diff)
 	}
 }
 

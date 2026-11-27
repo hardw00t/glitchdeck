@@ -1,5 +1,6 @@
 version: 2
 name: your-app-stripe-concurrent-race
+# For a different app port, pass --target http://127.0.0.1:<port> to exec.
 target: http://127.0.0.1:3000
 rules:
   - id: race

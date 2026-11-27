@@ -1,6 +1,7 @@
 # A clean cut after 3 events can return a silent short answer; assert finish_reason.
 version: 2
 name: your-app-openai-sse-cut
+# For a different app port, pass --target http://127.0.0.1:<port> to exec.
 target: http://127.0.0.1:3000
 rules:
   - id: openai-stream-cut

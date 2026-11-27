@@ -66,6 +66,9 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	}
 	if !valid {
 		p.connectEgressDenied.Add(1)
+		if p.options.OnEgressDenied != nil {
+			p.options.OnEgressDenied(r.Host)
+		}
 		http.Error(w, "egress denied", http.StatusForbidden)
 		p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", 0, 0)
 		return

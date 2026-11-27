@@ -12,10 +12,12 @@ Exec fails closed on `tls_rejected_only`, `egress_denied_only`, `zero_traffic`, 
 Go skips environment proxies for localhost; use reverse mode by setting the client base URL to `GLITCHDECK_PROXY_URL`.
 
 For LLM streams, start with `examples/tapes/your-app-openai-sse-cut.tape.yaml` or its Anthropic counterpart.
+Use `--target http://127.0.0.1:<port>` to change a starter tape's port. To change the route, copy the tape and edit `match.path_prefix` and the client request path together.
 Assert the application's `finish_reason` or `stop_reason`, not just that the SDK returned without an exception.
 `expect.faults` with `min_applied: 1` fails if the fault did not fire; a non-zero `exec` alone is not proof it fired.
 Use `dup-webhook` with `sequential`, `concurrent`, or `timeout_retry`; inspect `faults_triggered[].replays` for copy statuses and outcomes.
 Set `ws-glitch` `frames: data` to count data frames and leave Close, Ping, and Pong untouched.
+For `rate-limit`, `retry_after_sec` sets `Retry-After` explicitly. Otherwise, `retry_after_ms` rounds up to whole seconds, with a minimum of 1; if neither is set, the header defaults to 5 seconds.
 
 For piped tapes and CI reports, use `glitchdeck validate -` and `glitchdeck report --junit report.json`.
 

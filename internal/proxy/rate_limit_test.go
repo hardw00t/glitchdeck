@@ -80,6 +80,33 @@ func TestRateLimitProviderWire(t *testing.T) {
 	}
 }
 
+func TestRetryAfterDerivesSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params map[string]any
+		want   string
+	}{
+		{"default", nil, "5"},
+		{"zero milliseconds", map[string]any{"retry_after_ms": 0}, "1"},
+		{"subsecond", map[string]any{"retry_after_ms": 300}, "1"},
+		{"whole seconds", map[string]any{"retry_after_ms": 2000}, "2"},
+		{"round up", map[string]any{"retry_after_ms": 1001}, "2"},
+		{"explicit zero wins", map[string]any{"retry_after_sec": 0, "retry_after_ms": 1001}, "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(nil, rateLimitConfig(tc.params), nil)
+			defer p.Close()
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r.Host = "127.0.0.1"
+			p.ServeHTTP(w, r)
+			if got := w.Result().Header.Get("Retry-After"); got != tc.want {
+				t.Fatalf("Retry-After = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func rateLimitConfig(params map[string]any) fault.Config {
 	return fault.Config{Rules: []fault.Rule{{ID: "limit", Enabled: true, Fault: fault.Fault{Type: "rate-limit", Params: params}}}}
 }

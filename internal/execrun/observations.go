@@ -3,10 +3,12 @@ package execrun
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
@@ -40,57 +42,80 @@ func (c *tlsFailureEvidence) reset() {
 }
 
 func (c *trafficHosts) observe(e telemetry.Event) {
-	var data struct {
-		Host  string `json:"host"`
-		Error string `json:"error"`
-	}
-	if e.Type != "tls_handshake_failed" && e.Type != "http_req" {
+	if e.Type != "tls_handshake_failed" {
 		return
+	}
+	var data struct {
+		Host string `json:"host"`
 	}
 	if json.Unmarshal(e.Data, &data) != nil {
 		return
 	}
-	kind := ""
-	if e.Type == "tls_handshake_failed" {
-		kind = "tls"
-	} else if data.Error == "egress_denied" {
-		kind = "denied"
-	}
-	if kind == "" {
-		return
-	}
-	u, err := url.Parse("//" + data.Host)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err != nil || u.Hostname() == "" {
-		return
-	}
-	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
-	list := &c.tls
-	if kind == "denied" {
-		list = &c.denied
-	}
-	i := sort.SearchStrings(*list, host)
-	if i < len(*list) && (*list)[i] == host {
-		return
-	}
-	if i < 5 {
-		*list = append(*list, "")
-		copy((*list)[i+1:], (*list)[i:])
-		(*list)[i] = host
-		if len(*list) > 5 {
-			*list = (*list)[:5]
-		}
-	}
+	c.add(&c.tls, diagnosticHostname(data.Host), 5)
 }
 
-func (c *trafficHosts) list(kind string) string {
+func (c *trafficHosts) addDenied(authority string) {
+	c.add(&c.denied, diagnosticHostname(authority), 10)
+}
+
+func diagnosticHostname(authority string) string {
+	authority = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, authority)
+	u, err := url.Parse("//" + authority)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if len(host) > 253 {
+		return ""
+	}
+	if net.ParseIP(host) == nil {
+		for _, r := range host {
+			if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !unicode.IsMark(r) && r != '-' && r != '.' && r != '_' {
+				return ""
+			}
+		}
+	}
+	return host
+}
+
+func (c *trafficHosts) add(list *[]string, host string, limit int) {
+	if host == "" {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if kind == "tls" {
-		return strings.Join(c.tls, ", ")
+	i := sort.SearchStrings(*list, host)
+	if i == limit || i < len(*list) && (*list)[i] == host {
+		return
 	}
-	return strings.Join(c.denied, ", ")
+	if len(*list) < limit {
+		*list = append(*list, "")
+	}
+	copy((*list)[i+1:], (*list)[i:])
+	(*list)[i] = host
+}
+
+func (c *trafficHosts) tlsList() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.Join(c.tls, ", ")
+}
+
+func (c *trafficHosts) deniedSnapshot(proxyToken string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, host := range c.denied {
+		if proxyToken == "" || !strings.Contains(host, proxyToken) {
+			out = append(out, host)
+		}
+	}
+	return out
 }
 
 func (c *tlsFailureEvidence) observe(e telemetry.Event) {
