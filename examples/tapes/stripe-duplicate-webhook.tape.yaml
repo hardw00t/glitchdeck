@@ -1,0 +1,21 @@
+# Expected test exit: 1 (duplicate charge reproduced); exec exit depends on child and traffic.
+version: 2
+name: stripe-duplicate-webhook
+seed: 42
+target: demo
+rules:
+  - id: duplicate
+    enabled: true
+    match: {method: POST, path_prefix: /webhooks/payment}
+    fault: {type: dup-webhook, params: {count: 2, delay_ms: 20}}
+script:
+  - name: webhook
+    http:
+      method: POST
+      path: /webhooks/payment
+      headers: {Content-Type: application/json}
+      body: '{"order_id":"ord-1","amount_cents":4900}'
+assertions:
+  - name: no-duplicate
+    http_get: /api/state
+    json_eq: {duplicate_charges: 0}

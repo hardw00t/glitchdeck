@@ -1,0 +1,18 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+# ${DEMO_TLS} resolves to the paired local TLS demo during test.
+version: 2
+name: https-mitm-flaky-api
+target: demo
+tls_mitm: true
+rules:
+  - id: reset
+    enabled: true
+    match: {seq: [1]}
+    fault: {type: tcp-rst, params: {before_headers: true}}
+script:
+  - {name: first, http: {url: '${DEMO_TLS}/api/state'}}
+  - {name: retry, http: {url: '${DEMO_TLS}/api/state'}}
+expect:
+  faults: [{rule: reset, min_applied: 1, max_applied: 1}]
+assertions:
+  - {name: state, http_get: /api/state, direct: true, expect_status: 200}

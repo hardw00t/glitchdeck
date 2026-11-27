@@ -1,0 +1,14 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: openai-sse-truncate-rst
+target: demo
+rules:
+  - id: reset
+    enabled: true
+    match: {path_prefix: /api/chat/stream}
+    fault: {type: sse-glitch, params: {action: truncate, after_events: 3, cut_bytes: 40}}
+script:
+  - name: chat
+    stream: {method: POST, path: /api/chat/stream, body: '{"tokens":8,"token_ms":1}'}
+assertions:
+  - {name: reset, stream_step: chat, expect_sse: {end: rst, min_events: 3}}

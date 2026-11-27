@@ -1,0 +1,17 @@
+# Expected test exit: 0 (injected status detected); exec exit depends on child and traffic.
+version: 2
+name: grpc-unavailable
+seed: 7
+target: demo
+rules:
+  - id: unavailable
+    enabled: true
+    match: {path_prefix: /glitchdeck.demo.v1.Quotes/, proto: h2}
+    fault: {type: grpc-glitch, params: {code: UNAVAILABLE}}
+script:
+  - name: quote
+    grpc: {path: /glitchdeck.demo.v1.Quotes/Get, message_b64: CgRBQ01F, timeout_ms: 2000, proto: h2c}
+assertions:
+  - name: unavailable-observed
+    grpc_step: quote
+    expect_grpc_status: 14

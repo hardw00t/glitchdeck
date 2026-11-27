@@ -1,0 +1,14 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: anthropic-sse-eof-before-stop
+target: demo
+rules:
+  - id: early
+    enabled: true
+    match: {path_prefix: /v1/messages}
+    fault: {type: sse-glitch, params: {action: eof_early, before_event: message_stop}}
+script:
+  - name: chat
+    stream: {method: POST, path: /v1/messages, body: '{"tokens":8,"token_ms":1}'}
+assertions:
+  - {name: truncated, stream_step: chat, expect_sse: {end: eof_early, done: false}}

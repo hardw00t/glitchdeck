@@ -1,0 +1,17 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: grpc-unavailable-then-ok
+target: demo
+rules:
+  - id: unavailable
+    enabled: true
+    match: {path_prefix: /glitchdeck.demo.v1.Quotes/, seq: [1, 2]}
+    fault: {type: grpc-glitch, params: {code: UNAVAILABLE}}
+script:
+  - {name: first, grpc: {path: /glitchdeck.demo.v1.Quotes/Get, message_b64: CgRBQ01F, proto: h2c}}
+  - {name: second, grpc: {path: /glitchdeck.demo.v1.Quotes/Get, message_b64: CgRBQ01F, proto: h2c}}
+  - {name: third, grpc: {path: /glitchdeck.demo.v1.Quotes/Get, message_b64: CgRBQ01F, proto: h2c}}
+assertions:
+  - {name: first, grpc_step: first, expect_grpc_status: 14}
+  - {name: second, grpc_step: second, expect_grpc_status: 14}
+  - {name: recovered, grpc_step: third, expect_grpc_status: 0}

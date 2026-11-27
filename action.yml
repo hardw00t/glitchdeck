@@ -1,0 +1,24 @@
+name: Glitchdeck tape test
+description: Run a deterministic network fault tape
+inputs:
+  tape:
+    description: Tape file to run
+    required: true
+  version:
+    description: Go module version or ref
+    required: false
+    default: latest
+runs:
+  using: composite
+  steps:
+    - name: Install glitchdeck
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: go install "github.com/hardw00t/glitchdeck/cmd/glitchdeck@${VERSION}"
+    - name: Run tape
+      shell: bash
+      env:
+        TAPE: ${{ inputs.tape }}
+      run: |
+        "$(go env GOPATH)/bin/glitchdeck" test "$TAPE" --json

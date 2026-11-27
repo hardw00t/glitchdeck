@@ -1,0 +1,14 @@
+# Expected test exit: 1 (duplicate charge); exec exit: depends on child and traffic.
+version: 2
+name: stripe-webhook-429-then-502
+target: demo
+rules:
+  - {id: limit, enabled: true, match: {path_prefix: /webhooks/payment, seq: [1]}, fault: {type: rate-limit, params: {status: 429}}}
+  - {id: unavailable, enabled: true, match: {path_prefix: /webhooks/payment, seq: [2]}, fault: {type: rate-limit, params: {status: 502}}}
+  - {id: duplicate, enabled: true, match: {path_prefix: /webhooks/payment, seq: [3]}, fault: {type: dup-webhook, params: {count: 2, delay_ms: 20}}}
+script:
+  - {name: first, http: {method: POST, path: /webhooks/payment, headers: {Content-Type: application/json}, body: '{"order_id":"ord-1","amount_cents":4900}'}}
+  - {name: retry, http: {method: POST, path: /webhooks/payment, headers: {Content-Type: application/json}, body: '{"order_id":"ord-1","amount_cents":4900}'}}
+  - {name: last, http: {method: POST, path: /webhooks/payment, headers: {Content-Type: application/json}, body: '{"order_id":"ord-1","amount_cents":4900}'}}
+assertions:
+  - {name: no-duplicate, http_get: /api/state, json_eq: {duplicate_charges: 0}}

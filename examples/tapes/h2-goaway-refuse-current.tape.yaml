@@ -1,0 +1,14 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: h2-goaway-refuse-current
+target: demo
+rules:
+  - id: goaway
+    enabled: true
+    match: {proto: h2, path_prefix: /api/state, seq: [1]}
+    fault: {type: h2-glitch, params: {action: goaway, refuse_current: true}}
+script:
+  - {name: request, http: {path: /api/state, proto: h2c}}
+expect:
+  faults: [{rule: goaway, min_applied: 1, max_applied: 1}]
+assertions: []

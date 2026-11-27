@@ -1,0 +1,14 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: h2-rst-refused-stream
+target: demo
+rules:
+  - id: reset
+    enabled: true
+    match: {proto: h2, path_prefix: /api/state, seq: [1]}
+    fault: {type: h2-glitch, params: {action: rst_stream, code: REFUSED_STREAM}}
+script:
+  - {name: request, http: {path: /api/state, proto: h2c}}
+expect:
+  faults: [{rule: reset, min_applied: 1, max_applied: 1}]
+assertions: []

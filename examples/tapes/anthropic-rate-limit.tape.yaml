@@ -1,0 +1,20 @@
+# Expected test exit: 0 (rate limit detected); exec exit depends on child and traffic.
+version: 2
+name: anthropic-rate-limit
+seed: 7
+target: demo
+rules:
+  - id: throttled
+    enabled: true
+    match: {method: POST, path_prefix: /v1/messages}
+    fault: {type: rate-limit, params: {status: 429, retry_after_sec: 1}}
+script:
+  - name: messages
+    http: {method: POST, path: /v1/messages, headers: {Content-Type: application/json}, body: '{"tokens":2}'}
+expect:
+  faults:
+    - {rule: throttled, min_applied: 1}
+assertions:
+  - name: demo-available
+    http_get: /api/state
+    expect_status: 200

@@ -1,0 +1,14 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: openai-sse-eof-before-done
+target: demo
+rules:
+  - id: early
+    enabled: true
+    match: {path_prefix: /api/chat/stream}
+    fault: {type: sse-glitch, params: {action: eof_early, http_clean: true}}
+script:
+  - name: chat
+    stream: {method: POST, path: /api/chat/stream, body: '{"tokens":8,"token_ms":1}'}
+assertions:
+  - {name: truncated, stream_step: chat, expect_sse: {end: eof_early, done: false}}

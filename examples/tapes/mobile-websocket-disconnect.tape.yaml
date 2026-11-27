@@ -1,0 +1,21 @@
+# Expected test exit: 0 (disconnect reproduced); exec exit depends on child and traffic.
+version: 2
+name: mobile-websocket-disconnect
+seed: 7
+target: demo
+rules:
+  - id: mobile-disconnect
+    enabled: true
+    match: {path_prefix: /ws/ticker}
+    fault: {type: ws-glitch, params: {action: close_1006, after_frames: 1}}
+script:
+  - name: ticker
+    ws: {path: /ws/ticker, frames: 3, timeout_ms: 2000}
+expect:
+  faults:
+    - {rule: mobile-disconnect, min_applied: 1}
+assertions:
+  - name: service-available
+    http_get: /api/state
+    expect_status: 200
+    json_eq: {ws_broken: true}

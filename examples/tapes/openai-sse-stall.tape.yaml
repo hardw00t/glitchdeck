@@ -1,0 +1,14 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: openai-sse-stall
+target: demo
+rules:
+  - id: stall
+    enabled: true
+    match: {path_prefix: /api/chat/stream}
+    fault: {type: sse-glitch, params: {action: stall, after_events: 5, stall_ms: 500}}
+script:
+  - name: chat
+    stream: {method: POST, path: /api/chat/stream, body: '{"tokens":12,"token_ms":1}', idle_timeout_ms: 100}
+assertions:
+  - {name: idle, stream_step: chat, expect_sse: {end: idle_timeout, min_events: 5}}

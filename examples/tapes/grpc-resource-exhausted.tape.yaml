@@ -1,0 +1,13 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: grpc-resource-exhausted
+target: demo
+rules:
+  - id: exhausted
+    enabled: true
+    match: {path_prefix: /glitchdeck.demo.v1.Quotes/}
+    fault: {type: grpc-glitch, params: {code: RESOURCE_EXHAUSTED, after_messages: 0}}
+script:
+  - {name: quote, grpc: {path: /glitchdeck.demo.v1.Quotes/Get, message_b64: CgRBQ01F, proto: h2c}}
+assertions:
+  - {name: exhausted, grpc_step: quote, expect_grpc_status: 8}

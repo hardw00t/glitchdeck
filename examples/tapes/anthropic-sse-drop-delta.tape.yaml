@@ -1,0 +1,16 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: anthropic-sse-drop-delta
+target: demo
+rules:
+  - id: drop
+    enabled: true
+    match: {path_prefix: /v1/messages}
+    fault: {type: sse-glitch, params: {action: drop, events: [3], event_type: content_block_delta}}
+script:
+  - name: chat
+    stream: {method: POST, path: /v1/messages, body: '{"tokens":8,"token_ms":1}'}
+expect:
+  faults: [{rule: drop, min_applied: 1}]
+assertions:
+  - {name: completed, stream_step: chat, expect_sse: {end: eof, valid_json: true}}

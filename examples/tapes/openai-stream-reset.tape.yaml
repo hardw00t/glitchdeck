@@ -1,0 +1,23 @@
+# Expected test exit: 0 (reset detected); exec exit depends on child and traffic.
+version: 2
+name: openai-stream-reset
+seed: 7
+target: demo
+rules:
+  - id: stream-reset
+    enabled: true
+    match: {method: POST, path_prefix: /api/chat/stream}
+    fault: {type: sse-glitch, params: {action: truncate, after_events: 3, cut_bytes: 40}}
+script:
+  - name: chat
+    stream:
+      method: POST
+      path: /api/chat/stream
+      headers: {Content-Type: application/json}
+      body: '{"tokens":12,"token_ms":5}'
+      idle_timeout_ms: 1000
+      max_ms: 5000
+assertions:
+  - name: cut-detected
+    stream_step: chat
+    expect_sse: {end: rst, done: false, min_events: 3}

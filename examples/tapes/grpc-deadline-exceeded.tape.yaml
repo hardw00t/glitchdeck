@@ -1,0 +1,13 @@
+# Expected test exit: 0; exec exit: depends on child and traffic.
+version: 2
+name: grpc-deadline-exceeded
+target: demo
+rules:
+  - id: deadline
+    enabled: true
+    match: {path_prefix: /glitchdeck.demo.v1.Quotes/}
+    fault: {type: grpc-glitch, params: {code: DEADLINE_EXCEEDED, delay_ms: 1500}}
+script:
+  - {name: quote, grpc: {path: /glitchdeck.demo.v1.Quotes/Get, message_b64: CgRBQ01F, timeout_ms: 1000, proto: h2c}}
+assertions:
+  - {name: deadline, grpc_step: quote, expect_grpc_status: 4}
