@@ -614,7 +614,14 @@ func TestExecTrafficChecks(t *testing.T) {
 				resp.Body.Close()
 			}
 		}
-		if mode == "rejected" || mode == "mixed" || mode == "rejected_nonzero" || mode == "broken upstream" {
+		if mode == "mixed" {
+			tr := &http.Transport{Proxy: http.ProxyURL(p), TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS11, MaxVersion: tls.VersionTLS11}}
+			defer tr.CloseIdleConnections()
+			if _, err := (&http.Client{Transport: tr, Timeout: 3 * time.Second}).Get("https://127.0.0.1:443/"); err == nil {
+				t.Fatal("unsupported TLS version unexpectedly negotiated")
+			}
+		}
+		if mode == "rejected" || mode == "rejected_nonzero" || mode == "broken upstream" {
 			_, _ = client.Get("https://127.0.0.1:443/")
 		}
 		if mode == "mixed" {
@@ -701,7 +708,8 @@ func TestExecTrafficChecks(t *testing.T) {
 			if logs != nil {
 				data, err := os.ReadFile(logs.Name())
 				const warning = "warning: tls_rejected: 1 handshake(s) failed for hosts 127.0.0.1\n"
-				if err != nil || !strings.Contains(string(data), warning) || r.Exec.Traffic.InterceptedOK != 1 {
+				if err != nil || strings.Count(string(data), warning) != 1 || strings.Count(string(data), "tls_handshake_failed:") != 1 ||
+					r.Exec.Traffic.InterceptedOK != 1 || r.Exec.TLSHandshakeFailureCount != 1 {
 					t.Fatalf("mixed HTTPS traffic: %+v, stderr=%q, err=%v", r.Exec.Traffic, data, err)
 				}
 			}
@@ -742,6 +750,16 @@ func TestExecDrainsBeforeDirectAssertions(t *testing.T) {
 	}
 }
 
+type halfCloseAfterClientHello struct{ *net.TCPConn }
+
+func (c halfCloseAfterClientHello) Write(b []byte) (int, error) {
+	n, err := c.TCPConn.Write(b)
+	if err == nil {
+		err = c.CloseWrite()
+	}
+	return n, err
+}
+
 func TestExecTLSWithoutApplicationTraffic(t *testing.T) {
 	if mode := os.Getenv("GD_TLS_EMPTY_HELPER"); mode != "" {
 		p, err := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
@@ -764,7 +782,13 @@ func TestExecTLSWithoutApplicationTraffic(t *testing.T) {
 		if mode == "12" {
 			version = tls.VersionTLS12
 		}
-		if mode == "quiet" {
+		if mode == "protocol" {
+			version = tls.VersionTLS11
+		}
+		if mode == "hello EOF" {
+			conn = halfCloseAfterClientHello{conn.(*net.TCPConn)}
+		}
+		if mode == "quiet" || mode == "hello EOF" {
 			data, err := os.ReadFile(os.Getenv("GLITCHDECK_CA_CERT"))
 			if err != nil || !roots.AppendCertsFromPEM(data) {
 				t.Fatalf("load CA: %v", err)
@@ -794,6 +818,8 @@ func TestExecTLSWithoutApplicationTraffic(t *testing.T) {
 	}{
 		{"TLS 1.2 rejection", "12", "tls_rejected_only:", false, 1},
 		{"TLS 1.3 rejection", "13", "tls_rejected_only:", false, 1},
+		{"ClientHello then EOF", "hello EOF", "tls_rejected_only:", false, 1},
+		{"Unsupported TLS version", "protocol", "tls_rejected_only:", false, 1},
 		{"Silent close", "quiet", "no_usable_traffic:", false, 0},
 		{"Silent close override", "quiet", "", true, 0},
 	} {
@@ -809,6 +835,15 @@ func TestExecTLSWithoutApplicationTraffic(t *testing.T) {
 			if r.ExitCode != wantExit || r.Exec.ExitCode != 0 || r.Exec.Traffic.InterceptedOK != 0 || r.Exec.Traffic.TLSRejected != tc.rejected ||
 				r.Exec.TLSHandshakeFailureCount != uint64(tc.rejected) || !strings.HasPrefix(diff, tc.diff) || tc.override && diff != "" {
 				t.Fatalf("exec=%+v traffic=%+v child=%+v", r, r.Exec.Traffic, r.Exec)
+			}
+			if tc.mode == "hello EOF" || tc.mode == "protocol" {
+				var failure struct{ Error string }
+				if len(r.Exec.TLSHandshakeFailures) != 1 || json.Unmarshal(r.Exec.TLSHandshakeFailures[0], &failure) != nil {
+					t.Fatalf("expected one recorded handshake error, got %s", r.Exec.TLSHandshakeFailures)
+				}
+				if tc.mode == "hello EOF" && failure.Error != "EOF" || tc.mode == "protocol" && !strings.Contains(failure.Error, "unsupported versions") {
+					t.Fatalf("unexpected handshake error: %q", failure.Error)
+				}
 			}
 		})
 	}
