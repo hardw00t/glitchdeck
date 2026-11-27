@@ -235,8 +235,14 @@ func TestWebhookCloseReleasesReplicas(t *testing.T) {
 		}
 	}
 	p.Close()
+	p.mu.Lock()
+	pending := p.pending
+	p.mu.Unlock()
+	stats := p.Stats()["delivery"].Replays
+	if pending != 0 || stats == nil || stats.Outcomes["canceled"] != 4 {
+		t.Fatalf("pending=%d replays=%+v", pending, stats)
+	}
 	cancel()
-	settleReplays(t, p)
 	<-done
 	upstream.Close()
 	deadline := time.Now().Add(2 * time.Second)
@@ -272,6 +278,9 @@ func TestReplayDialDoesNotReuseReverseTargetException(t *testing.T) {
 			if w.Code != want || deliveries.Load() != 1 || stats == nil || stats.Outcomes["egress_denied"] != 2 {
 				t.Fatalf("status=%d upstream deliveries=%d replays=%+v", w.Code, deliveries.Load(), stats)
 			}
+			if mode == "concurrent" && p.Stats()["delivery"].Applied != 0 {
+				t.Errorf("denied replicas counted as applied: %+v", p.Stats()["delivery"])
+			}
 		})
 	}
 }
@@ -279,6 +288,7 @@ func TestReplayDialDoesNotReuseReverseTargetException(t *testing.T) {
 func TestTimeoutRetrySurvivesWireHangup(t *testing.T) {
 	const delay = 40 * time.Millisecond
 	entered := make(chan struct{}, 1)
+	commit := make(chan struct{})
 	committed, retry := make(chan time.Time, 1), make(chan time.Time, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -288,7 +298,7 @@ func TestTimeoutRetrySurvivesWireHangup(t *testing.T) {
 		}
 		entered <- struct{}{}
 		select {
-		case <-time.After(300 * time.Millisecond):
+		case <-commit:
 			committed <- time.Now()
 		case <-r.Context().Done():
 		}
@@ -316,11 +326,11 @@ func TestTimeoutRetrySurvivesWireHangup(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("original did not reach receiver")
 	}
-	time.Sleep(100 * time.Millisecond)
 	cancel()
 	if err := <-clientDone; err == nil {
 		t.Fatal("client did not hang up before the commit")
 	}
+	close(commit)
 	start := time.Time{}
 	select {
 	case start = <-committed:

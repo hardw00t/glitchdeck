@@ -19,7 +19,10 @@ type ErrFrameTooLarge struct {
 
 func (e *ErrFrameTooLarge) Error() string { return "frame too large" }
 
-type ErrProtocol struct{ Reason string }
+type ErrProtocol struct {
+	Reason   string
+	Declared uint64
+}
 
 func (e *ErrProtocol) Error() string { return e.Reason }
 
@@ -73,16 +76,27 @@ func Read(r io.Reader, masked bool) (Frame, error) {
 	f.Fin = h[0]&0x80 != 0
 	f.Opcode = h[0] & 15
 	if h[0]&0x70 != 0 || (h[1]&0x80 != 0) != masked {
-		return f, &ErrProtocol{Reason: "invalid frame flags"}
+		var declared uint64
+		if h[1]&127 < 126 {
+			declared = uint64(h[1] & 127)
+		}
+		return f, &ErrProtocol{Reason: "invalid frame flags", Declared: declared}
 	}
 	n := uint64(h[1] & 127)
+	if f.Opcode != 0 && f.Opcode != 1 && f.Opcode != 2 && f.Opcode != 8 && f.Opcode != 9 && f.Opcode != 10 || f.Opcode >= 8 && !f.Fin {
+		declared := n
+		if n >= 126 {
+			declared = 0
+		}
+		return f, &ErrProtocol{Reason: "invalid opcode or control frame", Declared: declared}
+	}
 	if n == 126 {
 		if err := readRest(h[:2]); err != nil {
 			return f, err
 		}
 		n = uint64(binary.BigEndian.Uint16(h[:2]))
 		if n < 126 {
-			return f, &ErrProtocol{Reason: "noncanonical length"}
+			return f, &ErrProtocol{Reason: "noncanonical length", Declared: n}
 		}
 	} else if n == 127 {
 		if err := readRest(h[:8]); err != nil {
@@ -90,14 +104,20 @@ func Read(r io.Reader, masked bool) (Frame, error) {
 		}
 		n = binary.BigEndian.Uint64(h[:])
 		if n < 65536 || n>>63 != 0 {
-			return f, &ErrProtocol{Reason: "invalid length"}
+			if n>>63 != 0 {
+				return f, &ErrProtocol{Reason: "invalid length"}
+			}
+			return f, &ErrProtocol{Reason: "invalid length", Declared: n}
 		}
 	}
 	if n > MaxPayload {
 		return f, &ErrFrameTooLarge{Declared: n, Opcode: f.Opcode, Limit: MaxPayload}
 	}
+	if f.Opcode == 8 && n == 1 {
+		return f, &ErrProtocol{Reason: "invalid opcode or control frame", Declared: n}
+	}
 	if f.Opcode >= 8 && n > 125 {
-		return f, &ErrProtocol{Reason: "frame too large"}
+		return f, &ErrProtocol{Reason: "frame too large", Declared: n}
 	}
 	var key [4]byte
 	if masked {
@@ -115,13 +135,13 @@ func Read(r io.Reader, masked bool) (Frame, error) {
 		}
 	}
 	if !valid(f) {
-		return Frame{}, &ErrProtocol{Reason: "invalid opcode or control frame"}
+		return Frame{}, &ErrProtocol{Reason: "invalid opcode or control frame", Declared: n}
 	}
 	return f, nil
 }
 func Write(w io.Writer, f Frame, masked bool) error {
 	if len(f.Payload) > MaxPayload || !valid(f) {
-		return &ErrProtocol{Reason: "invalid frame"}
+		return &ErrProtocol{Reason: "invalid frame", Declared: uint64(len(f.Payload))}
 	}
 	var h [14]byte
 	if f.Fin {

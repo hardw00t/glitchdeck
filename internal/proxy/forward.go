@@ -81,8 +81,10 @@ func (p *Proxy) AppliedFaults() []AppliedFault {
 		item := AppliedFault{RuleID: key.RuleID, Type: key.Type, Count: count}
 		if key.Type == "dup-webhook" {
 			item.Replays = cloneReplay(p.stats[key.RuleID].Replays)
+			if n := p.replayCapacitySkips[key]; n != 0 {
+				item.SkipReasons = map[string]uint64{"replay_capacity_exceeded": n}
+			}
 		}
-		item.SkipReasons = cloneReasons(p.stats[key.RuleID].SkipReasons)
 		out = append(out, item)
 	}
 	sort.Slice(out, func(i, j int) bool {

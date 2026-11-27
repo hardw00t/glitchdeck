@@ -14,7 +14,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
-	"sync"
 	"testing"
 	"time"
 
@@ -116,42 +115,80 @@ func TestCorruptInvalidCloseReportsFault(t *testing.T) {
 	<-done
 }
 
+type cancelOnErrorContext struct {
+	context.Context
+	cancel context.CancelFunc
+}
+
+func (c cancelOnErrorContext) Err() error {
+	c.cancel()
+	return c.Context.Err()
+}
+
+func TestWebSocketCancellationDuringFailureClosesBothPumps(t *testing.T) {
+	p := New(nil, fault.Config{}, nil)
+	defer p.Close()
+	client, clientPeer := net.Pipe()
+	up, upPeer := net.Pipe()
+	defer client.Close()
+	defer clientPeer.Close()
+	defer up.Close()
+	defer upPeer.Close()
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := cancelOnErrorContext{Context: base, cancel: cancel}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.coordinateWS(ctx, cancel, client, up, client, bytes.NewReader([]byte{0xc1, 0}), 0, fault.Query{Seq: 1})
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not exit after cancellation during error handling")
+	}
+}
+
 func FuzzPumpFrames(f *testing.F) {
-	f.Add([]byte{0x81, 0x01, 'a'})
-	f.Add([]byte{0x81, 126, 0, 1})
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Add([]byte{0x81, 0x01, 'a'}, false)
+	f.Add([]byte{0x81, 126, 0, 1}, false)
+	f.Add([]byte{0x88, 2, 3, 232}, false)
+	f.Add([]byte{0xc1, 0}, true)
+	f.Fuzz(func(t *testing.T, data []byte, cancelEarly bool) {
 		if len(data) > 65536 {
 			t.Skip()
 		}
 		p := New(nil, fault.Config{}, nil)
 		defer p.Close()
-		a, b := net.Pipe()
-		var once sync.Once
-		closeBoth := func(string) { once.Do(func() { a.Close(); b.Close() }) }
+		client, clientPeer := net.Pipe()
+		up, upPeer := net.Pipe()
+		defer client.Close()
+		defer clientPeer.Close()
+		defer up.Close()
+		defer upPeer.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		done := make(chan struct{})
-		drained := make(chan struct{})
-		closing := false
-		closed := false
+		clientDrained := make(chan struct{})
+		upDrained := make(chan struct{})
 		go func() {
 			defer close(done)
-			p.pump(context.Background(), bytes.NewReader(data), &wsWriter{conn: a}, false, "s2c", 0, fault.Query{Seq: 1}, func(action string) { closed = true; closeBoth(action) }, func() { closing = true }, func(string, string, error) { closed = true; closeBoth("") })
+			p.coordinateWS(ctx, cancel, client, up, client, bytes.NewReader(data), 0, fault.Query{Seq: 1})
 		}()
-		go func() { defer close(drained); _, _ = io.Copy(io.Discard, b) }()
-		select {
-		case <-done:
-			if !closing && !closed {
-				closeBoth("")
-				<-drained
-				t.Fatal("pump returned without closing")
-			}
-		case <-time.After(3 * time.Second):
-			closeBoth("")
-			<-done
-			<-drained
-			t.Fatal("pump did not return")
+		go func() { defer close(clientDrained); _, _ = io.Copy(io.Discard, clientPeer) }()
+		go func() { defer close(upDrained); _, _ = io.Copy(io.Discard, upPeer) }()
+		if cancelEarly {
+			cancel()
 		}
-		closeBoth("")
-		<-drained
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		for _, ch := range []<-chan struct{}{done, clientDrained, upDrained} {
+			select {
+			case <-ch:
+			case <-timer.C:
+				t.Fatal("websocket coordinator or peer did not exit")
+			}
+		}
 	})
 }
 
@@ -167,12 +204,15 @@ func TestWebSocketMalformedFrameClosesBothPeers(t *testing.T) {
 		{"oversized", []byte{0x82, 127, 0, 0, 0, 0, 0, 0x40, 0, 1}, false, 1009, "frame_too_large", 4194305},
 		{"rsv", []byte{0xc1, 0}, false, 1002, "protocol_error", 0},
 		{"unmasked client", []byte{0x81, 0}, true, 1002, "protocol_error", 0},
-		{"noncanonical", []byte{0x81, 126, 0, 1}, false, 1002, "protocol_error", 0},
+		{"noncanonical", []byte{0x81, 126, 0, 1}, false, 1002, "protocol_error", 1},
 		{"length", []byte{0x81, 127, 0x80, 0, 0, 0, 0, 0, 0, 0}, false, 1002, "protocol_error", 0},
-		{"opcode", []byte{0x83, 0}, false, 1002, "protocol_error", 0},
-		{"fragmented ping", []byte{0x09, 0}, false, 1002, "protocol_error", 0},
-		{"large ping", []byte{0x89, 126, 0, 126}, false, 1002, "protocol_error", 0},
-		{"close code", []byte{0x88, 2, 3, 0xed}, false, 1002, "protocol_error", 0},
+		{"opcode", []byte{0x83, 1}, false, 1002, "protocol_error", 1},
+		{"fragmented ping", []byte{0x09, 1}, false, 1002, "protocol_error", 1},
+		{"masked opcode before mask", []byte{0x83, 0x81}, true, 1002, "protocol_error", 1},
+		{"opcode before extended length", []byte{0x83, 126}, false, 1002, "protocol_error", 0},
+		{"fragmented ping before extended length", []byte{0x09, 127}, false, 1002, "protocol_error", 0},
+		{"large ping", []byte{0x89, 126, 0, 126}, false, 1002, "protocol_error", 126},
+		{"close code", []byte{0x88, 2, 3, 0xed}, false, 1002, "protocol_error", 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -247,7 +287,7 @@ func TestWebSocketMalformedFrameClosesBothPeers(t *testing.T) {
 				_ = json.Unmarshal(e.Data, &v)
 				if v["error"] == tc.event {
 					found = true
-					if v["declared_bytes"] != float64(tc.declared) {
+					if v["declared_bytes"] != float64(tc.declared) || v["ts_ms"] == nil || v["ts_ms"].(float64) <= 0 {
 						t.Fatalf("event: %s", e.Data)
 					}
 				}

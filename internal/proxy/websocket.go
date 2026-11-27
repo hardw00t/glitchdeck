@@ -190,6 +190,11 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	}
 	_ = client.SetWriteDeadline(time.Time{})
 	stop()
+	p.coordinateWS(ctx, cancel, client, up, buf.Reader, reader, gen, match)
+}
+
+func (p *Proxy) coordinateWS(ctx context.Context, cancel context.CancelFunc, client, up net.Conn, clientReader, upReader io.Reader, gen uint64, match fault.Query) {
+	seq := match.Seq
 	done := make(chan struct{})
 	var once sync.Once
 	var terminal sync.Mutex
@@ -246,6 +251,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 		terminal.Lock()
 		defer terminal.Unlock()
 		if ctx.Err() != nil {
+			closeNow("")
 			return
 		}
 		failed.Do(func() {
@@ -259,7 +265,11 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 				frameErr.Code, frameErr.Declared = "frame_too_large", large.Declared
 				closeCode, reason = 1009, "glitchdeck: frame exceeds 4 MiB proxy limit"
 			}
-			p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "dir": dir, "error": frameErr.Code, "detail": frameErr.Detail, "declared_bytes": frameErr.Declared, "limit_bytes": wsframe.MaxPayload})
+			var protocol *wsframe.ErrProtocol
+			if errors.As(err, &protocol) {
+				frameErr.Declared = protocol.Declared
+			}
+			p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "dir": dir, "error": frameErr.Code, "detail": frameErr.Detail, "declared_bytes": frameErr.Declared, "limit_bytes": wsframe.MaxPayload, "ts_ms": time.Now().UnixMilli()})
 			p.outcome(gen, Outcome{Seq: seq, Err: frameErr})
 			payload := make([]byte, 2, 2+len(reason))
 			binary.BigEndian.PutUint16(payload, closeCode)
@@ -276,11 +286,11 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		p.pump(ctx, buf.Reader, upWriter, true, "c2s", gen, match, closeBoth, beginClose, fail)
+		p.pump(ctx, clientReader, upWriter, true, "c2s", gen, match, closeBoth, beginClose, fail)
 	}()
 	go func() {
 		defer wg.Done()
-		p.pump(ctx, reader, clientWriter, false, "s2c", gen, match, closeBoth, beginClose, fail)
+		p.pump(ctx, upReader, clientWriter, false, "s2c", gen, match, closeBoth, beginClose, fail)
 	}()
 	wg.Wait()
 	closeBoth("")
@@ -319,7 +329,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst *wsWriter, masked b
 		}
 		if f.Opcode == 0 {
 			if !fragmented {
-				fail(dir, "protocol_error", &wsframe.ErrProtocol{Reason: "unexpected continuation frame"})
+				fail(dir, "protocol_error", &wsframe.ErrProtocol{Reason: "unexpected continuation frame", Declared: uint64(len(f.Payload))})
 				return
 			}
 			if f.Fin {
@@ -327,7 +337,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst *wsWriter, masked b
 			}
 		} else if f.Opcode == 1 || f.Opcode == 2 {
 			if fragmented {
-				fail(dir, "protocol_error", &wsframe.ErrProtocol{Reason: "unexpected data frame"})
+				fail(dir, "protocol_error", &wsframe.ErrProtocol{Reason: "unexpected data frame", Declared: uint64(len(f.Payload))})
 				return
 			}
 			fragmented = !f.Fin

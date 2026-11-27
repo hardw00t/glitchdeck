@@ -84,6 +84,7 @@ type Proxy struct {
 	cancel              context.CancelFunc
 	pending             int
 	active              int
+	replayWorkers       sync.WaitGroup
 	done                chan struct{}
 	closed              bool
 	draining            bool
@@ -92,6 +93,7 @@ type Proxy struct {
 	front               *front
 	stats               map[string]RuleStats
 	applied             map[appliedKey]uint64
+	replayCapacitySkips map[appliedKey]uint64
 	replayWarned        map[string]bool
 	sseEncodingWarned   map[string]bool
 	burstUsed           map[string]int
@@ -278,6 +280,7 @@ func (p *Proxy) ResetWith(fn func()) {
 	p.interceptedEmpty.Store(0)
 	clear(p.stats)
 	clear(p.applied)
+	clear(p.replayCapacitySkips)
 	clear(p.sseEncodingWarned)
 	clear(p.replayWarned)
 	clear(p.burstUsed)
@@ -289,6 +292,8 @@ func (p *Proxy) ResetWith(fn func()) {
 		fn()
 	}
 }
+
+// Close joins replica workers; synchronous replica callbacks must not call Close.
 func (p *Proxy) Close() {
 	p.mu.Lock()
 	p.closed = true
@@ -300,6 +305,7 @@ func (p *Proxy) Close() {
 	if s != nil {
 		_ = s.Close()
 	}
+	p.replayWorkers.Wait()
 }
 func (p *Proxy) beginPendingLocked() {
 	if p.active == 0 {
@@ -869,14 +875,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx = context.WithValue(ctx, reverseTargetKey{}, true)
 	}
 	mode := fault.String(params, "mode", "sequential")
-	if kind == "dup-webhook" && mode == "timeout_retry" {
-		detached, stopDetached := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(fault.Int(params, "replay_timeout_ms", 5000))*time.Millisecond)
-		defer stopDetached()
-		stopSession := context.AfterFunc(session, stopDetached)
-		defer stopSession()
-		ctx = detached
+	var releaseTimeout func(bool, string, int)
+	if kind == "dup-webhook" && buffered && mode == "timeout_retry" {
+		releaseTimeout = p.timeoutReplays(r, body, seq, gen, rule, params)
+		if releaseTimeout != nil {
+			defer releaseTimeout(false, "", 0)
+			detached, stopDetached := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(fault.Int(params, "replay_timeout_ms", 5000))*time.Millisecond)
+			defer stopDetached()
+			stopSession := context.AfterFunc(session, stopDetached)
+			defer stopSession()
+			ctx = detached
+		}
 	}
 	q := p.upstream(r, body, ctx)
+	if q != nil && kind == "dup-webhook" && fault.Bool(params, "replay_header", false) {
+		q.Header.Del("X-Glitchdeck-Replay")
+	}
 	if q == nil {
 		if !buffered && hasBody {
 			record(nil, hasBody, false)
@@ -949,12 +963,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		panic(http.ErrAbortHandler)
 	}
 	if releaseReplay != nil {
-		markApplied()
+		// A concurrent group is counted by the first copy that clears egress.
 		replayClock.start()
 		releaseReplay(true)
 	}
 	resp, err := transport.RoundTrip(q)
-	if kind == "dup-webhook" && buffered && mode == "timeout_retry" {
+	if releaseTimeout != nil {
 		originalOutcome := ""
 		committedStatus := 0
 		if err != nil {
@@ -971,9 +985,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if originalOutcome != "" && originalOutcome != "timeout" {
 			originalOutcome = "transport_error"
 		}
-		p.recordOriginal(gen, rule.ID, mode, committedStatus, originalOutcome)
-		defer p.replays(r, body, seq, gen, rule, params, originalOutcome, committedStatus)
-		markApplied()
+		if !p.recordOriginal(gen, rule, mode, committedStatus, originalOutcome) {
+			end = "client_cancel"
+			return
+		}
+		defer releaseTimeout(true, originalOutcome, committedStatus)
+		applied = true
 		if fault.String(params, "client_result", "gateway_timeout") == "reset" {
 			end = "rst"
 			if r.ProtoMajor == 2 {
@@ -1030,7 +1047,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch kind {
 	case "dup-webhook":
-		if buffered && mode == "sequential" && p.replays(r, body, seq, gen, rule, params, "", 0) {
+		if buffered && mode == "sequential" && p.sequentialReplays(r, body, seq, gen, rule, params) {
 			markApplied()
 		}
 	case "tcp-rst":

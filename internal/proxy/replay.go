@@ -21,6 +21,7 @@ type replayTiming struct {
 	p           *Proxy
 	gen         uint64
 	id          string
+	applied     sync.Once
 }
 
 func (t *replayTiming) start() {
@@ -84,11 +85,32 @@ func (p *Proxy) updateReplay(gen uint64, id, mode string, fn func(*ReplayStats))
 		return
 	}
 	v := p.stats[id]
+	if p.applied == nil {
+		p.applied = make(map[appliedKey]uint64)
+	}
+	key := appliedKey{RuleID: id, Type: "dup-webhook"}
+	if _, ok := p.applied[key]; !ok {
+		p.applied[key] = 0
+	}
 	fn(v.replay(mode))
 	p.stats[id] = v
 }
-func (p *Proxy) recordOriginal(gen uint64, id, mode string, status int, outcome string) {
-	p.updateReplay(gen, id, mode, func(s *ReplayStats) { s.CommittedStatus = status; s.OriginalOutcome = outcome })
+func (p *Proxy) recordOriginal(gen uint64, rule *fault.Rule, mode string, status int, outcome string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.ctx.Err() != nil || gen != p.generation {
+		return false
+	}
+	v := p.stats[rule.ID]
+	stats := v.replay(mode)
+	stats.CommittedStatus, stats.OriginalOutcome = status, outcome
+	v.Applied++
+	p.stats[rule.ID] = v
+	if p.applied == nil {
+		p.applied = make(map[appliedKey]uint64)
+	}
+	p.applied[appliedKey{RuleID: rule.ID, Type: rule.Fault.Type}]++
+	return true
 }
 func replayError(err error) string {
 	if errors.Is(err, errEgressDenied) {
@@ -118,6 +140,10 @@ func (p *Proxy) replayCapacity(gen, seq uint64, rule *fault.Rule, mode string, f
 		p.applied = make(map[appliedKey]uint64)
 	}
 	key := appliedKey{RuleID: rule.ID, Type: rule.Fault.Type}
+	if p.replayCapacitySkips == nil {
+		p.replayCapacitySkips = make(map[appliedKey]uint64)
+	}
+	p.replayCapacitySkips[key]++
 	if _, ok := p.applied[key]; !ok {
 		p.applied[key] = 0
 	}
@@ -138,7 +164,7 @@ func (p *Proxy) replayCapacity(gen, seq uint64, rule *fault.Rule, mode string, f
 		p.publish(gen, "http_req", event)
 	}
 	if first {
-		fmt.Fprintf(os.Stderr, "rule %s: webhook replay capacity exceeded\n", rule.ID)
+		fmt.Fprintf(os.Stderr, "rule %q: webhook replay capacity exceeded\n", rule.ID)
 	}
 }
 func (p *Proxy) concurrentReplays(r *http.Request, body []byte, seq, gen uint64, rule *fault.Rule, params map[string]any) (func(bool), *replayTiming) {
@@ -152,6 +178,9 @@ func (p *Proxy) concurrentReplays(r *http.Request, body []byte, seq, gen uint64,
 	ctx := p.ctx
 	if p.closed || ctx.Err() != nil || gen != p.generation {
 		p.mu.Unlock()
+		for i := 1; i <= count; i++ {
+			p.replaySkipped(gen, seq, rule, "concurrent", i, "canceled", "", 0)
+		}
 		return nil, nil
 	}
 	if p.pending+count > 64 {
@@ -163,9 +192,11 @@ func (p *Proxy) concurrentReplays(r *http.Request, body []byte, seq, gen uint64,
 		p.beginPendingLocked()
 		p.pending++
 	}
+	p.replayWorkers.Add(count)
 	p.mu.Unlock()
 	for i := 1; i <= count; i++ {
 		go func(index int) {
+			defer p.replayWorkers.Done()
 			defer p.finishReplay()
 			select {
 			case <-start:
@@ -182,66 +213,49 @@ func (p *Proxy) concurrentReplays(r *http.Request, body []byte, seq, gen uint64,
 	}
 	return release, clock
 }
-func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, rule *fault.Rule, params map[string]any, originalOutcome string, committedStatus int) bool {
+func (p *Proxy) sequentialReplays(r *http.Request, body []byte, seq, gen uint64, rule *fault.Rule, params map[string]any) bool {
 	count := fault.Int(params, "count", 2) - 1
-	mode := fault.String(params, "mode", "sequential")
+	const mode = "sequential"
 	delay := time.Duration(fault.Int(params, "delay_ms", 150)) * time.Millisecond
-	if mode == "sequential" {
-		q := p.upstream(r, body, r.Context())
-		if q == nil || !p.allowed(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port())) {
-			p.replaySkipped(gen, seq, rule, mode, 1, "egress_denied", originalOutcome, committedStatus)
-			return false
+	u := r.URL
+	if !u.IsAbs() {
+		u = p.target
+	}
+	if u == nil || !p.allowed(u.Hostname(), upstreamPort(u.Scheme, u.Port())) {
+		for i := 1; i <= count; i++ {
+			p.replaySkipped(gen, seq, rule, mode, i, "egress_denied", "", 0)
 		}
+		return false
 	}
 	p.mu.Lock()
 	ctx := p.ctx
 	if p.closed || ctx.Err() != nil || gen != p.generation {
 		p.mu.Unlock()
+		for i := 1; i <= count; i++ {
+			p.replaySkipped(gen, seq, rule, mode, i, "canceled", "", 0)
+		}
 		return false
 	}
-	used := p.pending
-	if mode == "sequential" {
-		used = p.active
-	}
-	admitted := min(count, max(0, 64-used))
+	admitted := min(count, max(0, 64-p.active))
 	for range admitted {
 		p.beginPendingLocked()
 		p.pending++
 	}
+	p.replayWorkers.Add(admitted)
 	p.mu.Unlock()
 	if admitted < count {
-		p.replayCapacity(gen, seq, rule, mode, admitted+1, count-admitted, originalOutcome, committedStatus)
+		p.replayCapacity(gen, seq, rule, mode, admitted+1, count-admitted, "", 0)
 	}
-	var previous <-chan struct{}
 	for i := 1; i <= admitted; i++ {
-		var done chan struct{}
-		if mode == "timeout_retry" {
-			done = make(chan struct{})
-		}
-		go func(index int, prev <-chan struct{}, done chan struct{}) {
+		go func(index int) {
+			defer p.replayWorkers.Done()
 			defer p.finishReplay()
-			if done != nil {
-				defer close(done)
-			}
-			if prev != nil {
-				select {
-				case <-prev:
-				case <-ctx.Done():
-					p.replaySkipped(gen, seq, rule, mode, index, "canceled", originalOutcome, committedStatus)
-					return
-				}
-			}
-			duration := time.Duration(index) * delay
-			if mode == "timeout_retry" {
-				duration = delay
-			}
-			if !wait(ctx, duration) {
-				p.replaySkipped(gen, seq, rule, mode, index, "canceled", originalOutcome, committedStatus)
+			if !wait(ctx, time.Duration(index)*delay) {
+				p.replaySkipped(gen, seq, rule, mode, index, "canceled", "", 0)
 				return
 			}
-			p.sendReplay(ctx, r, body, seq, gen, rule, params, index, nil, originalOutcome, committedStatus)
-		}(i, previous, done)
-		previous = done
+			p.sendReplay(ctx, r, body, seq, gen, rule, params, index, nil, "", 0)
+		}(i)
 	}
 	return admitted > 0
 }
@@ -287,6 +301,9 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 	} else if status < 200 || status >= 300 {
 		outcome = "client_error"
 	}
+	if clock != nil && outcome != "egress_denied" {
+		clock.applied.Do(func() { p.countRule(gen, rule, "applied", "") })
+	}
 	p.updateReplay(gen, rule.ID, mode, func(s *ReplayStats) {
 		if outcome != "egress_denied" {
 			s.Sent++
@@ -312,13 +329,79 @@ func (p *Proxy) replaySkipped(gen, seq uint64, rule *fault.Rule, mode string, in
 	event := map[string]any{"seq": seq, "fault": "dup-webhook", "rule_id": rule.ID, "applied": false, "replay_index": index, "replay_mode": mode, "outcome": outcome}
 	if outcome == "egress_denied" {
 		event["error"] = "webhook replay egress denied"
-		if mode == "sequential" {
-			p.outcome(gen, Outcome{Seq: seq, Err: errors.New("webhook replay egress denied")})
-		}
 	}
 	if mode == "timeout_retry" {
 		event["original_outcome"] = originalOutcome
 		event["committed_status"] = committedStatus
 	}
 	p.publish(gen, "http_req", event)
+}
+
+func (p *Proxy) timeoutReplays(r *http.Request, body []byte, seq, gen uint64, rule *fault.Rule, params map[string]any) func(bool, string, int) {
+	count := fault.Int(params, "count", 2) - 1
+	p.mu.Lock()
+	ctx := p.ctx
+	if p.closed || ctx.Err() != nil || gen != p.generation {
+		p.mu.Unlock()
+		for i := 1; i <= count; i++ {
+			p.replaySkipped(gen, seq, rule, "timeout_retry", i, "canceled", "", 0)
+		}
+		return nil
+	}
+	if p.pending+count > 64 {
+		p.mu.Unlock()
+		p.replayCapacity(gen, seq, rule, "timeout_retry", 1, count, "", 0)
+		return nil
+	}
+	for range count {
+		p.beginPendingLocked()
+		p.pending++
+	}
+	p.replayWorkers.Add(count)
+	p.mu.Unlock()
+	start := make(chan struct{})
+	var once sync.Once
+	var proceed bool
+	var originalOutcome string
+	var committedStatus int
+	release := func(ok bool, outcome string, status int) {
+		once.Do(func() {
+			proceed, originalOutcome, committedStatus = ok, outcome, status
+			close(start)
+		})
+	}
+	var previous <-chan struct{}
+	for i := 1; i <= count; i++ {
+		done := make(chan struct{})
+		go func(index int, prev <-chan struct{}) {
+			defer p.replayWorkers.Done()
+			defer p.finishReplay()
+			defer close(done)
+			select {
+			case <-start:
+			case <-ctx.Done():
+				p.replaySkipped(gen, seq, rule, "timeout_retry", index, "canceled", "", 0)
+				return
+			}
+			if !proceed || ctx.Err() != nil {
+				p.replaySkipped(gen, seq, rule, "timeout_retry", index, "canceled", originalOutcome, committedStatus)
+				return
+			}
+			if prev != nil {
+				select {
+				case <-prev:
+				case <-ctx.Done():
+					p.replaySkipped(gen, seq, rule, "timeout_retry", index, "canceled", originalOutcome, committedStatus)
+					return
+				}
+			}
+			if !wait(ctx, time.Duration(fault.Int(params, "delay_ms", 150))*time.Millisecond) {
+				p.replaySkipped(gen, seq, rule, "timeout_retry", index, "canceled", originalOutcome, committedStatus)
+				return
+			}
+			p.sendReplay(ctx, r, body, seq, gen, rule, params, index, nil, originalOutcome, committedStatus)
+		}(i, previous)
+		previous = done
+	}
+	return release
 }

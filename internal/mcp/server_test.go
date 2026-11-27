@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hardw00t/glitchdeck/internal/execrun"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"gopkg.in/yaml.v3"
 )
@@ -327,6 +329,63 @@ func TestWireEventsAppliedAndProtocolFields(t *testing.T) {
 	events := all["events"].([]any)
 	if events[2].(map[string]any)["grpc_status"] != float64(14) || events[3].(map[string]any)["dir"] != "s2c" {
 		t.Fatal(events)
+	}
+}
+
+func TestWireEventsDiagnosticAllowlist(t *testing.T) {
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wire_events","arguments":{}}}` + "\n"
+	var output bytes.Buffer
+	s := NewServer(strings.NewReader(input), &output, Options{})
+	s.ctx = context.Background()
+	if result, _ := s.call("proxy_start", []byte(`{"target":"demo"}`)); result["error"] != nil {
+		t.Fatal(result)
+	}
+	s.bus.Publish("ws_frame", map[string]any{"class": "data", "data_seq": 3, "control_seq": 2, "declared_bytes": 4194305, "limit_bytes": 4194304, "ts_ms": 123, "detail": "secret", "body": "secret"})
+	s.bus.Publish("http_req", map[string]any{"replay_mode": "timeout_retry", "replay_index": 1, "committed_status": 200, "outcome": "conflict", "original_outcome": "timeout"})
+	s.bus.Publish("ws_frame", map[string]any{"declared_bytes": uint64(9007199254740993)})
+	if err := s.Serve(); err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Result struct {
+			Content struct {
+				Events []map[string]any `json:"events"`
+			} `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if len(reply.Result.Content.Events) != 3 {
+		t.Fatal(output.String())
+	}
+	ws := reply.Result.Content.Events[0]
+	if ws["class"] != "data" || ws["data_seq"] != float64(3) || ws["control_seq"] != float64(2) || ws["declared_bytes"] != float64(4194305) || ws["limit_bytes"] != float64(4194304) || ws["ts_ms"] != float64(123) || ws["detail"] != nil || ws["body"] != nil {
+		t.Fatal(ws)
+	}
+	http := reply.Result.Content.Events[1]
+	if http["replay_mode"] != "timeout_retry" || http["replay_index"] != float64(1) || http["committed_status"] != float64(200) || http["outcome"] != "conflict" || http["original_outcome"] != "timeout" {
+		t.Fatal(http)
+	}
+	if !strings.Contains(output.String(), `"declared_bytes":9007199254740993`) {
+		t.Fatal(output.String())
+	}
+}
+
+func TestReportFaultProjectionOnlyExportsReplayCapacity(t *testing.T) {
+	var report execrun.Envelope
+	report.SetAppliedFaults([]proxy.AppliedFault{
+		{RuleID: "same", Type: "sse-glitch", SkipReasons: map[string]uint64{"replay_capacity_exceeded": 3, "encoding_unsupported:secret": 1}},
+		{RuleID: "same", Type: "dup-webhook", SkipReasons: map[string]uint64{"replay_capacity_exceeded": 2, "encoding_unsupported:secret": 1}},
+	})
+	first := report.FaultsTriggered[0].(map[string]any)
+	second := report.FaultsTriggered[1].(map[string]any)
+	if first["skip_reasons"] != nil {
+		t.Fatal(first)
+	}
+	reasons, ok := second["skip_reasons"].(map[string]uint64)
+	if !ok || len(reasons) != 1 || reasons["replay_capacity_exceeded"] != 2 {
+		t.Fatal(second)
 	}
 }
 

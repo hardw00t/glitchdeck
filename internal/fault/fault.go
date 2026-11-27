@@ -113,7 +113,10 @@ func Validate(c Config) error {
 				return invalidParam(r.ID, "mode")
 			}
 			if result, ok := r.Fault.Params["client_result"]; ok {
-				if result != "gateway_timeout" && result != "reset" || mode != "timeout_retry" {
+				if mode != "timeout_retry" {
+					return invalidRule(r.ID, "client_result", `param "client_result": requires mode timeout_retry`)
+				}
+				if result != "gateway_timeout" && result != "reset" {
 					return invalidParam(r.ID, "client_result")
 				}
 			}

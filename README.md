@@ -130,12 +130,12 @@ Run against a local endpoint accepting this test payload; use a valid signed fix
 
 ```sh
 glitchdeck exec --tape examples/tapes/your-app-stripe-concurrent-race.tape.yaml --json -- sh -c '
-  curl -q -fsS -H "Content-Type: application/json" -d '\''{"id":"evt_test_1","type":"payment_intent.succeeded"}'\'' "$GLITCHDECK_PROXY_URL/webhooks/stripe"'
+  curl -q -sS -w "\nOriginal HTTP %{http_code}\n" -H "Content-Type: application/json" -d '\''{"id":"evt_test_1","type":"payment_intent.succeeded"}'\'' "$GLITCHDECK_PROXY_URL/webhooks/stripe"'
 ```
 
 - **Concurrent delivery:** `mode: concurrent` starts the original and four copies together. Use it to test whether a check-then-insert handler can process the same event twice.
-- **Commit then retry:** switch to `examples/tapes/your-app-stripe-timeout-retry.tape.yaml`. Change curl's `-fsS` to `-sS -w "\nHTTP %{http_code}\n"` to observe the injected `504`. The original reaches the receiver before the timeout response; the same event is then retried.
-- **Read the report and check the database:** `faults_triggered[].replays.status` counts copy responses and `outcomes` groups their results. Across all five deliveries, five `200`s and five rows means duplicate processing; one `200` and four `409`s, or five `200`s and one row, means deduplication. The replay histogram excludes the original.
+- **Commit then retry:** switch to `examples/tapes/your-app-stripe-timeout-retry.tape.yaml` to observe the injected `504`. The original reaches the receiver before the timeout response; the same event is then retried.
+- **Read the original status, copy histogram, and database together:** `faults_triggered[].replays.status` counts copy responses and `outcomes` groups their results. The original can receive `409` if a copy inserts first. Across all five deliveries, five `200`s and five rows means duplicate processing; one `200` and four `409`s, or five `200`s and one row, means deduplication.
 
 ### WebSocket silent drop
 

@@ -8,8 +8,8 @@ func (e *Envelope) SetAppliedFaults(faults []proxy.AppliedFault) {
 		if fault.Replays != nil {
 			entry["replays"] = fault.Replays
 		}
-		if len(fault.SkipReasons) != 0 {
-			entry["skip_reasons"] = fault.SkipReasons
+		if fault.Type == "dup-webhook" && fault.SkipReasons["replay_capacity_exceeded"] != 0 {
+			entry["skip_reasons"] = map[string]uint64{"replay_capacity_exceeded": fault.SkipReasons["replay_capacity_exceeded"]}
 		}
 		e.FaultsTriggered = append(e.FaultsTriggered, entry)
 		e.Summary.FaultsTriggered += fault.Count

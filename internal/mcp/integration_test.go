@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hardw00t/glitchdeck/internal/wsframe"
 )
 
 func TestSessionLoopAndEOF(t *testing.T) {
@@ -147,5 +151,125 @@ func TestTapeRunReportsAssertions(t *testing.T) {
 		if reply.Result.IsError || reply.Result.Content.Exit != i || reply.Result.Content.Summary.Requests == 0 {
 			t.Fatal(line)
 		}
+	}
+}
+
+func TestDiscoveryShowsFaultCatalog(t *testing.T) {
+	var out strings.Builder
+	if err := NewServer(strings.NewReader("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n"), &out, Options{}).Serve(); err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &reply); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range reply.Result.Tools {
+		if tool["name"] != "fault_set" {
+			continue
+		}
+		inputSchema := tool["inputSchema"].(map[string]any)
+		rules := inputSchema["properties"].(map[string]any)["rules"].(map[string]any)
+		fault := rules["items"].(map[string]any)["properties"].(map[string]any)["fault"].(map[string]any)
+		params := fault["properties"].(map[string]any)["params"].(map[string]any)
+		if params["additionalProperties"] == false || params["properties"] != nil {
+			t.Fatal(params)
+		}
+		meta, ok := tool["_meta"].(map[string]any)
+		if !ok {
+			t.Fatalf("missing catalog: %v", tool)
+		}
+		catalog := meta["faultCatalog"].(map[string]any)
+		for _, tc := range []struct{ typ, param, def, values string }{
+			{"dup-webhook", "mode", "sequential", "sequential,concurrent,timeout_retry"},
+			{"dup-webhook", "client_result", "gateway_timeout", "gateway_timeout,reset"},
+			{"ws-glitch", "frames", "all", "all,data,control"},
+		} {
+			p := catalog[tc.typ].(map[string]any)["params"].(map[string]any)[tc.param].(map[string]any)
+			b, _ := json.Marshal(p["enum"])
+			var values []string
+			_ = json.Unmarshal(b, &values)
+			if p["default"] != tc.def || strings.Join(values, ",") != tc.values {
+				t.Fatal(p)
+			}
+		}
+		return
+	}
+	t.Fatal("fault_set absent")
+}
+
+func TestTapeRunIncludesReplayDiagnostics(t *testing.T) {
+	input := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":\"checkout-dup-webhook.tape.yaml\"}}}\n"
+	var out strings.Builder
+	if err := NewServer(strings.NewReader(input), &out, Options{Workdir: "../../examples"}).Serve(); err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Result struct {
+			Content struct {
+				Faults []map[string]any `json:"faults_triggered"`
+			} `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if len(reply.Result.Content.Faults) == 0 || reply.Result.Content.Faults[0]["replays"] == nil {
+		t.Fatal(out.String())
+	}
+}
+
+func TestTapeRunErrorRetainsFrameDiagnostics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/webhook" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		conn, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))
+		_ = rw.Flush()
+		_, _ = conn.Write([]byte{0x82, 127, 0, 0, 0, 0, 0, 0x40, 0, 1})
+		_, _ = wsframe.Read(rw.Reader, true)
+	}))
+	defer upstream.Close()
+	doc := fmt.Sprintf("version: 2\ntarget: %s\nrules:\n  - id: dup\n    enabled: true\n    match: {method: POST, path_prefix: /webhook}\n    fault: {type: dup-webhook, params: {count: 2, delay_ms: 0}}\nscript:\n  - http: {method: POST, path: /webhook}\n  - ws: {path: /ws, frames: 1, timeout_ms: 1000}\n", upstream.URL)
+	args, _ := json.Marshal(map[string]any{"tape_yaml": doc, "timeout_ms": 3000})
+	input := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":%s}}\n", args)
+	var out strings.Builder
+	if err := NewServer(strings.NewReader(input), &out, Options{}).Serve(); err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Result struct {
+			IsError bool `json:"isError"`
+			Content struct {
+				Faults []struct {
+					RuleID  string         `json:"rule_id"`
+					Count   int            `json:"count"`
+					Replays map[string]any `json:"replays"`
+				} `json:"faults_triggered"`
+				Frames []struct {
+					Error    string `json:"error"`
+					Declared int    `json:"declared_bytes"`
+				} `json:"frame_errors"`
+			} `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &reply); err != nil {
+		t.Fatal(err)
+	}
+	if !reply.Result.IsError || len(reply.Result.Content.Frames) != 1 || reply.Result.Content.Frames[0].Error != "frame_too_large" || reply.Result.Content.Frames[0].Declared != 4194305 {
+		t.Fatal(out.String())
+	}
+	if len(reply.Result.Content.Faults) != 1 || reply.Result.Content.Faults[0].RuleID != "dup" || reply.Result.Content.Faults[0].Count != 1 || reply.Result.Content.Faults[0].Replays == nil {
+		t.Fatal(out.String())
 	}
 }

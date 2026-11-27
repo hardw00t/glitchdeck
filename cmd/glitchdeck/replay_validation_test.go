@@ -16,6 +16,7 @@ func TestValidateReplayAndFrameParams(t *testing.T) {
 		{"dup-webhook", "replay_timeout_ms: 60001", "replay_timeout_ms"},
 		{"dup-webhook", "replay_timeout_ms: 1.5", "replay_timeout_ms"},
 		{"dup-webhook", "client_result: reset", "client_result"},
+		{"dup-webhook", "mode: concurrent, client_result: reset", "client_result"},
 		{"dup-webhook", "mode: timeout_retry, client_result: invalid", "client_result"},
 		{"dup-webhook", "mode: concurrent, delay_ms: 1", "delay_ms"},
 		{"dup-webhook", "mode: concurrent, count: 1", "count"},
@@ -30,6 +31,9 @@ func TestValidateReplayAndFrameParams(t *testing.T) {
 			code, out := launchOutput(t, "validate", "-")
 			if code != 2 || !strings.Contains(out, `rule "race"`) || !strings.Contains(out, `"`+tc.param+`"`) {
 				t.Fatalf("exit %d: %s", code, out)
+			}
+			if (tc.params == "client_result: reset" || tc.params == "mode: concurrent, client_result: reset") && !strings.Contains(out, `param "client_result": requires mode timeout_retry`) {
+				t.Fatalf("missing specific error: %s", out)
 			}
 		})
 	}

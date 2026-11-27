@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"encoding/xml"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hardw00t/glitchdeck/internal/wsframe"
@@ -194,5 +196,78 @@ func TestDefaultWebhookTapeGoldens(t *testing.T) {
 				t.Fatalf("legacy report differs: %v: %s", err, data)
 			}
 		})
+	}
+}
+
+func TestLegacyWebhookWireGoldens(t *testing.T) {
+	for _, tc := range []struct {
+		path, body string
+		exit       int
+		starter    bool
+	}{
+		{"checkout-dup-webhook", `{"order_id":"ord-101","amount_cents":4900}`, 1, false},
+		{"tapes/stripe-duplicate-webhook", `{"order_id":"ord-1","amount_cents":4900}`, 1, false},
+		{"tapes/your-app-stripe-dup-webhook", `{"id":"evt_fixture"}`, 0, true},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			type delivery struct {
+				path, body string
+				replay     []string
+			}
+			var mu sync.Mutex
+			var deliveries []delivery
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				if r.URL.Path == "/api/state" {
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]int{"duplicate_charges": len(deliveries) - 1, "total_charged_cents": 4900 * len(deliveries)})
+					return
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("reading webhook: %v", err)
+				}
+				deliveries = append(deliveries, delivery{r.URL.Path, string(body), r.Header.Values("X-Glitchdeck-Replay")})
+			}))
+			defer upstream.Close()
+			path := "../../examples/" + tc.path + ".tape.yaml"
+			webhookPath := "/webhooks/payment"
+			if tc.starter {
+				webhookPath = "/webhooks/stripe"
+				original, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				path = filepath.Join(t.TempDir(), "starter.tape.yaml")
+				script := "\nscript:\n  - name: webhook\n    http: {method: POST, path: /webhooks/stripe, body: '" + tc.body + "'}\n"
+				if err := os.WriteFile(path, append(original, script...), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if code, out := launchOutput(t, "test", "--json", "--target", upstream.URL, path); code != tc.exit {
+				t.Fatalf("exit %d, want %d: %s", code, tc.exit, out)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			want := []delivery{{path: webhookPath, body: tc.body}, {path: webhookPath, body: tc.body}}
+			if !reflect.DeepEqual(deliveries, want) {
+				t.Fatalf("upstream deliveries: %+v, want %+v", deliveries, want)
+			}
+		})
+	}
+}
+
+func TestLegacyRateLimitReportDoesNotExportSkipReasons(t *testing.T) {
+	code, out := launchOutput(t, "test", "--json", "../../examples/tapes/openai-rate-limit-storm.tape.yaml")
+	var report struct {
+		Faults []map[string]any `json:"faults_triggered"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); code != 0 || err != nil || len(report.Faults) != 1 {
+		t.Fatalf("exit %d, report error %v: %s", code, err, out)
+	}
+	want := map[string]any{"count": float64(2), "rule_id": "storm", "type": "rate-limit"}
+	if !reflect.DeepEqual(report.Faults[0], want) {
+		t.Fatalf("rate-limit report row: got %v, want %v", report.Faults[0], want)
 	}
 }

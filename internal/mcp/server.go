@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hardw00t/glitchdeck/internal/demo"
+	"github.com/hardw00t/glitchdeck/internal/execrun"
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -147,7 +149,13 @@ func (s *Server) Serve() error {
 					case "ping":
 						result = map[string]any{}
 					case "tools/list":
-						result = map[string]any{"tools": tools()}
+						catalog := tools()
+						for _, tool := range catalog {
+							if tool["name"] == "fault_set" {
+								tool["_meta"] = map[string]any{"faultCatalog": fault.Registry}
+							}
+						}
+						result = map[string]any{"tools": catalog}
 					case "tools/call":
 						var p struct {
 							Name      string          `json:"name"`
@@ -493,6 +501,36 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 					item[k] = v
 				}
 			}
+			for _, k := range []string{"data_seq", "control_seq", "limit_bytes", "ts_ms", "replay_index", "committed_status"} {
+				if v, ok := d[k].(float64); ok && v >= 0 {
+					item[k] = v
+				}
+			}
+			if _, ok := d["declared_bytes"]; ok {
+				var declared struct {
+					Bytes json.Number `json:"declared_bytes"`
+				}
+				if json.Unmarshal(event.Data, &declared) == nil && declared.Bytes != "" {
+					if n, err := strconv.ParseUint(string(declared.Bytes), 10, 64); err == nil {
+						item["declared_bytes"] = n
+					}
+				}
+			}
+			for k, allowed := range map[string][]string{
+				"class":            {"data", "control"},
+				"replay_mode":      {"sequential", "concurrent", "timeout_retry"},
+				"outcome":          {"ok", "conflict", "client_error", "server_error", "timeout", "transport_error", "canceled", "capacity_exceeded", "egress_denied"},
+				"original_outcome": {"timeout", "transport_error"},
+			} {
+				if v, ok := d[k].(string); ok {
+					for _, candidate := range allowed {
+						if v == candidate {
+							item[k] = v
+							break
+						}
+					}
+				}
+			}
 			if event.Type == "tls_handshake_failed" {
 				item["host"], item["sni"] = d["host"], d["sni"]
 			}
@@ -555,11 +593,24 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		defer cancel()
 		start := time.Now()
 		results, report, e := tape.RunWithReport(ctx, t, a.Target)
-		if ctx.Err() != nil {
-			return fail("TIMEOUT", ctx.Err().Error()), false
-		}
-		if e != nil {
-			return fail("INVALID_TAPE", e.Error()), false
+		envelope := execrun.Envelope{FaultsTriggered: []any{}}
+		envelope.SetAppliedFaults(report.AppliedFaults)
+		if ctx.Err() != nil || e != nil {
+			code, err := "INVALID_TAPE", e
+			if ctx.Err() != nil {
+				code, err = "TIMEOUT", ctx.Err()
+			}
+			result := fail(code, err.Error())
+			if len(envelope.FaultsTriggered) != 0 {
+				result["faults_triggered"] = envelope.FaultsTriggered
+			}
+			if len(report.FrameErrors) != 0 {
+				result["frame_errors"] = report.FrameErrors
+			}
+			if report.FrameErrorsOmitted != 0 {
+				result["frame_errors_omitted"] = report.FrameErrorsOmitted
+			}
+			return result, false
 		}
 		assertions := []any{}
 		failed := 0
@@ -586,13 +637,14 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		if name == "" {
 			name = t.Name
 		}
-		triggered := []any{}
-		var total uint64
-		for _, applied := range report.AppliedFaults {
-			triggered = append(triggered, map[string]any{"rule_id": applied.RuleID, "type": applied.Type, "count": applied.Count})
-			total += applied.Count
+		result := map[string]any{"schema_version": 2, "command": "test", "ok": code == 0, "exit_code": code, "tape": name, "target": target, "duration_ms": time.Since(start).Milliseconds(), "summary": map[string]any{"assertions_total": len(results), "assertions_failed": failed, "assertions_passed": len(results) - failed, "requests_total": report.RequestsTotal, "faults_triggered": envelope.Summary.FaultsTriggered}, "faults_triggered": envelope.FaultsTriggered, "assertions": assertions, "error": nil}
+		if len(report.FrameErrors) != 0 {
+			result["frame_errors"] = report.FrameErrors
 		}
-		return map[string]any{"schema_version": 2, "command": "test", "ok": code == 0, "exit_code": code, "tape": name, "target": target, "duration_ms": time.Since(start).Milliseconds(), "summary": map[string]any{"assertions_total": len(results), "assertions_failed": failed, "assertions_passed": len(results) - failed, "requests_total": report.RequestsTotal, "faults_triggered": total}, "faults_triggered": triggered, "assertions": assertions, "error": nil}, false
+		if report.FrameErrorsOmitted != 0 {
+			result["frame_errors_omitted"] = report.FrameErrorsOmitted
+		}
+		return result, false
 	case "tape_export":
 		var a struct {
 			Name    string `json:"name"`
