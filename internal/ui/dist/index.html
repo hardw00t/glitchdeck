@@ -15,6 +15,7 @@
         <i></i><span id="connection">CONNECTING</span><span id="route"></span>
       </div>
       <span id="demo-badge" class="badge" hidden>DEMO</span>
+      <span id="tls-badge" data-testid="tls-badge" class="badge badge-tls" hidden><i class="tls-dot" aria-hidden="true"></i>TLS MITM</span>
       <div class="transport" aria-label="Tape transport">
         <button id="rec-button" data-testid="rec-button" aria-label="REC">
           <i class="rec-dot" aria-hidden="true"></i><span>REC</span></button
@@ -83,6 +84,7 @@
           02 <b>429 RETRY STORM</b></button
         ><button data-testid="preset-ws-drop" data-preset="2">
           03 <b>SILENT WS DROP 1006</b></button
+        ><button data-testid="preset-llm-stream" data-preset="3">04 <b>LLM STREAM CUT</b></button
         ><button id="bypass">BYPASS ALL</button>
       </div>
       <div class="tabs" role="tablist" aria-label="Console view">
@@ -93,7 +95,7 @@
           aria-selected="true"
           aria-controls="rack-panel"
         >
-          FAULT RACK <span>06</span></button
+          FAULT RACK <span>08</span></button
         ><button
           role="tab"
           id="tab-demo"
@@ -115,7 +117,7 @@
         >
           <div class="section-head">
             <h2>02 / FAULT RACK <span>MODULAR BAY</span></h2>
-            <span>6 MODULES &nbsp; · &nbsp; LIVE CONFIG</span>
+            <span>8 MODULES &nbsp; · &nbsp; LIVE CONFIG</span>
           </div>
           <div id="modules" class="modules"></div>
         </section>
@@ -132,6 +134,14 @@
                 SEND CHECKOUT ↗
               </button>
             </div>
+            <div class="demo-toolbar">
+              <div class="demo-tabs" role="tablist" aria-label="Demo target view">
+                <button id="demo-tab-commerce" data-testid="demo-tab-commerce" role="tab" aria-selected="true" aria-controls="commerce-view">COMMERCE &amp; WS</button>
+                <button id="demo-tab-llm" data-testid="demo-tab-llm" role="tab" aria-selected="false" aria-controls="llm-view" tabindex="-1">LLM STREAM</button>
+              </div>
+              <button id="run-llm" data-testid="run-llm" hidden>STREAM TOKENS ↗</button>
+              <button id="run-grpc" data-testid="run-grpc">RUN gRPC CALL</button>
+            </div>
             <div
               id="double-charge-banner"
               data-testid="double-charge-banner"
@@ -139,7 +149,7 @@
               role="alert"
               hidden
             ></div>
-            <div class="demo-grid">
+            <div id="commerce-view" class="demo-grid" role="tabpanel" aria-labelledby="demo-tab-commerce">
               <div>
                 <div class="micro">
                   PAYMENT LEDGER <span id="ledger-total">$0.00 TOTAL</span>
@@ -159,6 +169,10 @@
                 </button>
               </div>
             </div>
+            <div id="llm-view" class="llm-well" role="tabpanel" aria-labelledby="demo-tab-llm" hidden>
+              <div class="micro">SSE TOKEN STREAM <span><span id="llm-count">0 TOKENS</span> · <span id="llm-status" data-testid="llm-status" data-state="idle">IDLE</span></span></div>
+              <div id="llm-output" data-testid="llm-output" aria-live="polite"></div>
+            </div>
           </div>
           <div class="wire">
             <div class="section-head">
@@ -169,6 +183,8 @@
               <button data-filter="all" aria-pressed="true">ALL</button
               ><button data-filter="http" aria-pressed="false">HTTP</button
               ><button data-filter="ws" aria-pressed="false">WS</button
+              ><button data-filter="sse" aria-pressed="false">SSE</button
+              ><button data-filter="grpc" aria-pressed="false">gRPC</button
               ><button data-filter="fault" aria-pressed="false">FAULTS</button
               ><span id="event-count">0 EVENTS</span>
             </div>

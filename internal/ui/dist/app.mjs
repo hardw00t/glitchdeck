@@ -4,6 +4,7 @@ import {
   percentile,
   numericValue,
   duplicateTotal,
+  matchesFilter, faultFired, faultTag, streamPreview, streamOutcome,
 } from "./model.mjs";
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -115,6 +116,16 @@ const definitions = [
       ["After", "after_frames", "range", 1, 20, 1, " frames"],
     ],
   },
+  {
+    type: "sse-glitch", name: "SSE GLITCH", desc: "BREAK THE TOKEN STREAM",
+    params: {action:"stall", after_events:8, stall_ms:1500}, match:{path_prefix:"/api/chat/stream"},
+    controls: [["Mode","action","select",[["stall","Stall"],["drop","Drop"],["truncate","Truncate"],["corrupt_json","Corrupt JSON"],["eof_early","Early EOF"]]],["After","after_events","range",1,40,1," ev"],["Stall","stall_ms","range",100,5000,100,"ms"]],
+  },
+  {
+    type: "h2-grpc", name: "H2 / gRPC", desc: "DISRUPT H2 & RPC FRAMES",
+    params: {action:"rst_stream"}, match:{probability:100},
+    controls: [["Mode","action","select",[["rst_stream","RST_STREAM"],["goaway","GOAWAY"],["grpc_14","gRPC 14 UNAVAILABLE"],["grpc_4","gRPC 4 DEADLINE"]]],["Rate","probability","range",0,100,1,"%"],["Target","path_prefix","select",[["","All H2/gRPC"],["/grpc.","/grpc.*"],["/api/","/api/*"]]]],
+  },
 ];
 let config = { rules: [] },
   events = [],
@@ -129,12 +140,12 @@ let config = { rules: [] },
   demo = false,
   refreshTimer;
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
-const ruleFor = (type) => config.rules.find((r) => r.fault.type === type);
+const ruleFor = (type) => config.rules.find((r) => type === "h2-grpc" ? r.id === "h2-grpc" || ["h2-glitch", "grpc-glitch"].includes(r.fault.type) : r.fault.type === type);
 const defaultRule = (d) => ({
   id: d.type,
   enabled: false,
   match: { ...d.match },
-  fault: { type: d.type, params: { ...d.params } },
+  fault: { type: d.type === "h2-grpc" ? "h2-glitch" : d.type, params: { ...d.params } },
   virtual: true,
 });
 function normalize(rules) {
@@ -188,7 +199,7 @@ async function patchRule(rule, patch) {
       const state = await api("/api/state");
       config.rules = normalize(state.rules);
       ensureRules();
-      const current = ruleFor(rule.fault.type);
+      const current = ruleFor(rule.id === "h2-grpc" ? "h2-grpc" : rule.fault.type);
       if (current.virtual) {
         Object.assign(
           current,
@@ -234,8 +245,8 @@ function controls(d, r) {
                   ),
                 )
               : kind === "range"
-                ? numericValue(r.fault.params[key], d.params[key])
-                : (r.fault.params[key] ?? d.params[key]);
+                ? numericValue(d.type === "sse-glitch" && key === "after_events" && ["drop","corrupt_json"].includes(r.fault.params.action) ? r.fault.params.every : r.fault.params[key], d.params[key])
+                : (d.type === "h2-grpc" && key === "action" && r.fault.type === "grpc-glitch" ? `grpc_${r.fault.params.code === "DEADLINE_EXCEEDED" || r.fault.params.code === 4 ? 4 : 14}` : (r.fault.params[key] ?? d.params[key]));
       const id = `${d.type}-${key}`;
       if (kind === "select") {
         const options = a
@@ -253,7 +264,7 @@ function controls(d, r) {
       return `<div class="control">
         <label for="${id}">${label}<output>${value}${suffix}</output></label>
         <input id="${id}" data-key="${key}" type="range" min="${a}" max="${b}"
-          step="${step}" value="${value}" data-suffix="${suffix}">
+          step="${step}" value="${value}" data-suffix="${suffix}" ${d.type === "sse-glitch" && key === "stall_ms" && r.fault.params.action !== "stall" ? "disabled" : ""}>
       </div>`;
     })
     .join("");
@@ -261,8 +272,8 @@ function controls(d, r) {
 function firingCount(type) {
   return events.filter(
     (e) =>
-      e.data?.fault &&
-      (e.type === "ws_frame" ? type === "ws-glitch" : e.data.fault === type),
+      faultFired(e) &&
+      (type === "h2-grpc" ? ["h2-glitch","grpc-glitch"].includes(e.data.fault) : e.type === "ws_frame" ? type === "ws-glitch" : e.data.fault === type),
   ).length;
 }
 function updateCounts() {
@@ -279,7 +290,7 @@ function renderModules() {
     .map((d, i) => {
       const r = ruleFor(d.type),
         n = firingCount(d.type);
-      return `<article class="module ${i === 5 ? "cyan" : i > 1 ? "amber" : ""} ${r.enabled ? "armed" : ""}" data-type="${d.type}">
+      return `<article class="module ${i === 6 ? "violet" : i === 7 ? "cobalt" : i === 5 ? "cyan" : i > 1 ? "amber" : ""} ${r.enabled ? "armed" : ""}" data-type="${d.type}">
         <div class="module-head">
           <span class="module-code">M0${i + 1}</span>
           <h3>${d.name}</h3>
@@ -323,6 +334,18 @@ $("#modules").addEventListener("change", (e) => {
         ? input.value
         : Number(input.value);
   let patch;
+  const type = input.closest(".module").dataset.type;
+  if (key === "action" && (type === "h2-grpc" || type === "sse-glitch")) {
+    if (type === "h2-grpc") {
+      r.fault.type = value.startsWith("grpc_") ? "grpc-glitch" : "h2-glitch";
+      r.fault.params = value.startsWith("grpc_") ? {action:"status", code:value === "grpc_14" ? "UNAVAILABLE" : "DEADLINE_EXCEEDED"} : {action:value};
+    } else {
+      r.fault.params = value === "stall" ? {action:value, after_events:8, stall_ms:1500} :
+        ["drop","corrupt_json"].includes(value) ? {action:value, every:2} : {action:value, after_events:8};
+    }
+    replaceRules(config.rules).then(renderModules).catch((e) => { message(`Could not update faults: ${e.message}`); loadState(); });
+    return;
+  }
   if (key === "probability" || key === "path_prefix") {
     r.match[key] = value;
     patch = { match: { [key]: value } };
@@ -334,7 +357,7 @@ $("#modules").addEventListener("change", (e) => {
         value,
       );
     else {
-      params[key] = value;
+      params[type === "sse-glitch" && key === "after_events" && ["drop","corrupt_json"].includes(r.fault.params.action) ? "every" : key] = value;
       if (key === "bytes_per_sec")
         params.chunk_bytes = chunkBytes(
           value,
@@ -365,22 +388,19 @@ async function applyPreset(n) {
     config.rules = normalize(state.rules);
     ensureRules();
     for (const r of config.rules) r.enabled = false;
-    const type = ["dup-webhook", "rate-limit", "ws-glitch"][n],
+    const type = ["dup-webhook", "rate-limit", "ws-glitch", "sse-glitch"][n],
       r = ruleFor(type);
     r.enabled = true;
     r.match = { ...definitions.find((d) => d.type === type).match };
-    Object.assign(
-      r.fault.params,
-      n === 0
-        ? { count: 2, delay_ms: 120 }
-        : n === 1
-          ? { status: 429, retry_after_sec: 1 }
-          : { dir: "s2c", action: "close_1006", after_frames: 3 },
-    );
+    r.fault.params = n === 0 ? {count:2, delay_ms:120} : n === 1
+      ? {status:429, retry_after_sec:1, body:"Too Many Requests"}
+      : n === 2 ? {dir:"s2c", action:"close_1006", after_frames:3, delay_ms:1000}
+      : {action:"truncate", after_events:8};
     await replaceRules(config.rules);
     preset = n;
     renderModules();
     markPreset();
+    selectDemoTab(n === 3 ? 1 : 0);
   } catch (e) {
     message(`Could not apply preset: ${e.message}`);
     await loadState();
@@ -453,7 +473,7 @@ function selectTab(index, focus = false) {
   });
   if (focus) tabs[index].focus();
 }
-$$("[role=tab]").forEach((tab, i) => {
+$$(".tabs [role=tab]").forEach((tab, i) => {
   tab.onclick = () => selectTab(i);
   tab.onkeydown = (e) => {
     if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
@@ -463,8 +483,7 @@ $$("[role=tab]").forEach((tab, i) => {
   };
 });
 selectTab(0);
-let lastDemoAlert = "",
-  retryAlert = "";
+let lastDemoAlert = "", retryAlert = "", llmAlert = "", llmRun = "", llmPending, llmTimer, llmCutAfter;
 function showAlert(text) {
   if (text === lastDemoAlert) return;
   lastDemoAlert = text;
@@ -498,7 +517,7 @@ async function refreshDemo() {
     showAlert(
       duplicate
         ? `DOUBLE CHARGE DETECTED: ${money(duplicate.cents)} — order ${duplicate.order}`
-        : retryAlert || (tickerBroken ? "WS SILENT DROP: ticker stalled" : ""),
+        : llmAlert || retryAlert || (tickerBroken ? "WS SILENT DROP: ticker stalled" : ""),
     );
   } catch (e) {
     message(`Demo: ${e.message}`);
@@ -509,6 +528,95 @@ function money(cents) {
     style: "currency",
     currency: "USD",
   }).format((Number(cents) || 0) / 100);
+}
+function selectDemoTab(index, focus = false) {
+  const tabs = [$("#demo-tab-commerce"), $("#demo-tab-llm")];
+  tabs.forEach((tab, i) => {
+    tab.setAttribute("aria-selected", String(i === index));
+    tab.tabIndex = i === index ? 0 : -1;
+    document.getElementById(tab.getAttribute("aria-controls")).hidden = i !== index;
+  });
+  $("#run-checkout").hidden = index !== 0;
+  $("#run-llm").hidden = index !== 1;
+  if (focus) tabs[index].focus();
+}
+[$("#demo-tab-commerce"), $("#demo-tab-llm")].forEach((tab, i) => {
+  tab.onclick = () => selectDemoTab(i);
+  tab.onkeydown = (e) => {
+    if (["ArrowLeft","ArrowRight","Home","End"].includes(e.key)) {
+      e.preventDefault();
+      selectDemoTab(e.key === "Home" ? 0 : e.key === "End" ? 1 : 1-i, true);
+    }
+  };
+});
+function llmStatus(state) {
+  $("#llm-status").dataset.state = state;
+  $("#llm-status").textContent = state.toUpperCase();
+}
+function llmFault(text, state) {
+  llmAlert = text;
+  llmStatus(state);
+  showAlert(text);
+  const tag = document.createElement("strong");
+  tag.className = "llm-fault";
+  tag.textContent = ` ${text}`;
+  $("#llm-output").append(tag);
+}
+function watchLLM() {
+  clearTimeout(llmTimer);
+  llmTimer = setTimeout(() => llmFault("STREAM STALLED: no SSE tokens for 2.5s", "stalled"), 2500);
+}
+$("#run-llm").onclick = async () => {
+  if (llmPending) return;
+  llmRun = ""; llmPending = []; llmAlert = ""; llmCutAfter = undefined;
+  $("#llm-output").textContent = "";
+  $("#llm-count").textContent = "0 TOKENS";
+  llmStatus("streaming"); showAlert(""); watchLLM();
+  try {
+    const result = await post("/api/demo/stream", {flavor:"openai", tokens:24, token_ms:40, wait:false, wedge_after_ms:3000});
+    const pending = llmPending;
+    llmRun = result.run_id; llmPending = undefined;
+    for (const [accept, data] of pending) accept(data);
+  } catch (e) {
+    llmPending = undefined; clearTimeout(llmTimer);
+    llmFault(`STREAM ERROR: ${e.message}`, "truncated");
+  }
+};
+$("#run-grpc").onclick = async () => {
+  try {
+    const result = await post("/api/demo/grpc");
+    message(result.h2_error ? `gRPC H2: ${result.h2_error}` : `gRPC ${result.grpc_status ?? "unavailable"} ${result.grpc_message || ""} · HTTP ${result.http_status}`);
+  } catch (e) { message(`gRPC call failed: ${e.message}`); }
+};
+function acceptDemoStream(d) {
+  if (llmPending) {
+    if (llmPending.length < 1024) llmPending.push([acceptDemoStream, d]);
+    return;
+  }
+  if (!llmRun || d.run_id !== llmRun) return;
+  if (d.phase !== "finished") return;
+  clearTimeout(llmTimer);
+  $("#llm-output").textContent = d.text || "";
+  $("#llm-count").textContent = `${d.tokens || 0} TOKENS`;
+  const result = streamOutcome(d, llmCutAfter);
+  llmAlert = "";
+  llmStatus(result.state);
+  if (result.alert) llmFault(result.alert, result.state); else showAlert("");
+}
+function acceptStreamEvent(d) {
+  if (llmPending) {
+    if (llmPending.length < 1024) llmPending.push([acceptStreamEvent, d]);
+    return;
+  }
+  if (!llmRun || d.run_id !== llmRun || d.kind !== "event") return;
+  if (d.action === "truncate") llmCutAfter = Math.max(0, d.event_index - 1);
+  watchLLM();
+  const preview = streamPreview(d);
+  if (preview.text) {
+    $("#llm-output").append(document.createTextNode(preview.text));
+    $("#llm-count").textContent = `${Number.parseInt($("#llm-count").textContent, 10) + 1} TOKENS`;
+  }
+  if (preview.done) $("#llm-status").textContent = "FINISHING";
 }
 $("#run-checkout").onclick = async () => {
   try {
@@ -593,14 +701,7 @@ $("#connect-ticker").onclick = () => {
 function renderLog() {
   const log = $("#wire-log"),
     visible = events
-      .filter(
-        (e) =>
-          e.id > logCutoff &&
-          (filter === "all" ||
-            (filter === "fault" && e.data?.fault) ||
-            (filter === "http" && e.type === "http_req") ||
-            (filter === "ws" && e.type === "ws_frame")),
-      )
+      .filter((e) => e.id > logCutoff && matchesFilter(e, filter))
       .slice(-200)
       .reverse(),
     wanted = new Set(visible.map((e) => String(e.id)));
@@ -626,7 +727,8 @@ function renderLog() {
     const d = e.data || {},
       row = document.createElement("details");
     row.dataset.id = e.id;
-    row.className = "wire-row" + (d.fault ? " fault" : "");
+    const protocol = e.type === "sse_event" ? "sse" : ["grpc_call","h2_frame"].includes(e.type) || ["grpc","h2"].includes(d.protocol) ? "grpc" : e.type === "ws_frame" ? "ws" : "http";
+    row.className = "wire-row " + protocol + (faultFired(e) ? " fault" : "");
     const summary = document.createElement("summary");
     const fields = [
       d.ts_ms
@@ -634,11 +736,11 @@ function renderLog() {
           "." +
           String(new Date(d.ts_ms).getMilliseconds()).padStart(3, "0")
         : "—",
-      e.type === "ws_frame" ? "WS" : "HTTP",
-      e.type === "ws_frame"
-        ? `${d.dir || ""} · ${d.preview || "frame"}`
-        : `${d.method || ""} ${d.path || ""}`,
-      d.status || d.opcode || "—",
+      protocol === "sse" ? "SSE" : protocol === "grpc" ? (e.type === "h2_frame" || d.protocol === "h2" ? "H2" : "gRPC") : protocol === "ws" ? "WS" : "HTTP",
+      protocol === "sse" ? `${d.event || d.kind || "event"} #${d.event_index || 0} · ${d.preview || ""}` :
+        protocol === "grpc" ? `${d.service || ""}/${d.method || ""} ${d.action || ""}` :
+        protocol === "ws" ? `${d.dir || ""} · ${d.preview || "frame"}` : `${d.method || ""} ${d.path || ""}`,
+      d.grpc_status != null ? `g${d.grpc_status}` : d.h2_error ? "RST" : d.status || d.opcode || "—",
       d.latency_ms != null ? `${d.latency_ms}ms` : d.fault || "—",
     ];
     for (const text of fields) {
@@ -685,7 +787,9 @@ function accept(event) {
     if (!$("#modules").contains(document.activeElement)) renderModules();
     return;
   }
-  if (!["http_req", "ws_frame"].includes(event.type)) return;
+  if (event.type === "demo_stream") { acceptDemoStream(event.data); return; }
+  if (event.type === "sse_event") acceptStreamEvent(event.data);
+  if (!["http_req", "ws_frame", "sse_event", "grpc_call", "h2_frame"].includes(event.type)) return;
   mergeHistory([event]);
   if (demo) {
     clearTimeout(refreshTimer);
@@ -707,7 +811,7 @@ function connectEvents() {
     $("#disconnect").hidden = false;
     $("#connection").textContent = "OFFLINE";
   };
-  for (const type of ["http_req", "ws_frame", "fault_state"])
+  for (const type of ["http_req", "ws_frame", "sse_event", "grpc_call", "h2_frame", "demo_stream", "fault_state"])
     stream.addEventListener(type, (e) => {
       try {
         accept({ id: Number(e.lastEventId), type, data: JSON.parse(e.data) });
@@ -725,6 +829,7 @@ async function loadState() {
     demo = !!s.demo_mode;
     $("#demo-pane").hidden = !demo;
     $("#demo-badge").hidden = !demo;
+    $("#tls-badge").hidden = !(s.tls_mitm || s.tls_enabled || s.capabilities?.tls_mitm);
     $("#route").textContent = [s.listen, s.target].filter(Boolean).join(" → ");
     if (!$("#modules").contains(document.activeElement)) renderModules();
     if (demo) refreshDemo();
@@ -735,13 +840,6 @@ async function loadState() {
 const canvas = $("#scope"),
   ctx = canvas.getContext("2d");
 const windowMS = 30000;
-const tags = {
-  "tcp-rst": "RST",
-  "dup-webhook": "DUP",
-  "rate-limit": "429",
-  "byte-trickle": "TRK",
-  "latency-wave": "LAT",
-};
 let animation = 0;
 
 function draw(updateReadouts = false) {
@@ -768,6 +866,7 @@ function draw(updateReadouts = false) {
     .filter((e) => e.type === "http_req" && Number.isFinite(e.data.latency_ms))
     .sort((a, b) => a.data.ts_ms - b.data.ts_ms);
   const ws = recent.filter((e) => e.type === "ws_frame");
+  const sse = recent.filter((e) => e.type === "sse_event" && e.data.kind === "event");
   const maxMS =
     Math.ceil(
       http.reduce((max, e) => Math.max(max, e.data.latency_ms), 1000) / 1000,
@@ -797,7 +896,7 @@ function draw(updateReadouts = false) {
   ctx.textBaseline = "alphabetic";
   for (const ms of [maxMS / 4, maxMS / 2, maxMS])
     ctx.fillText(ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`, w - 35, y(ms));
-  ctx.fillText("WS FRAMES", 8, bottom + 13);
+  ctx.fillText("WS / SSE STREAM", 8, bottom + 13);
   ctx.strokeStyle = ctx.fillStyle = "#38f59c";
   ctx.lineWidth = 1.75;
   if (!reduced.matches) {
@@ -833,22 +932,28 @@ function draw(updateReadouts = false) {
     ctx.strokeStyle = data.fault ? "#ff5968" : "#4cc9f0";
     line(px, mid, px, mid + (data.dir === "s2c" ? -9 : 9));
   }
+  for (const e of sse) {
+    const {data} = e;
+    const px = x(data.ts_ms), mid = bottom + track / 2 + 2;
+    ctx.fillStyle = faultFired(e) ? "#ff5968" : "#c084fc";
+    ctx.beginPath(); ctx.moveTo(px, mid-3); ctx.lineTo(px+3, mid); ctx.lineTo(px, mid+3); ctx.lineTo(px-3, mid); ctx.closePath(); ctx.fill();
+  }
   let previousTag = "",
     previousX = -100;
-  for (const { data } of recent) {
-    if (!data.fault) continue;
+  for (const e of recent) {
+    if (!faultFired(e)) continue;
+    const {data} = e;
     const px = x(data.ts_ms),
       close = data.fault === "close_1006",
-      tag = close ? "× 1006" : tags[data.fault] || "WS";
-    const color = close
-      ? "#ff5968"
-      : ["429", "TRK", "LAT"].includes(tag)
-        ? "#f5b731"
-        : "#ff5a1f";
+      tag = close ? "× 1006" : faultTag(data);
+    const isSSE = data.fault === "sse-glitch", isH2 = ["h2-glitch","grpc-glitch"].includes(data.fault);
+    const color = isSSE ? "#c084fc" : isH2 ? "#7aa2ff" : close ? "#ff5968" : ["429", "TRK", "LAT"].includes(tag) ? "#f5b731" : "#ff5a1f";
     const py = close ? bottom + track - 3 : innerWidth <= 800 ? 29 : 14;
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
-    line(px, close ? bottom : 0, px, close ? h : bottom);
+    if (isSSE || isH2) ctx.setLineDash(isSSE ? [3,3] : [4,2]);
+    line(px, close || isSSE ? bottom : 0, px, close || isSSE ? h : bottom);
+    ctx.setLineDash([]);
     if (previousTag === tag && px - previousX < 25) continue;
     previousTag = tag;
     previousX = px;
@@ -863,16 +968,16 @@ function draw(updateReadouts = false) {
     const values = http.map((e) => e.data.latency_ms),
       p50 = percentile(values, 0.5),
       p95 = percentile(values, 0.95);
-    const faults = recent.filter((e) => e.data.fault).length;
+    const faults = recent.filter(faultFired).length;
     $("#p50").innerHTML = `${p50 ?? "—"} <small>ms</small>`;
     $("#p95").innerHTML = `${p95 ?? "—"} <small>ms</small>`;
     $("#req-rate").textContent = (http.length / 30).toFixed(1);
-    $("#ws-rate").textContent = (ws.length / 30).toFixed(1);
+    $("#ws-rate").textContent = ((ws.length + sse.length) / 30).toFixed(1);
     $("#fault-count").textContent = faults;
     canvas.setAttribute(
       "aria-label",
       recent.length
-        ? `Live oscilloscope: P95 ${p95 === null ? "unavailable" : p95 + " milliseconds"}, ${faults} faults fired, WebSocket ${$("#ticker-status").textContent.toLowerCase()}`
+        ? `Live oscilloscope: P95 ${p95 === null ? "unavailable" : p95 + " milliseconds"}, ${faults} faults fired, ${sse.length} SSE events, ${recent.filter(e => e.type === "grpc_call").length} gRPC calls, WebSocket ${$("#ticker-status").textContent.toLowerCase()}`
         : "Live oscilloscope awaiting traffic",
     );
   }
@@ -893,7 +998,7 @@ document.addEventListener("keydown", (e) => {
   )
     return;
   if (e.key.toLowerCase() === "r") tapeAction(recording ? "stop" : "record");
-  else if (["1", "2", "3"].includes(e.key)) applyPreset(Number(e.key) - 1);
+  else if (["1", "2", "3", "4"].includes(e.key)) applyPreset(Number(e.key) - 1);
   else if (e.key === "0") $("#bypass").click();
 });
 connectEvents();
