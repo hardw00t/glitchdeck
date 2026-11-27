@@ -20,6 +20,7 @@ func TestTapeValidateStdio(t *testing.T) {
 	const v2 = "version: 2\nname: second\ntarget: demo\nrules:\n  - id: limit\n    enabled: true\n    fault: {type: rate-limit, params: {status: 429}}\n"
 	const badYAML = "version: [\n"
 	const badSchema = v1 + "unknown_field: true\n"
+	const badTarget = "version: 2\ntarget: ftp://localhost\n"
 	for path, text := range map[string]string{"work/valid.tape.yaml": v2, "work/invalid.tape.yaml": badSchema, "x.tape.yaml": v1} {
 		if err := os.WriteFile(filepath.Join(base, path), []byte(text), 0600); err != nil {
 			t.Fatal(err)
@@ -38,6 +39,9 @@ func TestTapeValidateStdio(t *testing.T) {
 		{name: "inline v2", args: map[string]string{"tape_yaml": v2}, want: map[string]any{"ok": true, "version": float64(2), "name": "second", "rules": float64(1)}},
 		{name: "invalid YAML", args: map[string]string{"tape_yaml": badYAML}, errText: "yaml:"},
 		{name: "invalid schema", args: map[string]string{"tape_yaml": badSchema}, errText: "unknown_field"},
+		{name: "invalid target", args: map[string]string{"tape_yaml": badTarget}, errText: "HTTP or HTTPS"},
+		{name: "unknown expected rule", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: missing, max_applied: 0}]}\n"}, errText: "missing"},
+		{name: "inverted bounds", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: limit, min_applied: 1, max_applied: 0}]}\n"}, errText: "min_applied"},
 		{name: "valid path", args: map[string]string{"tape_path": "valid.tape.yaml"}, want: map[string]any{"ok": true, "version": float64(2), "name": "second", "rules": float64(1)}},
 		{name: "absolute path in workdir", args: map[string]string{"tape_path": filepath.Join(workdir, "valid.tape.yaml")}, want: map[string]any{"ok": true, "version": float64(2), "name": "second", "rules": float64(1)}},
 		{name: "invalid tape at path", args: map[string]string{"tape_path": "invalid.tape.yaml"}, errText: "unknown_field"},
@@ -81,7 +85,7 @@ func TestTapeValidateStdio(t *testing.T) {
 				}
 				return
 			}
-			if reply.Error.Code != 0 || reply.Result == nil || reply.Result.IsError || len(reply.Result.Content) != 1 {
+			if reply.Error.Code != 0 || reply.Result == nil || reply.Result.IsError != (tc.errText != "") || len(reply.Result.Content) != 1 {
 				t.Fatal(output.String())
 			}
 			got := reply.Result.Structured

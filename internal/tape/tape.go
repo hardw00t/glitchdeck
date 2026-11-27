@@ -155,10 +155,23 @@ func validate(t Tape) error {
 			}
 		}
 	}
+	if t.Target != "" && t.Target != "demo" {
+		if _, err := proxy.ParseExplicitTarget(t.Target); err != nil {
+			return fmt.Errorf("target: %w", err)
+		}
+	}
+	if t.DroppedEntries < 0 {
+		return fmt.Errorf("dropped_entries cannot be negative")
+	}
 	switch value := t.Expect.ChildExit.(type) {
-	case nil, int:
+	case nil:
+	case int:
+		if value < -1 {
+			return fmt.Errorf("invalid child_exit")
+		}
 	case string:
-		if _, err := strconv.Atoi(value); err != nil && value != "any" && value != "nonzero" {
+		n, err := strconv.Atoi(value)
+		if (err != nil || n < -1) && value != "any" && value != "nonzero" {
 			return fmt.Errorf("invalid child_exit")
 		}
 	default:
@@ -193,6 +206,25 @@ func validate(t Tape) error {
 	seq := t.StartSeq
 	if err := fault.Validate(fault.Config{Seed: t.Seed, Rules: t.Rules}); err != nil {
 		return err
+	}
+	if len(t.Expect.Faults) != 0 {
+		ids := make(map[string]struct{}, len(t.Rules))
+		for _, rule := range t.Rules {
+			ids[rule.ID] = struct{}{}
+		}
+		for _, change := range t.ConfigChanges {
+			for _, rule := range change.Rules {
+				ids[rule.ID] = struct{}{}
+			}
+		}
+		for _, want := range t.Expect.Faults {
+			if _, ok := ids[want.Rule]; !ok {
+				return fmt.Errorf("expect.faults references unknown rule %q", want.Rule)
+			}
+			if want.MinApplied != nil && want.MaxApplied != nil && *want.MinApplied > *want.MaxApplied {
+				return fmt.Errorf("expect.faults rule %q: min_applied exceeds max_applied", want.Rule)
+			}
+		}
 	}
 	for _, s := range t.Script {
 		n := 0
@@ -293,6 +325,15 @@ func validate(t Tape) error {
 		}
 		if kinds != 1 || (a.HTTPGet != "" && !validPath(a.HTTPGet)) || a.MaxLatencyMS < 0 {
 			return fmt.Errorf("invalid assertion %q", a.Name)
+		}
+		if a.ExpectGRPCStatus != nil && *a.ExpectGRPCStatus < 0 || a.ExpectStatus < 0 {
+			return fmt.Errorf("assertion %q has a negative expected status", a.Name)
+		}
+		if x := a.ExpectSSE; x != nil {
+			if x.MinEvents != nil && *x.MinEvents < 0 || x.MaxEvents != nil && *x.MaxEvents < 0 ||
+				x.MaxGapMS != nil && *x.MaxGapMS < 0 {
+				return fmt.Errorf("assertion %q: min_events, max_events and max_gap_ms cannot be negative", a.Name)
+			}
 		}
 	}
 	return nil

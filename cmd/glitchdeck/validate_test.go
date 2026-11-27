@@ -91,6 +91,13 @@ func TestValidateStdin(t *testing.T) {
 		{"invalid YAML", "version: [\n", "", "yaml:", 0},
 		{"invalid schema", "version: 2\nunknown_field: true\n", "", "unknown_field", 0},
 		{"exact limit", v2 + strings.Repeat(" ", limit-len(v2)), "current", "", 2},
+		{"target scheme", "version: 2\ntarget: ftp://localhost\n", "", "HTTP or HTTPS", 0},
+		{"inverted bounds", "version: 2\nrules: [{id: known, fault: {type: tcp-rst}}]\nexpect: {faults: [{rule: known, min_applied: 1, max_applied: 0}]}\n", "", "min_applied", 0},
+		{"unknown rule", "version: 2\nexpect: {faults: [{rule: missing, max_applied: 0}]}\n", "", "missing", 0},
+		{"negative bounds", "version: 2\nrules: [{id: known, fault: {type: tcp-rst}}]\nexpect: {faults: [{rule: known, max_applied: -1}]}\n", "", "uint64", 0},
+		{"signal exit", "version: 2\nname: signal\nexpect: {child_exit: -1}\n", "signal", "", 2},
+		{"invalid child exit", "version: 2\nexpect: {child_exit: -2}\n", "", "child_exit", 0},
+		{"negative SSE count", "version: 2\nassertions: [{stream_step: s, expect_sse: {min_events: -1}}]\n", "", "min_events", 0},
 		{"over limit", v2 + strings.Repeat(" ", limit+1-len(v2)), "", sizeError, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

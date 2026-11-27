@@ -185,6 +185,9 @@ func (s *Server) Serve() error {
 							break
 						}
 						_, isErr := value["error"].(map[string]string)
+						if p.Name == "tape_validate" && value["ok"] == false {
+							isErr = true
+						}
 						result = map[string]any{"content": []any{map[string]string{"type": "text", "text": string(b)}}, "structuredContent": value, "isError": isErr}
 					default:
 						code = -32601
