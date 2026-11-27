@@ -41,12 +41,17 @@ func streamFrom(ctx context.Context) uint32 {
 	return v
 }
 
-func resetProtocolStream(ctx context.Context, code uint32) bool {
-	if tap, stream := MetaFrom(ctx).Tap, streamFrom(ctx); tap != nil && stream != 0 {
-		tap.Reset(stream, code)
-		return true
+func resetProtocolStreamAfterData(ctx context.Context, code uint32, bytes int64) bool {
+	tap, stream := MetaFrom(ctx).Tap, streamFrom(ctx)
+	if tap == nil || stream == 0 {
+		return false
 	}
-	return false
+	select {
+	case <-tap.ResetAfterData(stream, code, bytes):
+	case <-tap.Done():
+	case <-ctx.Done():
+	}
+	return true
 }
 
 // prepareProtocolRequest removes the private stream header even on untapped

@@ -78,8 +78,8 @@ func NewRecorder() *Recording { return new(Recording) }
 func (r *Recording) Start(p *proxy.Proxy) {
 	r.p = p
 	r.rec.attach(p)
-	p.CaptureBoundary(func(next uint64, active int) {
-		r.rec.start(next-1, active, p.Config())
+	p.CaptureRecordingBoundary(func(next uint64, active int, cfg fault.Config, usedBurst bool) {
+		r.rec.start(next-1, active, cfg, usedBurst)
 	})
 }
 
@@ -149,7 +149,7 @@ func (r *recorder) reset() {
 	r.clear()
 }
 
-func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config) recordingStatus {
+func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config, usedBurst ...bool) recordingStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.running {
@@ -163,6 +163,9 @@ func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config) record
 		r.streams = make(map[uint64]*recorded)
 		if activeStreams != 0 {
 			r.markIncomplete("WebSocket or blind CONNECT tunnel already open when recording started")
+		}
+		if len(usedBurst) != 0 && usedBurst[0] {
+			r.markIncomplete("rate-limit burst was partially or fully consumed before recording started")
 		}
 	}
 	return r.snapshot()

@@ -118,6 +118,21 @@ func Decode(r io.Reader) (Tape, error) {
 		}
 		return t, err
 	}
+	var presence struct {
+		Assertions []struct {
+			ExpectSSE map[string]any `yaml:"expect_sse"`
+		} `yaml:"assertions"`
+	}
+	if err := yaml.Unmarshal(raw.Bytes(), &presence); err != nil {
+		return t, err
+	}
+	for _, assertion := range presence.Assertions {
+		if terminal, ok := assertion.ExpectSSE["terminal"]; ok {
+			if value, ok := terminal.(string); !ok || value == "" {
+				return t, fmt.Errorf("invalid terminal %q", terminal)
+			}
+		}
+	}
 	if t.Version == 1 || len(t.Expect.Faults) != 0 {
 		var doc yaml.Node
 		if err := yaml.Unmarshal(raw.Bytes(), &doc); err != nil {
@@ -351,6 +366,9 @@ func validate(t Tape) error {
 			return fmt.Errorf("assertion %q has a negative expected status", a.Name)
 		}
 		if x := a.ExpectSSE; x != nil {
+			if x.Terminal != "" && a.StreamStep == "" {
+				return fmt.Errorf("assertion %q: terminal requires stream_step", a.Name)
+			}
 			if x.Terminal != "" && !sse.IsTerminalKind(x.Terminal) && !slices.Contains(terminals, x.Terminal) {
 				return fmt.Errorf("assertion %q: invalid terminal %q", a.Name, x.Terminal)
 			}
@@ -724,34 +742,11 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			if err := validateStepProtocol(s.Stream.URL, s.Stream.Proto); err != nil {
 				return nil, fmt.Errorf("step %s: %w", s.Name, err)
 			}
-			method := s.Stream.Method
-			if method == "" {
-				method = http.MethodGet
-			}
-			upstream := u
-			if s.Stream.URL != "" {
-				upstream, _ = url.Parse(s.Stream.URL)
-			}
-			path := s.Stream.Path
-			if s.Stream.URL != "" && upstream != nil {
-				path = upstream.Path
-			}
-			if parsed, err := url.Parse(path); err == nil {
-				path = parsed.Path
-			}
-			proto := "h1"
-			if s.Stream.Proto == "h2" || s.Stream.Proto == "h2c" {
-				proto = "h2"
-			}
-			query := fault.Query{Method: method, Path: path, Proto: proto, Seq: p.Seq() + 1, ContentType: s.Stream.Headers["Content-Type"]}
-			if upstream != nil {
-				query.Host, query.Scheme = upstream.Host, upstream.Scheme
-			}
-			var extra []string
-			if rule := fault.MatchRequest(p.Config(), query); rule != nil && rule.Fault.Type == "sse-glitch" {
-				extra = fault.Strings(rule.Fault.Params, "done_events")
-			}
-			sseResults[s.Name] = runStreamWithTerminals(ctx, serverURL, *s.Stream, extra, roots)
+			sseResults[s.Name] = func() streamEvidence {
+				runID, admission, cleanup := p.WatchSSEAdmission()
+				defer cleanup()
+				return runStreamWithAdmission(ctx, serverURL, *s.Stream, nil, runID, admission, roots)
+			}()
 		case s.GRPC != nil:
 			status, e := runGRPC(ctx, serverURL, *s.GRPC, roots)
 			if e != nil {

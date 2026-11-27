@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,6 +81,8 @@ type Proxy struct {
 	stats              map[string]RuleStats
 	applied            map[AppliedFault]uint64
 	sseEncodingWarned  map[string]bool
+	burstUsed          map[string]int
+	sseAdmission       map[string]chan []string
 	OnBlindTunnel      func(uint64)
 	OnSSE              func(uint64)
 	OnRequest          func(Record)
@@ -137,6 +141,26 @@ func (p *Proxy) SetConfigAt(c fault.Config) uint64 {
 	c = cloneConfig(c)
 	p.gate.Lock()
 	defer p.gate.Unlock()
+	if len(p.burstUsed) != 0 {
+		previous := p.cfg.Load()
+		for id := range p.burstUsed {
+			var unchanged bool
+			for _, old := range previous.Rules {
+				if old.ID == id {
+					for _, rule := range c.Rules {
+						if rule.ID == id {
+							unchanged = reflect.DeepEqual(old, rule)
+							break
+						}
+					}
+					break
+				}
+			}
+			if !unchanged {
+				delete(p.burstUsed, id)
+			}
+		}
+	}
 	p.cfg.Store(&c)
 	return p.seq.Load() + 1
 }
@@ -145,9 +169,41 @@ func (p *Proxy) RequestsTotal() uint64 { return p.requests.Load() }
 func (p *Proxy) SetSeq(n uint64)       { p.gate.Lock(); p.seq.Store(n); p.gate.Unlock() }
 func (p *Proxy) ActiveWebSockets() int { p.gate.Lock(); defer p.gate.Unlock(); return p.activeWS }
 func (p *Proxy) CaptureBoundary(fn func(uint64, int)) {
+	p.admission.Lock()
+	defer p.admission.Unlock()
 	p.gate.Lock()
 	defer p.gate.Unlock()
 	fn(p.seq.Load()+1, p.activeWS+p.activeTunnels)
+}
+
+// CaptureRecordingBoundary takes the configuration and burst snapshot at one admission boundary.
+func (p *Proxy) CaptureRecordingBoundary(fn func(uint64, int, fault.Config, bool)) {
+	p.CaptureBoundary(func(next uint64, active int) {
+		fn(next, active, p.Config(), len(p.burstUsed) != 0)
+	})
+}
+
+// SSEAdmissionHeader correlates an internal request with its admission observer.
+const SSEAdmissionHeader = "X-Glitchdeck-Sse-Admission"
+
+// WatchSSEAdmission returns the custom terminals of the actual admitted request.
+// Send the returned token as SSEAdmissionHeader and unregister after the response.
+func (p *Proxy) WatchSSEAdmission() (string, <-chan []string, func()) {
+	runID := rand.Text()
+	ch := make(chan []string, 1)
+	p.gate.Lock()
+	if p.sseAdmission == nil {
+		p.sseAdmission = make(map[string]chan []string)
+	}
+	p.sseAdmission[runID] = ch
+	p.gate.Unlock()
+	return runID, ch, func() {
+		p.gate.Lock()
+		if p.sseAdmission[runID] == ch {
+			delete(p.sseAdmission, runID)
+		}
+		p.gate.Unlock()
+	}
 }
 func (p *Proxy) Reset() { p.ResetWith(nil) }
 func (p *Proxy) ResetWith(fn func()) {
@@ -171,6 +227,7 @@ func (p *Proxy) ResetWith(fn func()) {
 	clear(p.stats)
 	clear(p.applied)
 	clear(p.sseEncodingWarned)
+	clear(p.burstUsed)
 	p.mu.Unlock()
 	if fn != nil {
 		fn()
@@ -406,10 +463,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.options.BeforeRequest != nil {
 		p.options.BeforeRequest(seq)
 	}
-	cfg := *p.cfg.Load()
-	if p.options.OnAdmission != nil {
-		p.options.OnAdmission(seq, r.Method, r.URL.RequestURI(), host)
-	}
 	ws := r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
 	proto, recordProto := "h1", ""
 	if r.ProtoMajor == 2 {
@@ -420,27 +473,57 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctype := r.Header.Get("Content-Type")
 	match := fault.Query{Method: r.Method, Path: r.URL.Path, Host: host, Scheme: scheme, Proto: proto, ContentType: ctype, Seq: seq, WS: ws}
+	p.gate.Lock()
+	if gen != p.generation {
+		p.gate.Unlock()
+		p.admission.Unlock()
+		http.Error(w, "proxy closed", http.StatusServiceUnavailable)
+		return
+	}
+	cfg := *p.cfg.Load()
 	rule := fault.MatchRequest(cfg, match)
 	var kind, action, skip, h2Error string
 	var params map[string]any
 	if rule != nil {
 		kind, params = rule.Fault.Type, rule.Fault.Params
-		if !ws {
-			matched := p.countRule(gen, rule, "matched", "")
-			if kind == "rate-limit" {
-				if burst := fault.Int(params, "burst", 0); burst > 0 && matched > uint64(burst) {
+		if !ws && kind == "rate-limit" {
+			if burst := fault.Int(params, "burst", 0); burst > 0 {
+				if p.burstUsed[rule.ID] >= burst {
 					skip = "burst_exhausted"
-					p.countRule(gen, rule, "skipped", skip)
+				} else {
+					if p.burstUsed == nil {
+						p.burstUsed = make(map[string]int)
+					}
+					p.burstUsed[rule.ID]++
 				}
 			}
 		}
 	}
-	p.admission.Unlock()
-	p.gate.Lock()
+	if runID := r.Header.Get(SSEAdmissionHeader); runID != "" {
+		r.Header.Del(SSEAdmissionHeader)
+		if ch := p.sseAdmission[runID]; ch != nil {
+			delete(p.sseAdmission, runID)
+			var extra []string
+			if kind == "sse-glitch" {
+				extra = fault.Strings(params, "done_events")
+			}
+			ch <- extra
+		}
+	}
 	if ws {
 		p.activeWS++
 	}
 	p.gate.Unlock()
+	if p.options.OnAdmission != nil {
+		p.options.OnAdmission(seq, r.Method, r.URL.RequestURI(), host)
+	}
+	p.admission.Unlock()
+	if rule != nil && !ws {
+		p.countRule(gen, rule, "matched", "")
+		if skip != "" {
+			p.countRule(gen, rule, "skipped", skip)
+		}
+	}
 	if ws {
 		defer func() {
 			p.gate.Lock()
@@ -668,7 +751,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		record(recorded, missing, truncated)
 		status = fault.Int(params, "status", 429)
-		responseBody := rateLimitResponse(w.Header(), params, status, seq, start)
+		responseBody := rateLimitResponse(w.Header(), params, status, seq, time.Now())
 		upstreamHeaders = w.Header()
 		w.WriteHeader(status)
 		count, _ := io.WriteString(w, responseBody)
@@ -700,6 +783,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if kind == "sse-glitch" {
 		q.Header.Del("Accept-Encoding")
+		if fault.String(params, "action", "") == "inject_error" && fault.String(params, "provider", "auto") == "auto" {
+			upstreamCtx, cancelUpstream := context.WithCancel(q.Context())
+			defer cancelUpstream()
+			q = q.WithContext(upstreamCtx)
+			ctx = context.WithValue(ctx, sseUpstreamCancelKey{}, cancelUpstream)
+		}
 	}
 	var finishRecord func(bool)
 	var recordMu sync.Mutex
@@ -814,6 +903,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				resp.Body = decoder
 				resp.Header.Del("Content-Encoding")
 				resp.Header.Del("Content-Length")
+				stripSSEIntegrity(resp.Header)
+				stripSSEIntegrity(resp.Trailer)
 				decoded := encoding
 				if decoded == "x-gzip" {
 					decoded = "gzip"
@@ -876,7 +967,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					code = 8
 				}
 			}
-			if !resetProtocolStream(ctx, code) {
+			if !resetProtocolStreamAfterData(ctx, code, result.bytes) {
 				panic(http.ErrAbortHandler)
 			}
 		}
@@ -887,13 +978,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					panic(http.ErrAbortHandler)
 				}
 				if r.ProtoMajor == 2 {
-					if !resetProtocolStream(ctx, 2) {
+					if !resetProtocolStreamAfterData(ctx, 2, result.bytes) {
 						_ = rc.SetWriteDeadline(time.Now())
 					}
 				} else if conn, _, err := rc.Hijack(); err == nil {
 					// Close without writing the final chunk: decoding failed, not clean EOF.
 					_ = conn.Close()
 				}
+			}
+		}
+		if result.err == nil && (result.end == "eof" || result.end == "done") {
+			if _, decoded := resp.Body.(*sseDecoder); decoded {
+				stripSSEIntegrity(resp.Trailer)
+			}
+			for k, v := range resp.Trailer {
+				w.Header()[http.TrailerPrefix+k] = v
 			}
 		}
 		return

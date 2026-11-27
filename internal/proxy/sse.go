@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,6 +59,8 @@ func requestSSEEnd(end string) string {
 	}
 }
 
+type sseUpstreamCancelKey struct{}
+
 type sseResult struct {
 	bytes     int64
 	events    int
@@ -103,6 +106,7 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		provider = fault.String(params, "provider", "auto")
 	}
 	fragments := 0
+	framesSeen := 0
 	var droppedTool toolKey
 	doneEvents := fault.Strings(params, "done_events")
 	_, decoded := body.(*sseDecoder)
@@ -194,11 +198,75 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		}
 		return true
 	}
+	record := func(f sse.Frame, index int, current string) {
+		clip := func(s string, n int) string {
+			s = s[:min(len(s), n)]
+			for len(s) != 0 && !utf8.ValidString(s) {
+				s = s[:len(s)-1]
+			}
+			return s
+		}
+		eventName := f.Event
+		if eventName == "" {
+			eventName = "message"
+		}
+		var id any
+		if f.ID != nil {
+			id = clip(*f.ID, 256)
+		}
+		frameKind := "event"
+		if !f.Dispatch {
+			frameKind = "comment"
+			if f.Retry != nil {
+				frameKind = "retry"
+			}
+		}
+		delay := 0
+		if current == "stall" {
+			delay = stallMS
+		}
+		p.publish(gen, "sse_event", map[string]any{
+			"seq": seq, "stream_id": stream, "run_id": run, "kind": frameKind,
+			"event_index": index, "ts_ms": time.Now().UnixMilli(), "t_rel_ms": time.Since(start).Milliseconds(),
+			"event": clip(eventName, 256), "id": id, "data_bytes": len(f.Data), "raw_bytes": len(f.Raw), "is_done": f.IsDone(),
+			"applied": current != "none", "fault_id": faultID,
+			"fault": kind, "action": current, "stall_ms": delay, "preview": clip(f.Data, 120), "provider": provider,
+		})
+	}
 	inject := func() {
 		if provider == "auto" {
 			// Inspect only the remainder of the three-frame detection window.
-			for seen := res.events; seen < 3; {
-				f, err := r.Next()
+		lookahead:
+			for seen := framesSeen; seen < 3; seen++ {
+				var f sse.Frame
+				var err error
+				if cancel, ok := ctx.Value(sseUpstreamCancelKey{}).(context.CancelFunc); ok {
+					type readResult struct {
+						frame sse.Frame
+						err   error
+					}
+					result := make(chan readResult, 1)
+					go func() { frame, err := r.Next(); result <- readResult{frame, err} }()
+					timer := time.NewTimer(200 * time.Millisecond)
+					select {
+					case next := <-result:
+						f, err = next.frame, next.err
+						timer.Stop()
+					case <-timer.C:
+						cancel()
+						<-result
+						provider = "openai"
+						break lookahead
+					case <-ctx.Done():
+						timer.Stop()
+						cancel()
+						<-result
+						res.end, res.err = "client_cancel", ctx.Err()
+						return
+					}
+				} else {
+					f, err = r.Next()
+				}
 				if err != nil {
 					if ctx.Err() != nil {
 						res.end, res.err = "client_cancel", ctx.Err()
@@ -212,7 +280,6 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 				if !f.Dispatch {
 					continue
 				}
-				seen++
 				if detected := detectSSEProvider(f); detected != "" {
 					provider = detected
 					break
@@ -243,7 +310,10 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		} else if terminal == "none" {
 			terminal = "error"
 		}
-		p.publish(gen, "sse_event", map[string]any{"seq": seq, "stream_id": stream, "run_id": run, "kind": "event", "event_index": res.events + 1, "event": "error", "action": action, "fault": kind, "fault_id": faultID, "applied": true, "provider": provider})
+		frame, err := sse.NewReader(bytes.NewReader(raw), 0).Next()
+		if err == nil {
+			record(frame, res.events+1, action)
+		}
 		if fault.String(params, "close", "clean") == "rst" {
 			res.end = "rst"
 		}
@@ -281,11 +351,12 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 			}
 			return res
 		}
+		framesSeen++
 		eventName := f.Event
 		if eventName == "" {
 			eventName = "message"
 		}
-		if f.Dispatch && provider == "auto" && res.events < 3 {
+		if f.Dispatch && provider == "auto" && framesSeen <= 3 {
 			if detected := detectSSEProvider(f); detected != "" {
 				provider = detected
 			}
@@ -305,7 +376,9 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 				if selected(params, seed, rule.ID, seq, matching) {
 					switch {
 					case action == "corrupt_json" && !jsonFrame:
-						res.skip = "not_json"
+						if !res.applied {
+							res.skip = "not_json"
+						}
 					case terminalKind != "done_marker":
 						current = action
 					}
@@ -329,8 +402,12 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 				changed, drop := false, false
 				for _, part := range parts {
 					if part.key == droppedTool {
-						part.obj[part.field] = ""
-						changed = true
+						if len(parts) == 1 && !part.shared {
+							drop = true
+						} else {
+							delete(part.obj, part.field)
+							changed = true
+						}
 						continue
 					}
 					fragments++
@@ -403,28 +480,7 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		}
 		if captured < limit || current != "none" {
 			captured++
-			preview := f.Data[:min(len(f.Data), 120)]
-			for len(preview) != 0 && !utf8.ValidString(preview) {
-				preview = preview[:len(preview)-1]
-			}
-			frameKind := "event"
-			if !f.Dispatch {
-				frameKind = "comment"
-				if f.Retry != nil {
-					frameKind = "retry"
-				}
-			}
-			delay := 0
-			if current == "stall" {
-				delay = stallMS
-			}
-			p.publish(gen, "sse_event", map[string]any{
-				"seq": seq, "stream_id": stream, "run_id": run, "kind": frameKind,
-				"event_index": res.events, "ts_ms": time.Now().UnixMilli(), "t_rel_ms": time.Since(start).Milliseconds(),
-				"event": eventName, "id": f.ID, "data_bytes": len(f.Data), "raw_bytes": len(f.Raw), "is_done": f.IsDone(),
-				"applied": current != "none", "fault_id": faultID,
-				"fault": kind, "action": current, "stall_ms": delay, "preview": preview, "provider": provider,
-			})
+			record(f, res.events, current)
 		}
 		switch current {
 		case "truncate":
@@ -447,11 +503,11 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 				return res
 			}
 		}
-		if action == "inject_error" && !res.applied && delivered >= after {
+		if action == "inject_error" && !res.applied && terminal == "none" && delivered >= after {
 			inject()
 			return res
 		}
-		if terminalKind == "done_marker" || f.Event == "message_stop" {
+		if terminalKind == "done_marker" {
 			res.end = "done"
 		}
 	}

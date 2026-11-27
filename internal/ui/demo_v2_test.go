@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -65,5 +67,69 @@ func TestDemoV2TrafficGoesThroughProxy(t *testing.T) {
 	post("/api/demo/grpc", "", &grpc)
 	if grpc.Status != 14 {
 		t.Fatalf("RPC did not receive injected gRPC status: %+v", grpc)
+	}
+}
+
+type blockingTransport struct {
+	base    http.RoundTripper
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Header.Get("X-Glitchdeck-Run") == "first" {
+		close(b.entered)
+		<-b.release
+	}
+	return b.base.RoundTrip(r)
+}
+
+func TestDemoStreamUsesAdmittedRule(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: custom_end\ndata: {}\n\n")
+	}))
+	defer up.Close()
+	target, _ := proxy.ParseTarget(up.URL)
+	p := proxy.New(target, fault.Config{Rules: []fault.Rule{{ID: "r", Enabled: true, Match: fault.Match{Seq: []uint64{1}}, Fault: fault.Fault{Type: "sse-glitch", Params: map[string]any{"action": "drop", "every": 100, "done_events": []string{"custom_end"}}}}}}, nil)
+	defer p.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go p.Serve(ln)
+	transport := &blockingTransport{base: http.DefaultTransport, entered: make(chan struct{}), release: make(chan struct{})}
+	c := &control{Options: Options{Listen: ln.Addr().String(), DemoURL: up.URL}, p: p, client: &http.Client{Transport: transport}}
+	in := streamInput{Flavor: "openai", MaxMS: 5000, WedgeAfterMS: 1000}
+	first := make(chan streamResult, 1)
+	go func() { first <- c.readDemoStream(context.Background(), "first", in) }()
+	<-transport.entered
+	second := c.readDemoStream(context.Background(), "second", in)
+	close(transport.release)
+	gotFirst := <-first
+	if second.Outcome != "complete" || gotFirst.Outcome != "silent_truncation" {
+		t.Fatalf("second=%+v first=%+v", second, gotFirst)
+	}
+}
+
+func TestDemoStreamDoesNotExposeProviderError(t *testing.T) {
+	secret := strings.Repeat("secret-credential", 1000)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "event: error\ndata: {\"error\":{\"message\":%q}}\n\n", secret)
+	}))
+	defer up.Close()
+	target, _ := proxy.ParseTarget(up.URL)
+	p := proxy.New(target, fault.Config{}, nil)
+	defer p.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go p.Serve(ln)
+	c := &control{Options: Options{Listen: ln.Addr().String(), DemoURL: up.URL}, p: p, client: &http.Client{}}
+	got := c.readDemoStream(context.Background(), "error", streamInput{Flavor: "openai", MaxMS: 5000, WedgeAfterMS: 1000})
+	if got.Outcome != "error" || got.ClientError == "" || len(got.ClientError) > 256 || strings.Contains(got.ClientError, "secret-credential") {
+		t.Fatalf("unsafe error: %+v", got)
 	}
 }

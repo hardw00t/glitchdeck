@@ -153,6 +153,7 @@ func TestToolArgumentsModesAndClosures(t *testing.T) {
 					}
 					reader := sse.NewReader(strings.NewReader(w.Body.String()), 0)
 					args := ""
+					sibling := false
 					for {
 						frame, err := reader.Next()
 						if err == io.EOF {
@@ -165,12 +166,19 @@ func TestToolArgumentsModesAndClosures(t *testing.T) {
 							t.Fatalf("invalid outer JSON %q", frame.Data)
 						}
 						parts, _ := toolFragments(frame)
-						if len(parts) > 0 {
-							args += parts[0].obj[parts[0].field].(string)
+						for _, part := range parts {
+							if part.key.shape == "chat" && part.key.call == "1" {
+								if part.obj[part.field] != "safe" {
+									t.Fatalf("other tool changed: %s", frame.Data)
+								}
+								sibling = true
+							} else {
+								args += part.obj[part.field].(string)
+							}
 						}
-						if fixture.name == "chat" && len(parts) > 1 && parts[1].obj[parts[1].field] != "safe" {
-							t.Fatalf("other tool changed: %s", frame.Data)
-						}
+					}
+					if fixture.name == "chat" && mode != "drop" && !sibling {
+						t.Fatal("sibling tool call missing")
 					}
 					if json.Valid([]byte(args)) {
 						t.Fatalf("arguments unexpectedly valid: %q", args)

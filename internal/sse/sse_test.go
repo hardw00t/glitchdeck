@@ -93,6 +93,22 @@ func TestTerminalAndJSON(t *testing.T) {
 	}
 }
 
+func TestTerminalRequiresExactKeysAndBoundedRawFrame(t *testing.T) {
+	for _, data := range []string{`{"Error":{}}`, `{"Type":"message_stop"}`, `{"Candidates":[{"finishReason":"STOP"}]}`, `{"candidates":[{"FinishReason":"STOP"}]}`} {
+		if kind, ok := (Frame{Data: data}).Terminal(nil); ok {
+			t.Fatalf("%s classified as %s", data, kind)
+		}
+	}
+	f := Frame{Raw: []byte(strings.Repeat(":x\n", 22000) + "data: {\"type\":\"message_stop\"}\n\n"), Data: `{"type":"message_stop"}`}
+	if kind, ok := f.Terminal(nil); ok {
+		t.Fatalf("oversized raw frame classified as %s", kind)
+	}
+	f.Event = "message_stop"
+	if kind, ok := f.Terminal(nil); !ok || kind != "message_stop" {
+		t.Fatalf("named terminal lost: %s %v", kind, ok)
+	}
+}
+
 func FuzzReader(f *testing.F) {
 	f.Add([]byte("\ufeffdata: é\r\n\r\n: comment\r\rpartial"))
 	f.Add([]byte("data\n\n"))

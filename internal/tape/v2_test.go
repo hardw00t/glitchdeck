@@ -1,7 +1,9 @@
 package tape
 
 import (
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -126,7 +128,10 @@ func TestStreamTerminalEvidence(t *testing.T) {
 		{"event: error\ndata: {\"error\":{}}\n\n", "error", "eof", false, true},
 		{"event: message_stop\ndata: {}\n\n", "message_stop", "eof", true, true},
 	} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, tc.body) }))
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, tc.body)
+		}))
 		e := runStreamWithTerminals(context.Background(), server.URL, Stream{Path: "/"}, []string{"end"})
 		server.Close()
 		if e.Terminal != tc.terminal || e.End != tc.end || e.Done != tc.done || e.ValidJSON != tc.valid {
@@ -167,6 +172,7 @@ func TestInjectedErrorTapeEvidenceDistinguishesEOFAndReset(t *testing.T) {
 
 func TestTerminalRuleScopeAndValidation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "event: end\ndata: text\n\ndata: [DONE]\n\n")
 	}))
 	defer server.Close()
@@ -183,6 +189,122 @@ func TestTerminalRuleScopeAndValidation(t *testing.T) {
 	}
 	if _, err := Decode(strings.NewReader(strings.Replace(doc, "terminal: end", "terminal: other", 1))); err == nil {
 		t.Fatal("unknown terminal accepted")
+	}
+}
+
+func TestReplayTerminalMarkerAfterSemanticTerminal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+	e := runStream(context.Background(), server.URL, Stream{Path: "/"})
+	if e.Terminal != "response.completed" || e.End != "done" || e.Events != 2 || !e.Done {
+		t.Fatalf("evidence: %+v", e)
+	}
+}
+
+func TestTapeRunLegacyTerminalEvidence(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.URL.Path == "/stop" {
+			fmt.Fprint(w, "event: message_stop\ndata: {}\n\n")
+			return
+		}
+		fmt.Fprint(w, "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+	one, two, yes := 1, 2, true
+	tp := Tape{Version: 2, Target: up.URL, Script: []Step{
+		{Name: "stop", Stream: &Stream{Path: "/stop"}},
+		{Name: "completed", Stream: &Stream{Path: "/completed"}},
+	}, Assertions: []Assertion{
+		{StreamStep: "stop", ExpectSSE: &SSEExpect{End: "eof", Terminal: "message_stop", Done: &yes, MinEvents: &one, MaxEvents: &one}},
+		{StreamStep: "completed", ExpectSSE: &SSEExpect{End: "done", Terminal: "response.completed", Done: &yes, MinEvents: &two, MaxEvents: &two}},
+	}}
+	results, err := Run(context.Background(), tp, "")
+	if err != nil || len(results) != 2 || len(results[0].Failures) != 0 || len(results[1].Failures) != 0 {
+		t.Fatalf("results=%v err=%v", results, err)
+	}
+}
+
+func TestReplayRejectsOpaqueFrameAssertions(t *testing.T) {
+	for _, content := range []string{"application/json", "text/event-stream"} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", content)
+			if content == "text/event-stream" {
+				w.Header().Set("Content-Encoding", "br")
+			}
+			fmt.Fprint(w, "opaque")
+		}))
+		e := runStream(context.Background(), server.URL, Stream{Path: "/"})
+		server.Close()
+		if got := checkStream(Assertion{ExpectSSE: &SSEExpect{Terminal: "none"}}, e); len(got) == 0 {
+			t.Fatalf("certified opaque response: %+v", e)
+		}
+		if got := checkStream(Assertion{ExpectStatus: 200}, e); len(got) != 0 {
+			t.Fatal(got)
+		}
+	}
+}
+
+func TestReplayLimitsDecodedFrameLines(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		z := gzip.NewWriter(w)
+		fmt.Fprint(z, strings.Repeat(":x\n", 65537)+"data: {}\n\n")
+		z.Close()
+	}))
+	defer up.Close()
+	tp := Tape{Version: 2, Target: up.URL, Script: []Step{{Name: "stream", Stream: &Stream{Path: "/"}}}, Assertions: []Assertion{{StreamStep: "stream", ExpectSSE: &SSEExpect{Terminal: "none"}}}}
+	results, err := Run(context.Background(), tp, "")
+	if err != nil || len(results) != 1 || len(results[0].Failures) == 0 {
+		t.Fatalf("oversized decoded frame certified: %v %v", results, err)
+	}
+}
+
+func TestTerminalAssertionPresenceAndStepType(t *testing.T) {
+	for _, assertion := range []string{
+		`{http_get: /, expect_sse: {terminal: error}}`,
+		`{grpc_step: g, expect_sse: {terminal: error}}`,
+		`{stream_step: s, expect_sse: {terminal: ""}}`,
+		`{stream_step: s, expect_sse: {terminal: null}}`,
+	} {
+		doc := "version: 2\ntarget: demo\nscript: [{name: s, stream: {path: /}}, {name: g, grpc: {path: /}}]\nassertions: [" + assertion + "]\n"
+		if _, err := Decode(strings.NewReader(doc)); err == nil {
+			t.Errorf("accepted %s", assertion)
+		}
+	}
+}
+
+func TestReplayUsesAdmittedRuleForEscapedURL(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("X-Glitchdeck-Sse-Admission") != "" {
+			t.Error("admission token forwarded upstream")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: custom_end\ndata: {}\n\n")
+	}))
+	defer up.Close()
+	tp := Tape{Version: 2, Target: up.URL, Rules: []fault.Rule{{ID: "r", Enabled: true, Match: fault.Match{PathPrefix: "/a?b"}, Fault: fault.Fault{Type: "sse-glitch", Params: map[string]any{"action": "drop", "every": 100, "done_events": []string{"custom_end"}}}}}, Script: []Step{{Name: "s", Stream: &Stream{URL: up.URL + "/a%3Fb"}}}, Assertions: []Assertion{{StreamStep: "s", ExpectSSE: &SSEExpect{Terminal: "custom_end"}}}}
+	results, err := Run(context.Background(), tp, "")
+	if err != nil || len(results) != 1 || len(results[0].Failures) != 0 {
+		t.Fatalf("results=%v err=%v", results, err)
+	}
+}
+
+func TestPublishedSSEModeDefaults(t *testing.T) {
+	data, err := json.Marshal(fault.Registry["sse-glitch"].Params["mode"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Default         any               `json:"default"`
+		DefaultByAction map[string]string `json:"default_by_action"`
+	}
+	if err := json.Unmarshal(data, &spec); err != nil || spec.Default != nil || spec.DefaultByAction["corrupt_json"] != "cut" || spec.DefaultByAction["corrupt_tool_args"] != "truncate" {
+		t.Fatalf("incorrect published mode defaults: %s (%v)", data, err)
 	}
 }
 

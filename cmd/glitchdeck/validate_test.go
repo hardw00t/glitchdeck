@@ -187,6 +187,14 @@ func TestValidateV220Parameters(t *testing.T) {
 		`{type: rate-limit, params: {burst: 0}}`,
 		`{type: rate-limit, params: {retry_after_ms: 1.5}}`,
 		`{type: rate-limit, params: {provider: azure}}`,
+		`{type: sse-glitch, params: {done_events: []}}`,
+		`{type: sse-glitch, params: {done_events: [` + strings.Repeat("x,", 16) + `x]}}`,
+		`{type: sse-glitch, params: {done_events: [""]}}`,
+		`{type: sse-glitch, params: {done_events: ["` + strings.Repeat("é", 65) + `"]}}`,
+		`{type: sse-glitch, params: {action: inject_error, message: "` + strings.Repeat("é", 257) + `"}}`,
+		`{type: sse-glitch, params: {action: inject_error, provider: raw, data: "` + strings.Repeat("é", 32769) + `"}}`,
+		`{type: sse-glitch, params: {action: inject_error, error_type: "` + strings.Repeat("x", 65) + `"}}`,
+		`{type: sse-glitch, params: {action: inject_error, error_type: "é"}}`,
 	} {
 		path := filepath.Join(t.TempDir(), "bad.yaml")
 		doc := "version: 2\ntarget: demo\nrules:\n  - id: r\n    fault: " + fault + "\n"
@@ -195,6 +203,39 @@ func TestValidateV220Parameters(t *testing.T) {
 		}
 		if code, _ := launchOutput(t, "validate", path); code != 2 {
 			t.Errorf("accepted %s", fault)
+		}
+	}
+}
+
+func TestValidateV220ParameterBoundaries(t *testing.T) {
+	for _, params := range []string{
+		`{done_events: [x]}`,
+		`{done_events: [` + strings.Repeat("x,", 15) + `x]}`,
+		`{done_events: ["` + strings.Repeat("é", 64) + `"]}`,
+		`{action: inject_error, message: "` + strings.Repeat("é", 256) + `"}`,
+		`{action: inject_error, provider: raw, data: "` + strings.Repeat("é", 32768) + `"}`,
+		`{action: inject_error, error_type: "` + strings.Repeat("x", 64) + `"}`,
+	} {
+		path := filepath.Join(t.TempDir(), "good.yaml")
+		doc := "version: 2\ntarget: demo\nrules: [{id: r, fault: {type: sse-glitch, params: " + params + "}}]\n"
+		if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := launchOutput(t, "validate", path); code != 0 {
+			t.Errorf("rejected %s", params[:min(len(params), 100)])
+		}
+	}
+}
+
+func TestValidateTerminalAssertionPresence(t *testing.T) {
+	for _, assertion := range []string{`{http_get: /, expect_sse: {terminal: error}}`, `{grpc_step: g, expect_sse: {terminal: error}}`, `{stream_step: s, expect_sse: {terminal: ""}}`, `{stream_step: s, expect_sse: {terminal: null}}`} {
+		path := filepath.Join(t.TempDir(), "bad.yaml")
+		doc := "version: 2\ntarget: demo\nscript: [{name: s, stream: {path: /}}, {name: g, grpc: {path: /}}]\nassertions: [" + assertion + "]\n"
+		if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := launchOutput(t, "validate", path); code != 2 {
+			t.Errorf("accepted %s", assertion)
 		}
 	}
 }

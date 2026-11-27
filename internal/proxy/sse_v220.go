@@ -35,6 +35,9 @@ func (d *sseDecoder) Read(p []byte) (int, error) {
 			}
 		} else {
 			reader, err := gzip.NewReader(d.source)
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
 			d.err = err
 			if err == nil {
 				d.reader = reader
@@ -98,7 +101,7 @@ func detectSSEProvider(f sse.Frame) string {
 		return "openai_responses"
 	}
 	data := strings.TrimSpace(f.Data)
-	if len(data) <= 64<<10 && strings.HasPrefix(data, "{") {
+	if strings.HasPrefix(data, "{") {
 		var v struct{ Candidates json.RawMessage }
 		if json.Unmarshal([]byte(data), &v) == nil && v.Candidates != nil {
 			return "gemini"
@@ -112,9 +115,10 @@ type toolKey struct {
 }
 
 type toolFragment struct {
-	obj   map[string]any
-	field string
-	key   toolKey
+	obj    map[string]any
+	field  string
+	key    toolKey
+	shared bool
 }
 
 // toolFragments returns mutable argument fields and stable per-call identities.
@@ -130,25 +134,28 @@ func toolFragments(f sse.Frame) ([]toolFragment, map[string]any) {
 		return nil, nil
 	}
 	var out []toolFragment
-	add := func(m map[string]any, field string, key toolKey) {
+	add := func(m map[string]any, field string, key toolKey, shared bool) {
 		if _, ok := m[field].(string); ok {
-			out = append(out, toolFragment{m, field, key})
+			out = append(out, toolFragment{m, field, key, shared})
 		}
 	}
-	for ci, c := range array(v["choices"]) {
+	choices := array(v["choices"])
+	for ci, c := range choices {
 		choice := object(c)
 		delta := object(choice["delta"])
 		choiceID := toolIndex(choice["index"], ci)
-		add(object(delta["function_call"]), "arguments", toolKey{shape: "legacy", choice: choiceID})
-		for i, x := range array(delta["tool_calls"]) {
+		calls := array(delta["tool_calls"])
+		shared := len(choices) > 1 || len(delta) > 1
+		add(object(delta["function_call"]), "arguments", toolKey{shape: "legacy", choice: choiceID}, shared)
+		for i, x := range calls {
 			call := object(x)
-			add(object(call["function"]), "arguments", toolKey{shape: "chat", choice: choiceID, call: toolIndex(call["index"], i)})
+			add(object(call["function"]), "arguments", toolKey{shape: "chat", choice: choiceID, call: toolIndex(call["index"], i)}, shared || len(calls) > 1)
 		}
 	}
 	if v["type"] == "content_block_delta" || f.Event == "content_block_delta" {
 		delta := object(v["delta"])
 		if delta["type"] == "input_json_delta" {
-			add(delta, "partial_json", toolKey{shape: "anthropic", call: toolIndex(v["index"], 0)})
+			add(delta, "partial_json", toolKey{shape: "anthropic", call: toolIndex(v["index"], 0)}, false)
 		}
 	}
 	typ, _ := v["type"].(string)
@@ -163,9 +170,9 @@ func toolFragments(f sse.Frame) ([]toolFragment, map[string]any) {
 			key.choice = toolIndex(v["output_index"], 0)
 		}
 		if typ == "response.function_call_arguments.delta" {
-			add(v, "delta", key)
+			add(v, "delta", key, false)
 		} else {
-			add(v, "arguments", key)
+			add(v, "arguments", key, false)
 		}
 	}
 	return out, v

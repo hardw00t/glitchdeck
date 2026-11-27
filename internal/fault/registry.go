@@ -9,13 +9,14 @@ import (
 type ParamKind string
 
 type ParamSpec struct {
-	Kind         ParamKind           `json:"kind"`
-	Min          int                 `json:"min,omitempty"`
-	Max          int                 `json:"max,omitempty"`
-	Default      any                 `json:"default,omitempty"`
-	Enum         []string            `json:"enum,omitempty"`
-	EnumByAction map[string][]string `json:"enum_by_action,omitempty"`
-	Actions      []string            `json:"actions,omitempty"`
+	Kind            ParamKind           `json:"kind"`
+	Min             int                 `json:"min,omitempty"`
+	Max             int                 `json:"max,omitempty"`
+	Default         any                 `json:"default,omitempty"`
+	DefaultByAction map[string]any      `json:"default_by_action,omitempty"`
+	Enum            []string            `json:"enum,omitempty"`
+	EnumByAction    map[string][]string `json:"enum_by_action,omitempty"`
+	Actions         []string            `json:"actions,omitempty"`
 }
 
 type TypeSpec struct {
@@ -57,7 +58,7 @@ var Registry = map[string]TypeSpec{
 			"event_type":      {Kind: "string", Actions: []string{"stall", "drop", "corrupt_json"}},
 			"cut_bytes":       {Kind: "int", Min: 1, Max: 1 << 20, Actions: []string{"truncate"}},
 			"rst":             {Kind: "bool", Default: true, Actions: []string{"truncate"}},
-			"mode":            {Kind: "string", Default: "cut", EnumByAction: map[string][]string{"corrupt_json": {"cut", "brace", "quote"}, "corrupt_tool_args": {"truncate", "invalid", "drop"}}, Actions: []string{"corrupt_json", "corrupt_tool_args"}},
+			"mode":            {Kind: "string", DefaultByAction: map[string]any{"corrupt_json": "cut", "corrupt_tool_args": "truncate"}, EnumByAction: map[string][]string{"corrupt_json": {"cut", "brace", "quote"}, "corrupt_tool_args": {"truncate", "invalid", "drop"}}, Actions: []string{"corrupt_json", "corrupt_tool_args"}},
 			"before_event":    {Kind: "string", Actions: []string{"eof_early"}},
 			"http_clean":      {Kind: "bool", Default: true, Actions: []string{"eof_early"}},
 			"done_events":     {Kind: "string_list"},

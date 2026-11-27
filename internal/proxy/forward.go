@@ -105,11 +105,11 @@ func cloneReasons(in map[string]uint64) map[string]uint64 {
 	return out
 }
 
-func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) uint64 {
+func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if gen != p.generation {
-		return 0
+		return
 	}
 	id := rule.ID
 	v := p.stats[id]
@@ -126,7 +126,6 @@ func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) uin
 		v.skip(reason)
 	}
 	p.stats[id] = v
-	return v.Matched
 }
 
 func (p *Proxy) authorize(w http.ResponseWriter, r *http.Request, absolute bool) bool {

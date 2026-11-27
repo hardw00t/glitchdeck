@@ -7,6 +7,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -379,6 +381,45 @@ func TestObservedSSEDoesNotAssertOnOpaquePassThrough(t *testing.T) {
 	a := tape.Assertion{StreamStep: "stream", ExpectSSE: &tape.SSEExpect{Terminal: "none"}}
 	if got := observedAssertion(a, tp, bus.History(10)); len(got.Failures) != 1 || !strings.Contains(got.Failures[0], "not inspected") {
 		t.Fatalf("expected an inconclusive assertion, got %+v", got)
+	}
+}
+
+func TestExecLegacyTerminalEvidence(t *testing.T) {
+	if os.Getenv("GD_TERMINAL_HELPER") == "1" {
+		for _, path := range []string{"/stop", "/completed"} {
+			resp, err := http.Get(os.Getenv("GLITCHDECK_PROXY_URL") + path)
+			if err != nil {
+				os.Exit(9)
+			}
+			_, err = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				os.Exit(9)
+			}
+		}
+		os.Exit(0)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if r.URL.Path == "/stop" {
+			fmt.Fprint(w, "event: message_stop\ndata: {}\n\n")
+			return
+		}
+		fmt.Fprint(w, "event: response.completed\ndata: {}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+	t.Setenv("GD_TERMINAL_HELPER", "1")
+	one, two, yes := 1, 2, true
+	tp := tape.Tape{Version: 2, Target: up.URL, Script: []tape.Step{
+		{Name: "stop", Stream: &tape.Stream{Path: "/stop"}},
+		{Name: "completed", Stream: &tape.Stream{Path: "/completed"}},
+	}, Assertions: []tape.Assertion{
+		{StreamStep: "stop", ExpectSSE: &tape.SSEExpect{End: "eof", Terminal: "message_stop", Done: &yes, MinEvents: &one, MaxEvents: &one}},
+		{StreamStep: "completed", ExpectSSE: &tape.SSEExpect{End: "done", Terminal: "response.completed", Done: &yes, MinEvents: &two, MaxEvents: &two}},
+	}}
+	r := Run(context.Background(), tp, Options{Command: []string{os.Args[0], "-test.run=^TestExecLegacyTerminalEvidence$"}, JSON: true})
+	if r.ExitCode != 0 {
+		t.Fatalf("exec evidence: %+v", r)
 	}
 }
 

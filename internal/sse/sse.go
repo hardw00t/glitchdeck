@@ -57,28 +57,27 @@ func (f Frame) Terminal(extra []string) (string, bool) {
 		}
 	}
 	data := strings.TrimSpace(f.Data)
-	if len(data) == 0 || len(data) > 64<<10 || data[0] != '{' {
+	if len(data) == 0 || len(f.Raw) > 64<<10 || len(data) > 64<<10 || data[0] != '{' {
 		return "", false
 	}
-	var body struct {
-		Type       string          `json:"type"`
-		Error      json.RawMessage `json:"error"`
-		Candidates []struct {
-			FinishReason string `json:"finishReason"`
-		} `json:"candidates"`
-	}
+	var body map[string]json.RawMessage
 	if json.Unmarshal([]byte(data), &body) != nil {
 		return "", false
 	}
-	switch body.Type {
+	var typ string
+	_ = json.Unmarshal(body["type"], &typ)
+	switch typ {
 	case "message_stop", "response.completed", "response.incomplete", "response.failed":
-		return body.Type, true
+		return typ, true
 	}
-	if len(body.Error) > 0 && body.Error[0] == '{' {
+	if value := bytes.TrimSpace(body["error"]); len(value) > 0 && value[0] == '{' {
 		return "error", true
 	}
-	for _, candidate := range body.Candidates {
-		if candidate.FinishReason != "" {
+	var candidates []map[string]json.RawMessage
+	_ = json.Unmarshal(body["candidates"], &candidates)
+	for _, candidate := range candidates {
+		var reason string
+		if json.Unmarshal(candidate["finishReason"], &reason) == nil && reason != "" {
 			return "finish_reason", true
 		}
 	}

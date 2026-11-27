@@ -38,6 +38,11 @@ type planned struct {
 	sent int64
 	done chan struct{}
 }
+type dataReset struct {
+	code  uint32
+	count int64
+	done  chan struct{}
+}
 
 // Conn leaves flow control and HTTP semantics to the HTTP server. It rewrites
 // client HPACK separately from the server's encoder and serializes all writes.
@@ -55,6 +60,8 @@ type Conn struct {
 	pending      []byte
 	headerStream uint32
 	resetNext    map[uint32]uint32
+	dataBytes    map[uint32]int64
+	dataResets   map[uint32]dataReset
 	closing      *time.Timer
 	recvMax      atomic.Int32
 	decoderLimit atomic.Uint32
@@ -139,6 +146,11 @@ func (c *Conn) receive() {
 			if h.Type == frameRST && h.Stream != 0 && len(data) == 4 {
 				c.mu.Lock()
 				c.forgetPlan(h.Stream)
+				delete(c.dataBytes, h.Stream)
+				if reset, ok := c.dataResets[h.Stream]; ok {
+					close(reset.done)
+					delete(c.dataResets, h.Stream)
+				}
 				c.mu.Unlock()
 			}
 			if h.Type == frameSetting && h.Flags&flagAck == 0 && h.Stream == 0 && len(data)%6 == 0 {
@@ -299,6 +311,35 @@ func (c *Conn) Reset(stream, code uint32) {
 	}
 }
 
+// ResetAfterData resets only after count response DATA bytes have reached the wire.
+// Callers must also watch Done and their request context while awaiting completion.
+func (c *Conn) ResetAfterData(stream, code uint32, count int64) <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	done := make(chan struct{})
+	if _, dead := c.dead[stream]; dead {
+		close(done)
+		return done
+	}
+	if c.dataResets == nil {
+		c.dataResets = make(map[uint32]dataReset)
+	}
+	c.dataResets[stream] = dataReset{code: code, count: count, done: done}
+	if c.dataBytes[stream] >= count && len(c.pending) == 0 && c.headerStream == 0 {
+		c.finishDataReset(stream)
+	}
+	return done
+}
+
+func (c *Conn) finishDataReset(stream uint32) {
+	reset := c.dataResets[stream]
+	delete(c.dataResets, stream)
+	if err := c.reset(stream, reset.code); err != nil {
+		_ = c.Close()
+	}
+	close(reset.done)
+}
+
 func (c *Conn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -331,6 +372,11 @@ func (c *Conn) Write(p []byte) (int, error) {
 				}
 			}
 			clear(c.resetNext)
+			for stream, reset := range c.dataResets {
+				if c.dataBytes[stream] >= reset.count {
+					c.finishDataReset(stream)
+				}
+			}
 		}
 		b = b[n:]
 	}
@@ -441,13 +487,38 @@ func (c *Conn) writeFrame(h FrameHeader, raw []byte) error {
 	if h.Type == frameHeaders {
 		c.admitted = max(c.admitted, h.Stream)
 	}
-	return c.send(raw)
+	if err := c.send(raw); err != nil {
+		return err
+	}
+	if h.Type == frameData {
+		if c.dataBytes == nil {
+			c.dataBytes = make(map[uint32]int64)
+		}
+		n := h.Length
+		if h.Flags&flagPadded != 0 && len(body) > 0 {
+			n -= 1 + int(body[0])
+		}
+		c.dataBytes[h.Stream] += int64(max(n, 0))
+	}
+	if h.Flags&flagEndStream != 0 && (h.Type == frameData || h.Type == frameHeaders) || h.Type == frameRST {
+		delete(c.dataBytes, h.Stream)
+		if reset, ok := c.dataResets[h.Stream]; ok {
+			delete(c.dataResets, h.Stream)
+			close(reset.done)
+		}
+	}
+	return nil
 }
 
 func clamp(v, low, high int64) int64 { return max(low, min(high, v)) }
 
 func (c *Conn) reset(stream, code uint32) error {
 	c.forgetPlan(stream)
+	delete(c.dataBytes, stream)
+	if pending, ok := c.dataResets[stream]; ok {
+		delete(c.dataResets, stream)
+		close(pending.done)
+	}
 	if _, dead := c.dead[stream]; dead {
 		return nil
 	}

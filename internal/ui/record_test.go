@@ -3,6 +3,7 @@ package ui
 import (
 	"bytes"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,27 @@ func TestStoppedTapeFreezesConfigChangesAndSequenceGaps(t *testing.T) {
 	}
 	if len(doc.ConfigChanges) != 1 || doc.ConfigChanges[0].BeforeSeq != 8 || doc.ConfigChanges[0].Seed != 29 || !doc.ConfigChanges[0].Rules[0].Enabled {
 		t.Fatalf("config timeline = %+v", doc.ConfigChanges)
+	}
+}
+
+func TestRecordingAfterBurstConsumptionIsIncomplete(t *testing.T) {
+	cfg := fault.Config{Rules: []fault.Rule{{ID: "burst", Enabled: true, Fault: fault.Fault{
+		Type: "rate-limit", Params: map[string]any{"burst": 1},
+	}}}}
+	p := proxy.New(nil, cfg, nil)
+	defer p.Close()
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Host = "127.0.0.1"
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("initial status %d", w.Code)
+	}
+	rec := NewRecorder()
+	rec.Start(p)
+	doc, err := rec.Export("after-burst")
+	if err != nil || !doc.Incomplete || !strings.Contains(doc.IncompleteReason, "burst") {
+		t.Fatalf("recording %+v, err %v", doc, err)
 	}
 }
 

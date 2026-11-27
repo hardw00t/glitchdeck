@@ -62,7 +62,7 @@ func TestRateLimitProviderWire(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := "Retry-After: 2\n"
-			if tc.provider != "" {
+			if tc.provider != "" && tc.provider != "gemini" {
 				want += "Retry-After-Ms: 0\n"
 			}
 			want += tc.headers + "X-Glitchdeck-Fault: rate-limit\n"
@@ -145,5 +145,63 @@ func TestRateLimitBurstConcurrent(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 429 {
 		t.Fatalf("first request after reset = %d", resp.StatusCode)
+	}
+}
+
+func TestRateLimitBurstUsesCurrentRuleNotMatchHistory(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer up.Close()
+	target, err := ParseTarget(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := fault.Config{Rules: []fault.Rule{{ID: "limit", Enabled: true, Fault: fault.Fault{Type: "latency-wave"}}}}
+	p := New(target, cfg, nil)
+	defer p.Close()
+	request := func(want int) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.Host = "127.0.0.1"
+		p.ServeHTTP(w, r)
+		if w.Code != want {
+			t.Fatalf("request %d: status %d, want %d", p.Seq(), w.Code, want)
+		}
+	}
+	request(200)
+	request(200)
+	cfg = rateLimitConfig(map[string]any{"burst": 2})
+	p.SetConfig(cfg)
+	request(429)
+	cfg.Seed++
+	p.SetConfig(cfg)
+	request(429)
+	request(200)
+	cfg.Rules[0].Fault.Params["status"] = 503
+	p.SetConfig(cfg)
+	request(503)
+	request(503)
+	request(200)
+	if stats := p.Stats()["limit"]; stats.Matched != 8 || stats.Applied != 6 {
+		t.Fatalf("reporting totals were reset: %+v", stats)
+	}
+}
+
+func TestRateLimitResetTimeStartsAfterRecording(t *testing.T) {
+	p := New(nil, rateLimitConfig(map[string]any{"provider": "anthropic", "reset_sec": 1}), nil)
+	defer p.Close()
+	var writtenAfter time.Time
+	p.OnRequest = func(Record) {
+		tick := time.Now().Truncate(time.Second).Add(time.Second)
+		time.Sleep(time.Until(tick))
+		writtenAfter = time.Now()
+	}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("test"))
+	r.Host = "127.0.0.1"
+	p.ServeHTTP(w, r)
+	reset, err := time.Parse(time.RFC3339, w.Result().Header.Get("Anthropic-Ratelimit-Requests-Reset"))
+	if err != nil || !reset.After(writtenAfter) {
+		t.Fatalf("reset %v is not after response preparation %v (%v)", reset, writtenAfter, err)
 	}
 }

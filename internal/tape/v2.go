@@ -8,8 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -64,6 +66,7 @@ type streamEvidence struct {
 	Events    int
 	ValidJSON bool
 	MaxGapMS  int64
+	Inspected bool
 }
 
 func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPool) streamEvidence {
@@ -71,6 +74,10 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 }
 
 func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []string, root ...*x509.CertPool) streamEvidence {
+	return runStreamWithAdmission(ctx, base, s, extra, "", nil, root...)
+}
+
+func runStreamWithAdmission(ctx context.Context, base string, s Stream, extra []string, runID string, admission <-chan []string, root ...*x509.CertPool) streamEvidence {
 	result := streamEvidence{End: "eof", Terminal: "none", ValidJSON: true}
 	if s.MaxMS <= 0 {
 		s.MaxMS = 30000
@@ -95,6 +102,9 @@ func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []
 	}
 	for k, v := range s.Headers {
 		req.Header.Set(k, v)
+	}
+	if runID != "" {
+		req.Header.Set(proxy.SSEAdmissionHeader, runID)
 	}
 	var roots *x509.CertPool
 	if len(root) != 0 {
@@ -145,6 +155,18 @@ func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []
 	}
 	defer resp.Body.Close()
 	result.Status = resp.StatusCode
+	if admission != nil {
+		select {
+		case extra = <-admission:
+		default:
+		}
+	}
+	media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	encoding := strings.TrimSpace(resp.Header.Get("Content-Encoding"))
+	if media != "text/event-stream" || (encoding != "" && !strings.EqualFold(encoding, "identity")) {
+		return result
+	}
+	result.Inspected = true
 	if (s.Proto == "h2" || s.Proto == "h2c") && resp.ProtoMajor != 2 {
 		result.End = "error"
 		return result
@@ -156,6 +178,7 @@ func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []
 	frames := make(chan item, 1)
 	go func() {
 		r := sse.NewReader(resp.Body, 0)
+		r.LimitFrameLines(64 << 10)
 		for {
 			frame, e := r.Next()
 			select {
@@ -187,8 +210,11 @@ func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []
 		case x := <-frames:
 			if x.err != nil {
 				if x.err != io.EOF {
+					if errors.Is(x.err, sse.ErrLineTooLong) {
+						result.Inspected = false
+					}
 					result.End = "rst"
-				} else if result.Events > 0 && result.Terminal != "error" {
+				} else if result.Events > 0 && result.Terminal == "none" {
 					result.End = "eof_early"
 				}
 				return result
@@ -215,14 +241,13 @@ func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []
 			if kind, ok := x.frame.Terminal(extra); ok && result.Terminal == "none" {
 				result.Terminal = kind
 				result.Done = kind != "error"
-				switch kind {
-				case "error":
-					continue // Observe whether the provider error ends with EOF or a reset.
-				case "done_marker":
-					result.End = "done"
-				default:
-					result.End = "eof"
-				}
+			}
+			if x.frame.IsDone() {
+				result.End = "done"
+				return result
+			}
+			if x.frame.Event == "message_stop" {
+				result.End = "eof"
 				return result
 			}
 		}
@@ -376,6 +401,9 @@ func checkStream(a Assertion, e streamEvidence) []string {
 	x := a.ExpectSSE
 	if x == nil {
 		return out
+	}
+	if !e.Inspected {
+		return append(out, "SSE response was not inspected")
 	}
 	add := func(field string, want, got any) {
 		out = append(out, fmt.Sprintf("%s: expected %v, got %v", field, want, got))

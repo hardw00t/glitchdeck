@@ -11,11 +11,11 @@ import (
 func rateLimitResponse(h http.Header, params map[string]any, status int, seq uint64, now time.Time) string {
 	h.Set("Retry-After", strconv.Itoa(fault.Int(params, "retry_after_sec", 5)))
 	h.Set("X-Glitchdeck-Fault", "rate-limit")
-	if _, ok := params["retry_after_ms"]; ok {
+	provider := fault.String(params, "provider", "none")
+	if _, ok := params["retry_after_ms"]; ok && provider != "gemini" {
 		h.Set("Retry-After-Ms", strconv.Itoa(fault.Int(params, "retry_after_ms", 0)))
 	}
 	body := fault.String(params, "body", "")
-	provider := fault.String(params, "provider", "none")
 	reset := fault.Int(params, "reset_sec", 0)
 	switch provider {
 	case "openai":

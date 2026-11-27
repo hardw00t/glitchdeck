@@ -8,6 +8,8 @@ import (
 const (
 	historySize    = 4096
 	subscriberSize = 256
+	historyBytes   = 8 << 20
+	maxEventBytes  = 64 << 10
 )
 
 // Event's ID continues across resets so a reconnect never mistakes fresh events for duplicates.
@@ -22,6 +24,7 @@ type Bus struct {
 	id           uint64
 	ring         [historySize]Event
 	write, count int
+	bytes        int
 	subs         map[chan Event]struct{}
 	observer     func(Event)
 }
@@ -36,7 +39,7 @@ func (b *Bus) SetObserver(observer func(Event)) {
 
 func (b *Bus) Publish(kind string, data any) {
 	payload, err := json.Marshal(data)
-	if err != nil {
+	if err != nil || len(payload)+len(kind) > maxEventBytes {
 		return
 	}
 	b.mu.Lock()
@@ -47,9 +50,18 @@ func (b *Bus) Publish(kind string, data any) {
 		b.observer(e)
 	}
 	if kind == "http_req" || kind == "ws_frame" || kind == "sse_event" || kind == "grpc_call" || kind == "tls_handshake_failed" {
+		size := len(payload) + len(kind)
+		for b.count == len(b.ring) || b.bytes+size > historyBytes {
+			i := (b.write - b.count + len(b.ring)) % len(b.ring)
+			old := b.ring[i]
+			b.bytes -= len(old.Data) + len(old.Type)
+			b.ring[i] = Event{}
+			b.count--
+		}
 		b.ring[b.write] = e
 		b.write = (b.write + 1) % len(b.ring)
-		b.count = min(b.count+1, len(b.ring))
+		b.count++
+		b.bytes += size
 	}
 	for ch := range b.subs {
 		select {
@@ -100,7 +112,7 @@ func (b *Bus) Clear() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	clear(b.ring[:])
-	b.write, b.count = 0, 0
+	b.write, b.count, b.bytes = 0, 0, 0
 	for ch := range b.subs {
 		for range len(ch) {
 			select {
