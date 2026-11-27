@@ -495,6 +495,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		e.SetResults([]tape.Result{result})
 	}
 	expected := t.Expect.ChildExit
+	if expected == nil {
+		expected = 0
+	}
 	matched := e.Exec.ExitCode == 0
 	switch v := expected.(type) {
 	case int:

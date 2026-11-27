@@ -138,24 +138,28 @@ func TestExecExitCodesAndSecretRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := []struct {
-		name    string
-		cmd     []string
-		timeout time.Duration
-		want    int
+		name     string
+		cmd      []string
+		timeout  time.Duration
+		want     int
+		wantDiff string
 	}{
-		{"success", []string{"sh", "-c", "exit 0"}, 0, 0},
-		{"mismatch", []string{"sh", "-c", "exit 1"}, 0, 1},
-		{"usage", nil, 0, 2},
-		{"timeout", []string{"sh", "-c", "sleep 5"}, 50 * time.Millisecond, 124},
-		{"start failure", []string{invalid}, 0, 125},
-		{"permission", []string{denied}, 0, 126},
-		{"not found", []string{filepath.Join(dir, "missing")}, 0, 127},
+		{"success", []string{"sh", "-c", "exit 0"}, 0, 0, ""},
+		{"mismatch", []string{"sh", "-c", "exit 7"}, 0, 1, "child_exit: expected 0, got 7"},
+		{"usage", nil, 0, 2, ""},
+		{"timeout", []string{"sh", "-c", "sleep 5"}, 50 * time.Millisecond, 124, ""},
+		{"start failure", []string{invalid}, 0, 125, ""},
+		{"permission", []string{denied}, 0, 126, ""},
+		{"not found", []string{filepath.Join(dir, "missing")}, 0, 127, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: tc.cmd, Timeout: tc.timeout, Grace: 50 * time.Millisecond, JSON: true})
 			if r.ExitCode != tc.want {
 				t.Fatalf("exit %d, want %d: %+v", r.ExitCode, tc.want, r)
+			}
+			if diff := strings.Join(r.Diff, "\n"); diff != tc.wantDiff {
+				t.Fatalf("diff %q, want %q", diff, tc.wantDiff)
 			}
 		})
 	}

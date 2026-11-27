@@ -293,16 +293,20 @@ func reportCommand(args []string) int {
 		return 0
 	}
 	if *github {
-		escape := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
-		for _, line := range e.Diff {
-			fmt.Printf("::error::%s\n", escape.Replace(line))
-		}
+		failures := e.Diff
 		if failure, ok := e.Error.(map[string]any); ok {
 			message, _ := failure["message"].(string)
 			code, _ := failure["code"].(string)
 			if message != "" {
-				fmt.Printf("::error::%s\n", escape.Replace(code+": "+message))
+				if code != "" {
+					message = code + ": " + message
+				}
+				failures = append(failures, message)
 			}
+		}
+		escape := strings.NewReplacer("%", "%25", "\r", "%0D", "\n", "%0A")
+		for _, line := range failures {
+			fmt.Printf("::error::%s\n", escape.Replace(line))
 		}
 		if e.OK {
 			fmt.Println("::notice::Glitchdeck expectations passed")
@@ -313,7 +317,7 @@ func reportCommand(args []string) int {
 				fmt.Fprintln(os.Stderr, err)
 				return 3
 			}
-			_, err = fmt.Fprintf(out, "## Glitchdeck\n\n| Exit | Assertions passed | Assertions failed |\n| --- | --- | --- |\n| %d | %d | %d |\n", e.ExitCode, e.Summary.AssertionsPassed, e.Summary.AssertionsFailed)
+			_, err = io.WriteString(out, githubSummary(e, failures))
 			closeErr := out.Close()
 			if err != nil || closeErr != nil {
 				fmt.Fprintln(os.Stderr, errors.Join(err, closeErr))
@@ -327,4 +331,46 @@ func reportCommand(args []string) int {
 		fmt.Printf("Exit code: %d\n", e.ExitCode)
 	}
 	return 0
+}
+
+func githubSummary(e execrun.Envelope, failures []string) string {
+	var summary strings.Builder
+	summary.WriteString("## Glitchdeck\n\n| Exit code |")
+	childHeading, childSeparator, childValue := "", "", ""
+	if e.Command == "exec" && e.Exec != nil {
+		childHeading, childSeparator = " Child exit code |", " --- |"
+		childValue = fmt.Sprintf(" %d |", e.Exec.ExitCode)
+	}
+	fmt.Fprintf(&summary, "%s Requests total | Faults triggered | Assertions passed | Assertions failed |\n", childHeading)
+	fmt.Fprintf(&summary, "| --- |%s --- | --- | --- | --- |\n", childSeparator)
+	fmt.Fprintf(&summary, "| %d |%s %d | %d | %d | %d |\n", e.ExitCode, childValue,
+		e.Summary.RequestsTotal, e.Summary.FaultsTriggered, e.Summary.AssertionsPassed, e.Summary.AssertionsFailed)
+
+	escape := strings.NewReplacer(
+		"\r\n", " ", "\r", " ", "\n", " ",
+		"\\", "\\\\", "|", "\\|", "`", "\\`", "*", "\\*", "_", "\\_", "[", "\\[", "]", "\\]", "~", "\\~",
+		"&", "&amp;", "<", "&lt;", ">", "&gt;",
+	)
+	if len(e.FaultsTriggered) > 0 {
+		summary.WriteString("\n**Faults by rule**\n\n")
+		for _, entry := range e.FaultsTriggered {
+			fault, ok := entry.(map[string]any)
+			if !ok {
+				continue
+			}
+			rule, _ := fault["rule_id"].(string)
+			kind, _ := fault["type"].(string)
+			count, ok := fault["count"].(float64)
+			if ok {
+				fmt.Fprintf(&summary, "- %s (%s): %.0f\n", escape.Replace(rule), escape.Replace(kind), count)
+			}
+		}
+	}
+	if len(failures) > 0 {
+		summary.WriteString("\n**Failures**\n\n")
+		for _, line := range failures {
+			fmt.Fprintf(&summary, "- %s\n", escape.Replace(line))
+		}
+	}
+	return summary.String()
 }

@@ -220,7 +220,7 @@ In another repository, pin a release tag (or the floating major tag):
 - uses: actions/checkout@v4
 - uses: hardw00t/glitchdeck@v2
   with:
-    tape: examples/clean.tape.yaml
+    tape: tapes/checkout.tape.yaml
 ```
 
 For a published action ref, omit `version` to use that ref. The action uses verified release binaries when available for the requested release, with a Go build for source refs. It exposes `exit-code` and the JSON `report` path.
