@@ -123,6 +123,15 @@ To run the [composite action](action.yml) from a checkout of this repository:
     version: local
 ```
 
+In another repository, pin a release tag (or the floating major tag):
+
+```yaml
+- uses: actions/checkout@v4
+- uses: hardw00t/glitchdeck@v2
+  with:
+    tape: tapes/checkout.tape.yaml
+```
+
 For a published action ref, omit `version` to use that ref. The action uses verified release binaries when available for the requested release, with a Go build for source refs. It exposes `exit-code` and the JSON `report` path.
 
 ## Console screenshots
