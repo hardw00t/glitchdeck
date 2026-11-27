@@ -210,7 +210,7 @@ func (p *Proxy) TrafficStats() TrafficStats {
 		InnerUsable: p.innerUsable.Load(), InterceptedEmpty: p.interceptedEmpty.Load(),
 		PassthroughOK: p.passthroughOK.Load(), BlindOK: p.blindOK.Load(),
 		EgressDenied: p.connectEgressDenied.Load() + innerDenied, InnerEgressDenied: innerDenied,
-		DialFailed: p.dialFailed.Load() + reverseFailed, ReverseDialFailed: reverseFailed}
+		DialFailed: p.dialFailed.Load(), ReverseDialFailed: reverseFailed}
 }
 func (p *Proxy) SetSeq(n uint64)       { p.gate.Lock(); p.seq.Store(n); p.gate.Unlock() }
 func (p *Proxy) ActiveWebSockets() int { p.gate.Lock(); defer p.gate.Unlock(); return p.activeWS }
@@ -528,22 +528,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	scheme, host := r.URL.Scheme, r.URL.Host
 	if r.URL.IsAbs() {
 		if r.URL.User != nil || (scheme != "http" && scheme != "https") || !p.allowed(r.URL.Hostname(), upstreamPort(scheme, r.URL.Port())) {
-			p.innerEgressDenied.Add(1)
-			if p.options.OnEgressDenied != nil {
-				p.options.OnEgressDenied(r.URL.Host)
-			}
+			deniedHost := p.noteEgressDenial(r.URL.Host, false)
 			http.Error(w, "egress denied", http.StatusForbidden)
 			if seq, gen := p.tunnelSequence(); seq != 0 {
-				p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", 0, 0)
+				p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", deniedHost, 0, 0)
 			}
 			return
 		}
 	} else if p.target != nil {
 		if p.options.RequireUpstreamAllow && !p.allowed(p.target.Hostname(), upstreamPort(p.target.Scheme, p.target.Port())) {
-			p.innerEgressDenied.Add(1)
-			if p.options.OnEgressDenied != nil {
-				p.options.OnEgressDenied(p.target.Host)
-			}
+			p.noteEgressDenial(p.target.Host, false)
 			http.Error(w, "egress denied", http.StatusForbidden)
 			return
 		}
@@ -668,6 +662,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.countRule(gen, rule, "applied", "")
 	}
 	status, n, end := 0, int64(0), "complete"
+	var dialFailure, deniedHost string
 	runID := r.Header.Get("X-Glitchdeck-Run")
 	var body []byte
 	var streamedBytes atomic.Int64
@@ -695,7 +690,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if proto == "h2" && !isGRPC {
 				protocol = "h2"
 			}
-			p.publish(gen, "http_req", map[string]any{
+			event := map[string]any{
 				"seq": seq, "ts_ms": start.UnixMilli(), "method": r.Method, "path": r.URL.RequestURI(),
 				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": streamedBytes.Load(), "resp_bytes": n,
 				"fault": kind, "replay_index": 0, "request_headers": inspectorHeaders(r.Header),
@@ -703,7 +698,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": snippet,
 				"proto": r.Proto, "protocol": protocol, "scheme": scheme, "host": host, "stream_id": streamID, "sse": isSSE,
 				"sse_events": sseEvents, "grpc_status": grpcStatus, "fault_action": action, "fault_skipped": skip, "end": end, "run_id": runID, "tunnel": tunnel,
-			})
+			}
+			if dialFailure == "egress_denied" {
+				delete(event, "path")
+				delete(event, "host")
+				if deniedHost != "" {
+					event["host"] = deniedHost
+				}
+				event["error"] = dialFailure
+			}
+			p.publish(gen, "http_req", event)
 		}()
 	}
 	if runID != "" {
@@ -883,8 +887,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		end = "client_cancel"
 		panic(http.ErrAbortHandler)
 	}
-	if !r.URL.IsAbs() && !meta.MITM && p.target != nil {
+	reverse := !r.URL.IsAbs() && !meta.MITM && p.target != nil
+	if reverse {
 		ctx = context.WithValue(ctx, reverseTargetKey{}, true)
+	}
+	if buffered {
+		origin := &replayDialOrigin{client: incoming.Context(), reverse: reverse}
+		r = r.WithContext(context.WithValue(r.Context(), replayDialOriginKey{}, origin))
+		defer func() {
+			if origin.client.Err() == nil {
+				origin.completed.Store(true)
+			}
+		}()
 	}
 	mode := fault.String(params, "mode", "sequential")
 	var releaseTimeout func(bool, string, int)
@@ -980,6 +994,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		releaseReplay(true)
 	}
 	resp, err := transport.RoundTrip(q)
+	dialFailure, deniedHost = p.noteRoundTripDial(incoming.Context(), gen, q.URL.Host, reverse, err)
 	if releaseTimeout != nil {
 		originalOutcome := ""
 		committedStatus := 0

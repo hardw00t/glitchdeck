@@ -302,10 +302,18 @@ func TestTrafficHostsKeepSmallestNormalizedNames(t *testing.T) {
 	var hosts trafficHosts
 	for _, authority := range []string{"z.test:443", "I.TEST.", "h.test", "g.test", "f.test", "e.test", "d.test", "c.test", "B.test",
 		"a.test", "b.test", "user@J.\ntest:443/path?query=value", strings.Repeat("a", 254) + ".test"} {
-		hosts.addDenied(authority)
+		hosts.addDenied(proxy.DiagnosticHostname(authority))
 	}
-	if got := strings.Join(hosts.deniedSnapshot(""), ", "); got != "a.test, b.test, c.test, d.test, e.test, f.test, g.test, h.test, i.test, j.test" {
+	if got := strings.Join(hosts.deniedSnapshot(), ", "); got != "a.test, b.test, c.test, d.test, e.test, f.test, g.test, h.test, i.test, j.test" {
 		t.Fatalf("hosts = %q", got)
+	}
+}
+
+func TestOversizedDeniedAuthorityIsOmitted(t *testing.T) {
+	var hosts trafficHosts
+	hosts.addDenied(proxy.DiagnosticHostname("example.test:" + strings.Repeat("0", 1024) + "80"))
+	if got := hosts.deniedSnapshot(); len(got) != 0 {
+		t.Fatalf("retained oversized authority: %q", got)
 	}
 }
 
@@ -318,7 +326,7 @@ func TestTrafficEvidenceReset(t *testing.T) {
 	failures.observe(tls)
 	hosts.reset()
 	failures.reset()
-	if hosts.tlsList() != "" || len(hosts.deniedSnapshot("")) != 0 {
+	if hosts.tlsList() != "" || len(hosts.deniedSnapshot()) != 0 {
 		t.Fatal("reset retained old hosts")
 	}
 	if count, details := failures.snapshot(); count != 0 || len(details) != 0 {

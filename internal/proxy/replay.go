@@ -10,10 +10,20 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
 )
+
+type replayDialOriginKey struct{}
+
+// Accounting-only metadata. A replay never inherits the reverse policy key.
+type replayDialOrigin struct {
+	client    context.Context
+	reverse   bool
+	completed atomic.Bool // Set before the server cancels a normally completed request.
+}
 
 type replayTiming struct {
 	mu          sync.Mutex
@@ -281,6 +291,10 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 		clock.start()
 	}
 	resp, err := transport.RoundTrip(q)
+	var dialFailure, deniedHost string
+	if origin, _ := r.Context().Value(replayDialOriginKey{}).(*replayDialOrigin); origin != nil && (origin.client.Err() == nil || origin.completed.Load()) {
+		dialFailure, deniedHost = p.noteRoundTripDial(replayCtx, gen, q.URL.Host, origin.reverse, err)
+	}
 	if clock != nil {
 		clock.record()
 	}
@@ -317,6 +331,13 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 	}
 	event := map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "rule_id": rule.ID, "applied": outcome != "egress_denied", "replay_index": index, "replay_mode": mode, "outcome": outcome}
+	if dialFailure == "egress_denied" {
+		delete(event, "path")
+		if deniedHost != "" {
+			event["host"] = deniedHost
+		}
+		event["error"] = dialFailure
+	}
 	if mode == "timeout_retry" {
 		event["original_outcome"] = originalOutcome
 		event["committed_status"] = committedStatus

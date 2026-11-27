@@ -180,10 +180,11 @@ func testTape(args []string) int {
 	if failed {
 		code = 1
 	}
-	envelope := execrun.NewEnvelope("test", filename, t.Target)
+	reportTarget := t.Target
 	if *target != "" {
-		envelope.Target = *target
+		reportTarget = *target
 	}
+	envelope := execrun.NewEnvelope("test", filename, reportTarget)
 	envelope.ExitCode = code
 	envelope.OK = !failed
 	envelope.DurationMS = time.Since(started).Milliseconds()

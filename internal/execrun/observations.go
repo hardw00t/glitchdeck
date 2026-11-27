@@ -3,13 +3,12 @@ package execrun
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/url"
 	"sort"
 	"strings"
 	"sync"
-	"unicode"
 
+	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
@@ -51,36 +50,11 @@ func (c *trafficHosts) observe(e telemetry.Event) {
 	if json.Unmarshal(e.Data, &data) != nil {
 		return
 	}
-	c.add(&c.tls, diagnosticHostname(data.Host), 5)
+	c.add(&c.tls, proxy.DiagnosticHostname(data.Host), 5)
 }
 
-func (c *trafficHosts) addDenied(authority string) {
-	c.add(&c.denied, diagnosticHostname(authority), 10)
-}
-
-func diagnosticHostname(authority string) string {
-	authority = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return -1
-		}
-		return r
-	}, authority)
-	u, err := url.Parse("//" + authority)
-	if err != nil {
-		return ""
-	}
-	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
-	if len(host) > 253 {
-		return ""
-	}
-	if net.ParseIP(host) == nil {
-		for _, r := range host {
-			if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !unicode.IsMark(r) && r != '-' && r != '.' && r != '_' {
-				return ""
-			}
-		}
-	}
-	return host
+func (c *trafficHosts) addDenied(host string) {
+	c.add(&c.denied, host, 10)
 }
 
 func (c *trafficHosts) add(list *[]string, host string, limit int) {
@@ -106,16 +80,10 @@ func (c *trafficHosts) tlsList() string {
 	return strings.Join(c.tls, ", ")
 }
 
-func (c *trafficHosts) deniedSnapshot(proxyToken string) []string {
+func (c *trafficHosts) deniedSnapshot() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var out []string
-	for _, host := range c.denied {
-		if proxyToken == "" || !strings.Contains(host, proxyToken) {
-			out = append(out, host)
-		}
-	}
-	return out
+	return append([]string(nil), c.denied...)
 }
 
 func (c *tlsFailureEvidence) observe(e telemetry.Event) {

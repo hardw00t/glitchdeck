@@ -65,12 +65,9 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		p.callback(gen, func() { p.OnBlindTunnel(seq) })
 	}
 	if !valid {
-		p.connectEgressDenied.Add(1)
-		if p.options.OnEgressDenied != nil {
-			p.options.OnEgressDenied(r.Host)
-		}
+		deniedHost := p.noteEgressDenial(r.Host, true)
 		http.Error(w, "egress denied", http.StatusForbidden)
-		p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", 0, 0)
+		p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", deniedHost, 0, 0)
 		return
 	}
 	if ctx.Err() != nil {
@@ -91,11 +88,11 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		stop := context.AfterFunc(ctx, cancel)
 		upstream, err = p.dial(dialCtx, "tcp", r.Host)
 		stop()
+		failure, deniedHost := p.noteDialResult(dialCtx, gen, r.Host, false, true, err)
 		cancel()
 		if err != nil {
-			p.dialFailed.Add(1)
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
-			p.tunnelEvent(r, start, seq, gen, 502, tunnel, pattern, "dial_failed", 0, 0)
+			p.tunnelEvent(r, start, seq, gen, 502, tunnel, pattern, failure, deniedHost, 0, 0)
 			return
 		}
 		defer upstream.Close()
@@ -166,7 +163,7 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p.blindOK.Add(1)
 	}
-	p.tunnelEvent(r, start, seq, gen, 200, tunnel, pattern, "", sent, fromUp)
+	p.tunnelEvent(r, start, seq, gen, 200, tunnel, pattern, "", "", sent, fromUp)
 }
 
 func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn string, failed func(string, error)) (net.Conn, ConnMeta, bool) {
@@ -277,7 +274,7 @@ func closeWrite(c net.Conn) {
 	}
 }
 
-func (p *Proxy) tunnelEvent(r *http.Request, t time.Time, seq, gen uint64, status int, tunnel, pattern, failure string, in, out int64) {
+func (p *Proxy) tunnelEvent(r *http.Request, t time.Time, seq, gen uint64, status int, tunnel, pattern, failure, deniedHost string, in, out int64) {
 	if seq == 0 {
 		return
 	}
@@ -285,6 +282,13 @@ func (p *Proxy) tunnelEvent(r *http.Request, t time.Time, seq, gen uint64, statu
 		"seq": seq, "ts_ms": t.UnixMilli(), "method": r.Method, "path": r.Host, "host": r.Host, "proto": r.Proto,
 		"status": status, "tunnel": tunnel, "req_bytes": in, "resp_bytes": out, "latency_ms": time.Since(t).Milliseconds(),
 		"fault": "", "error": failure, "replay_index": 0,
+	}
+	if failure == "egress_denied" {
+		delete(event, "path")
+		delete(event, "host")
+		if deniedHost != "" {
+			event["host"] = deniedHost
+		}
 	}
 	if pattern != "" {
 		event["passthrough"] = pattern

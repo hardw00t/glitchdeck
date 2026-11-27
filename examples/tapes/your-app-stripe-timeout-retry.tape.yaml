@@ -8,5 +8,6 @@ rules:
     match: {method: POST, path_prefix: /webhooks/stripe, seq: [1]}
     fault: {type: dup-webhook, params: {mode: timeout_retry, count: 2, delay_ms: 500, replay_timeout_ms: 10000, client_result: gateway_timeout}}
 expect:
+  # Senders may exit nonzero on the 504. Tighten this to your sender's exact 504 exit code.
   child_exit: any
   faults: [{rule: commit-then-timeout, min_applied: 1}]

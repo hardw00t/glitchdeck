@@ -83,11 +83,15 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	dialCtx, stopDial := context.WithTimeout(ctx, 5*time.Second)
 	defer stopDial()
 	addr := net.JoinHostPort(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port()))
-	if !r.URL.IsAbs() && !MetaFrom(r.Context()).MITM && p.target != nil {
+	reverse := !r.URL.IsAbs() && !MetaFrom(r.Context()).MITM && p.target != nil
+	if reverse {
 		dialCtx = context.WithValue(dialCtx, reverseTargetKey{}, true)
 	}
 	up, err := p.dial(dialCtx, "tcp", addr)
 	if err != nil {
+		if failure, host := p.noteDialResult(ctx, gen, q.URL.Host, reverse, false, err); failure == "egress_denied" {
+			p.tunnelEvent(r, time.Now(), seq, gen, 502, "", "", failure, host, 0, 0)
+		}
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		w.Header().Set(TransportErrorHeader, "1")
 		http.Error(w, "upstream unavailable", 502)

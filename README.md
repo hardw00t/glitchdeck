@@ -139,7 +139,7 @@ glitchdeck exec --tape examples/tapes/your-app-stripe-concurrent-race.tape.yaml 
 
 - **Concurrent delivery:** `mode: concurrent` starts the original and four copies together. Use it to test whether a check-then-insert handler can process the same event twice.
 - **Commit then retry:** switch to `examples/tapes/your-app-stripe-timeout-retry.tape.yaml` to observe the injected `504`. The original reaches the receiver before the timeout response; the same event is then retried.
-  The tape accepts both zero and nonzero sender exits because some senders treat the `504` as a failure.
+  `expect.child_exit: any` accepts senders that exit either zero or nonzero on the `504`. To catch unrelated sender failures, set `child_exit` to the exact exit code your sender uses for a `504`.
 - **Read the original status, copy histogram, and database together:** `faults_triggered[].replays.status` counts copy responses and `outcomes` groups their results. The original can receive `409` if a copy inserts first. Across all five deliveries, five `200`s and five rows means duplicate processing; one `200` and four `409`s, or five `200`s and one row, means deduplication.
 
 ### WebSocket silent drop

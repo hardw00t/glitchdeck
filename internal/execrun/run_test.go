@@ -24,6 +24,7 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
+	"github.com/hardw00t/glitchdeck/internal/testutil"
 	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 )
 
@@ -615,6 +616,20 @@ func TestExecTrafficChecks(t *testing.T) {
 			}
 		}
 		if mode == "mixed" {
+			token, ok := p.User.Password()
+			if !ok {
+				t.Fatal("missing proxy authentication")
+			}
+			for _, authority := range []string{token + ".example.test", "oversized.example.test:" + strings.Repeat("0", 1024) + "80"} {
+				resp, err := client.Get("http://" + authority + "/unreported?fixture=value")
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusForbidden {
+					t.Fatalf("denied request got %d, want 403", resp.StatusCode)
+				}
+			}
 			tr := &http.Transport{Proxy: http.ProxyURL(p), TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS11, MaxVersion: tls.VersionTLS11}}
 			defer tr.CloseIdleConnections()
 			if _, err := (&http.Client{Transport: tr, Timeout: 3 * time.Second}).Get("https://127.0.0.1:443/"); err == nil {
@@ -663,7 +678,7 @@ func TestExecTrafficChecks(t *testing.T) {
 		{mode: "oversized denial", diff: "egress_denied_only:", want: 1, denied: 1},
 		{mode: "rejected", diff: "tls_rejected_only:", want: 1, rejected: 1},
 		{mode: "rejected_nonzero", allow: true, childExit: "nonzero", rejected: 1},
-		{mode: "mixed", rejected: 1, denied: 1},
+		{mode: "mixed", rejected: 1, denied: 3},
 		{mode: "broken upstream", diff: "tls_rejected_only:", want: 1, rejected: 1},
 		{mode: "idle", diff: "Go net/http (and some other clients) never proxy localhost/127.0.0.1", want: 1},
 		{mode: "java", diff: "JVM ignores HTTP(S)_PROXY; set -Dhttps.proxyHost/-Dhttps.proxyPort via JAVA_TOOL_OPTIONS", want: 1},
@@ -704,13 +719,13 @@ func TestExecTrafficChecks(t *testing.T) {
 				os.Stderr = logs
 				defer func() { os.Stderr = old }()
 			}
-			r := Run(context.Background(), tp, Options{TLS: true, JSON: true, AllowZeroTraffic: tc.allow, Command: command})
+			r := Run(context.Background(), tp, Options{TLS: true, JSON: true, AllowZeroTraffic: tc.allow, Command: command, ProxyAuth: tc.mode == "mixed"})
 			if logs != nil {
 				data, err := os.ReadFile(logs.Name())
 				const warning = "warning: tls_rejected: 1 handshake(s) failed for hosts 127.0.0.1\n"
 				report, marshalErr := json.Marshal(r.Exec.Traffic)
 				if marshalErr != nil || !strings.Contains(string(report), `"egress_denied_hosts":["example.com"]`) ||
-					!strings.Contains(string(data), "egress denied 1 (hosts: example.com)") {
+					!strings.Contains(string(data), "egress denied 3 (hosts: example.com)") {
 					t.Errorf("missing denied host: traffic=%s, stderr=%q, err=%v", report, data, marshalErr)
 				}
 				if err != nil || strings.Count(string(data), warning) != 1 || strings.Count(string(data), "tls_handshake_failed:") != 1 ||
@@ -723,6 +738,41 @@ func TestExecTrafficChecks(t *testing.T) {
 				t.Fatalf("%+v; traffic %+v", r, r.Exec.Traffic)
 			}
 		})
+	}
+}
+
+func TestSerializedExecTargetIsPublic(t *testing.T) {
+	for _, tc := range []struct {
+		target, want string
+	}{
+		{"http://user:fixture@127.0.0.1:3000", ""},
+		{"http://127.0.0.1:3000/?fixture=value", ""},
+		{"http://127.0.0.1:3000/fixture", "http://127.0.0.1:3000"},
+		{"demo", "demo"},
+	} {
+		o := Options{Target: tc.target}
+		if tc.want == "" {
+			o.Command = []string{"unused"}
+		}
+		r := Run(context.Background(), tape.Tape{Version: 2}, o)
+		wire, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var report map[string]json.RawMessage
+		if err := json.Unmarshal(wire, &report); err != nil {
+			t.Fatal(err)
+		}
+		if tc.want == "" {
+			if problem, _ := r.Error.(map[string]string); problem["code"] != "TARGET_INVALID" {
+				t.Errorf("expected target validation failure, got %v", r.Error)
+			}
+			if _, ok := report["target"]; ok {
+				t.Errorf("invalid target appeared in report: %s", wire)
+			}
+		} else if string(report["target"]) != fmt.Sprintf("%q", tc.want) {
+			t.Errorf("target = %s, want %q", report["target"], tc.want)
+		}
 	}
 }
 
@@ -751,18 +801,21 @@ func TestExecRefusedReverseTarget(t *testing.T) {
 		}
 		return
 	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	addr := testutil.RefusedTCPAddr(t)
+	if other, err := net.Listen("tcp", addr); err == nil {
+		other.Close()
+		t.Error("refusal fixture released its address before exec")
 	}
-	addr := l.Addr().String()
-	l.Close()
 	t.Setenv("GD_REFUSED_HELPER", "1")
 	r := Run(context.Background(), tape.Tape{Version: 2}, Options{
-		Target: "http://" + addr + "/upstream-only", AllowZeroTraffic: true,
+		Target: "http://" + strings.Replace(addr, ":", ":"+strings.Repeat("0", 1024), 1) + "/upstream-only", AllowZeroTraffic: true,
 		Command: []string{os.Args[0], "-test.run=^TestExecRefusedReverseTarget$"},
 	})
 	diff := strings.Join(r.Diff, " ")
+	wire, err := json.Marshal(r)
+	if err != nil || strings.Contains(string(wire), "upstream-only") || strings.Contains(string(wire), strings.Repeat("0", 1024)) {
+		t.Errorf("unbounded or unsanitized target in serialized report: %s (%v)", wire, err)
+	}
 	if r.ExitCode != 1 || r.Exec.ExitCode != 0 || r.Exec.Traffic.DialFailed != 2 ||
 		!strings.Contains(diff, "target "+addr+" unreachable") || strings.Contains(diff, "upstream-only") {
 		t.Fatalf("exit=%d child=%d traffic=%+v diff=%q", r.ExitCode, r.Exec.ExitCode, r.Exec.Traffic, diff)

@@ -35,7 +35,7 @@ type Options struct {
 	ProxyAuth            string
 	BeforeRequest        func(uint64)
 	OnAdmission          func(seq uint64, method, path, host string)
-	OnEgressDenied       func(host string)
+	OnEgressDenied       func(host string) // Receives only public, normalized hostnames.
 	OnReset              func()
 	RequireUpstreamAllow bool
 	AllowLoopbackEgress  bool
@@ -306,7 +306,7 @@ func (p *Proxy) DialContext(ctx context.Context, network, addr string) (net.Conn
 	return p.dialWithPolicy(ctx, network, addr, false)
 }
 
-func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restrict bool) (_ net.Conn, err error) {
+func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restrict bool) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -315,13 +315,6 @@ func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restri
 	reverseTarget := configuredTarget && !p.options.RequireUpstreamAllow
 	if !p.allowed(host, port) && !reverseTarget {
 		return nil, errEgressDenied
-	}
-	if configuredTarget {
-		defer func() {
-			if err != nil && !errors.Is(err, errEgressDenied) && !errors.Is(err, context.Canceled) {
-				p.reverseDialFailed.Add(1)
-			}
-		}()
 	}
 	// The operator-configured reverse target is reachable on any listener; clients
 	// cannot choose it, so exposing the proxy does not turn it into an open relay.
@@ -400,7 +393,11 @@ func (p *Proxy) newTransport(h2c, restrict bool) *http.Transport {
 	t := &http.Transport{
 		DisableCompression: true,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return p.dialWithPolicy(ctx, network, address, restrict)
+			conn, err := p.dialWithPolicy(ctx, network, address, restrict)
+			if err != nil {
+				return nil, &transportDialError{err}
+			}
+			return conn, nil
 		},
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        100,

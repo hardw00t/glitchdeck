@@ -107,7 +107,7 @@ type Envelope struct {
 	OK                 bool                    `json:"ok"`
 	ExitCode           int                     `json:"exit_code"`
 	Tape               string                  `json:"tape"`
-	Target             string                  `json:"target"`
+	Target             string                  `json:"target,omitempty"`
 	DurationMS         int64                   `json:"duration_ms"`
 	Summary            Summary                 `json:"summary"`
 	FaultsTriggered    []any                   `json:"faults_triggered"`
@@ -120,8 +120,43 @@ type Envelope struct {
 }
 
 func NewEnvelope(command, path, target string) Envelope {
+	if target != "" && target != "demo" {
+		u, err := proxy.ParseExplicitTarget(target)
+		target = ""
+		if err == nil {
+			if authority := publicTargetAuthority(u, false); authority != "" {
+				target = u.Scheme + "://" + authority
+			}
+		}
+	}
 	return Envelope{SchemaVersion: 2, Command: command, Tape: path, Target: target, FaultsTriggered: []any{}, Assertions: []Assertion{}, Diff: []string{}}
 }
+
+func publicTargetAuthority(u *url.URL, includeDefaultPort bool) string {
+	host := proxy.DiagnosticHostname(u.Hostname())
+	if host == "" {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			return ""
+		}
+		return net.JoinHostPort(host, strconv.FormatUint(n, 10))
+	}
+	if includeDefaultPort {
+		port := "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+		return net.JoinHostPort(host, port)
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
 func (e *Envelope) SetResults(results []tape.Result) {
 	for _, r := range results {
 		if r.Failures == nil {
@@ -228,6 +263,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			}
 		}
 		if err != nil {
+			e.Target = ""
 			return finish(2, "TARGET_INVALID", err)
 		}
 	}
@@ -631,8 +667,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
 	defer cancelDrain()
 	waitErr = p.Drain(drainCtx)
-	childStats := p.TrafficStats()
-	deniedHosts := hosts.deniedSnapshot(opts.ProxyAuth)
+	var childStats proxy.TrafficStats
+	var deniedHosts []string
+	if waitErr == nil {
+		// Dial accounting finishes in handlers and replay workers, before Drain returns.
+		childStats = p.TrafficStats()
+		deniedHosts = hosts.deniedSnapshot()
+	}
 	childFaults := p.AppliedFaults()
 	var httpResults []tape.Result
 	if waitErr == nil {
@@ -694,16 +735,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	failed := e.Summary.AssertionsFailed > 0
 	if childStats.ReverseDialFailed > 0 {
-		port := parsed.Port()
-		if port == "" {
-			port = "80"
-			if parsed.Scheme == "https" {
-				port = "443"
-			}
-		}
 		targetHost := ""
-		if host := diagnosticHostname(parsed.Host); host != "" {
-			targetHost = " " + net.JoinHostPort(host, port)
+		if authority := publicTargetAuthority(parsed, true); authority != "" {
+			targetHost = " " + authority
 		}
 		e.Diff = append(e.Diff, fmt.Sprintf("target%s unreachable: is your app running / is the port right? (%d dial failure(s))", targetHost, childStats.ReverseDialFailed))
 		failed = true

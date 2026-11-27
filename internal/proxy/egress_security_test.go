@@ -243,6 +243,12 @@ func TestDialRejectsDNSResolvedLoopback(t *testing.T) {
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("passthrough CONNECT status = %d, want 502", resp.StatusCode)
 	}
+	if err := p.Wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if stats := p.TrafficStats(); stats.EgressDenied != 1 || stats.DialFailed != 0 {
+		t.Errorf("passthrough policy denial traffic: %+v", stats)
+	}
 }
 
 func TestInterceptedEgressHonorsListenerPolicy(t *testing.T) {
