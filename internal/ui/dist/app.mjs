@@ -124,7 +124,7 @@ const definitions = [
   {
     type: "h2-grpc", name: "H2 / gRPC", desc: "DISRUPT H2 & RPC FRAMES",
     params: {action:"rst_stream"}, match:{probability:100},
-    controls: [["Mode","action","select",[["rst_stream","RST_STREAM"],["goaway","GOAWAY"],["grpc_14","gRPC 14 UNAVAILABLE"],["grpc_4","gRPC 4 DEADLINE"]]],["Rate","probability","range",0,100,1,"%"],["Target","path_prefix","select",[["","ALL"],["/grpc.","/grpc.*"],["/api/","/api/*"]]]],
+    controls: [["Mode","action","select",[["rst_stream","RST_STREAM"],["goaway","GOAWAY"],["grpc_14","gRPC 14 UNAVAILABLE"],["grpc_4","gRPC 4 DEADLINE"]]],["Rate","probability","range",0,100,1,"%"],["Target","path_prefix","select",[["","All"],["/grpc.","/grpc.*"],["/api/","/api/*"]]]],
   },
 ];
 let config = { rules: [] },

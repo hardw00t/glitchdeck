@@ -941,7 +941,8 @@ select {
   .module-desc { font-size: 9px; min-height: 14px; margin: 2px 0 6px; }
   .fire { margin-bottom: 6px; }
   .switch { margin: -8px -4px; }
-  .module.violet .controls, .module.cobalt .controls { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; }
+  .module.violet .controls, .module.cobalt .controls { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px 12px; align-items: end; }
+  .module.violet .control input[type="range"], .module.cobalt .control input[type="range"] { display: block; height: 27px; }
   .module.violet .control:first-child, .module.cobalt .control:first-child { grid-column: 1 / -1; }
 }
 @media (min-width: 801px) and (max-width: 1279px) {
@@ -954,6 +955,9 @@ select {
   .filters { flex-wrap: wrap; }
   .demo-toolbar button { min-height: 44px; }
   .wire-row summary { grid-template-columns: max-content 42px minmax(0,1fr); }
+  .wire-row summary span:nth-child(5) { grid-column: 2 / -1; }
+  .tape-counter { display: flex; align-items: center; padding-block: 0; }
+  .copy { width: 110px; height: 44px; box-sizing: border-box; border-radius: 0; border-color: var(--border-hairline); border-left: 0; }
 }
 @media (prefers-reduced-motion: reduce) {
   #llm-view #llm-output::after { animation: none !important; }
