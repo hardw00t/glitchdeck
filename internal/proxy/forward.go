@@ -232,8 +232,14 @@ func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restri
 	if err != nil {
 		return nil, err
 	}
-	if !p.allowed(host, port) && !(ctx.Value(reverseTargetKey{}) == true && p.target != nil && !p.options.RequireUpstreamAllow && strings.EqualFold(host, p.target.Hostname()) && port == upstreamPort(p.target.Scheme, p.target.Port())) {
+	reverseTarget := ctx.Value(reverseTargetKey{}) == true && p.target != nil && !p.options.RequireUpstreamAllow && strings.EqualFold(host, p.target.Hostname()) && port == upstreamPort(p.target.Scheme, p.target.Port())
+	if !p.allowed(host, port) && !reverseTarget {
 		return nil, errors.New("egress denied")
+	}
+	// The operator-configured reverse target is reachable on any listener; clients
+	// cannot choose it, so exposing the proxy does not turn it into an open relay.
+	if reverseTarget {
+		restrict = false
 	}
 	d := &net.Dialer{}
 	if restrict {

@@ -51,7 +51,7 @@ glitchdeck proxy --target http://127.0.0.1:3000
 
 The proxy and console default to `127.0.0.1:8080` and `127.0.0.1:8081`. Use `--listen` and `--ui` to choose other addresses. An explicit `--target` grants only its exact reverse-proxy origin. CONNECT, absolute-form requests, and tape replay need `--upstream-allow` (or `upstream_allow` in a tape) for non-loopback upstreams. Do not expose a TLS-intercepting listener to untrusted clients.
 
-The console only accepts loopback peers, regardless of its bind address or the request's `Host`. Unless the proxy knows it is bound to loopback, it blocks upstream connections to loopback, link-local, and unspecified IPs even when reached through DNS. `--allow-loopback-egress` opts out of that restriction on trusted listeners; the upstream allowlist still applies.
+The console only accepts loopback peers, regardless of its bind address or the request's `Host`. Unless the proxy knows it is bound to loopback, it blocks upstream connections to loopback, link-local, and unspecified IPs even when reached through DNS. The exact origin of an explicit `--target` stays reachable, so `--listen 0.0.0.0:8080 --target http://127.0.0.1:3000` still serves devices on your network. `--allow-loopback-egress` opts out of that restriction on trusted listeners; the upstream allowlist still applies.
 
 Uploads stream upstream. Recording retains only a bounded body prefix and reports truncation; a matched fault that needs replay rejects bodies above its replay limit. Stop recording after upload requests finish to avoid an incomplete tape.
 

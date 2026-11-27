@@ -260,3 +260,29 @@ func TestInterceptedEgressHonorsListenerPolicy(t *testing.T) {
 		p.Close()
 	}
 }
+
+func TestExposedListenerReachesConfiguredLoopbackTarget(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer up.Close()
+	target, _ := url.Parse(up.URL)
+	p := New(target, fault.Config{}, nil)
+	defer p.Close()
+	exposed := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 8080}
+	r := httptest.NewRequest(http.MethodGet, "/health", nil)
+	r.Host = exposed.String()
+	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, exposed))
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("configured reverse target: got %d", w.Code)
+	}
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer other.Close()
+	r = httptest.NewRequest(http.MethodGet, other.URL, nil)
+	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, exposed))
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if w.Code == http.StatusNoContent {
+		t.Fatal("absolute-form loopback request escaped the exposed-listener policy")
+	}
+}
