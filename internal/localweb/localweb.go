@@ -3,10 +3,21 @@ package localweb
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
 )
+
+// LoopbackPeer checks the socket peer rather than client-controlled headers.
+func LoopbackPeer(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
+}
 
 // Allowed admits local hosts (or an explicitly configured listener host) and
 // rejects cross-origin browser writes and upgrades. Native clients need no Origin.

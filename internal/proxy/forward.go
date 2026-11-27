@@ -8,9 +8,11 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
@@ -31,6 +33,7 @@ type Options struct {
 	BeforeRequest        func(uint64)
 	OnAdmission          func(seq uint64, method, path, host string)
 	RequireUpstreamAllow bool
+	AllowLoopbackEgress  bool
 }
 
 type RuleStats struct {
@@ -194,6 +197,28 @@ func upstreamPort(scheme, port string) string {
 	return "80"
 }
 
+func restrictedEgress(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return !ip.IsValid() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+}
+
+func (p *Proxy) restrictEgress() bool {
+	if p.options.AllowLoopbackEgress {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.front == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(p.front.Listener.Addr().String())
+	if err != nil {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err != nil || !ip.Unmap().IsLoopback()
+}
+
 func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -203,6 +228,20 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 		return nil, errors.New("egress denied")
 	}
 	d := &net.Dialer{}
+	restrict := p.restrictEgress()
+	if restrict {
+		d.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip, err := netip.ParseAddr(host)
+			if err != nil || restrictedEgress(ip) {
+				return errors.New("egress denied")
+			}
+			return nil
+		}
+	}
 	if strings.EqualFold(host, "localhost") {
 		c, err := d.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
 		if err != nil && ctx.Err() == nil {

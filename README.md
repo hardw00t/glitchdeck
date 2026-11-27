@@ -51,6 +51,10 @@ glitchdeck proxy --target http://127.0.0.1:3000
 
 The proxy and console default to `127.0.0.1:8080` and `127.0.0.1:8081`. Use `--listen` and `--ui` to choose other addresses. An explicit `--target` grants only its exact reverse-proxy origin. CONNECT, absolute-form requests, and tape replay need `--upstream-allow` (or `upstream_allow` in a tape) for non-loopback upstreams. Do not expose a TLS-intercepting listener to untrusted clients.
 
+The console only accepts loopback peers, regardless of its bind address or the request's `Host`. On a non-loopback proxy listener, upstream connections to loopback, link-local, and unspecified IPs are blocked even when reached through DNS. `--allow-loopback-egress` opts out of that restriction on trusted listeners; the upstream allowlist still applies.
+
+Uploads stream upstream. Recording retains only a bounded body prefix and reports truncation; a matched fault that needs replay rejects bodies above its replay limit. Stop recording after upload requests finish to avoid an incomplete tape.
+
 `glitchdeck demo` enables TLS interception by default. `glitchdeck ca init` creates a persistent CA; `glitchdeck ca print` prints only its public certificate. Use `--ca-dir` to select a store and `--upstream-ca` to trust a private upstream CA. Trust the interception CA only in the client under test. Prior-knowledge h2c is supported; the HTTP/1.1 `Upgrade: h2c` handshake is not. `--h2-tap=off` disables frame injection while retaining HTTP/2 relay.
 
 Before passing `--ca-dir` to `glitchdeck demo`, initialize that directory with `glitchdeck ca init --ca-dir <dir>`. Without `--ca-dir`, the demo uses a temporary CA.

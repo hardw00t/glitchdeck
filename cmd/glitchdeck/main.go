@@ -248,6 +248,7 @@ func serve(args []string, isDemo bool) int {
 	h2tap := f.String("h2-tap", "on", "HTTP/2 tap")
 	sseMax := f.Int("sse-telemetry-max", 512, "SSE telemetry limit")
 	allowRemote := f.Bool("allow-remote", false, "allow remote listener")
+	allowLoopbackEgress := f.Bool("allow-loopback-egress", false, "allow loopback, link-local and unspecified upstream addresses on non-loopback proxy listeners")
 	if showCommandHelp(f, args, "usage: glitchdeck "+name+" [flags]") {
 		return 0
 	}
@@ -316,7 +317,7 @@ func serve(args []string, isDemo bool) int {
 	defer ul.Close()
 	bus := telemetry.New()
 	p := proxy.New(u, cfg, bus)
-	opts := proxy.Options{Demo: isDemo, UpstreamAllow: upstreamAllow, InsecureUpstream: *insecure, MITMALPN: *alpn, H2TapOff: *h2tap == "off", SSETelemetryMax: *sseMax}
+	opts := proxy.Options{Demo: isDemo, UpstreamAllow: upstreamAllow, InsecureUpstream: *insecure, MITMALPN: *alpn, H2TapOff: *h2tap == "off", SSETelemetryMax: *sseMax, AllowLoopbackEgress: *allowLoopbackEgress}
 	if *upstreamCA != "" {
 		data, e := os.ReadFile(*upstreamCA)
 		if e != nil {

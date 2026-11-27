@@ -118,6 +118,10 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	}
 	mux.Handle("GET /", http.FileServer(http.FS(dist)))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !localweb.LoopbackPeer(r) {
+			http.Error(w, "control requires a loopback peer", http.StatusForbidden)
+			return
+		}
 		if !localweb.Allowed(r, c.UI) {
 			http.Error(w, "untrusted control host or origin", http.StatusForbidden)
 			return

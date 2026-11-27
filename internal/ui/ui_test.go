@@ -36,6 +36,7 @@ func TestConfigMutationDoesNotWaitForResponseReader(t *testing.T) {
 	request := func(body string) *http.Request {
 		r := httptest.NewRequest(http.MethodPut, "/api/faults", strings.NewReader(body))
 		r.Host = "localhost"
+		r.RemoteAddr = "127.0.0.1:12345"
 		return r
 	}
 	blocked := blockedResponse{httptest.NewRecorder(), make(chan struct{}), make(chan struct{})}
