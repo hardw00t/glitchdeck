@@ -176,15 +176,16 @@ func TestUploadLimitDistinguishesUpstream413(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		body      string
-		wantError bool
+		rules     []fault.Rule
+		wantError string
 	}{
-		{"upstream", "small", false},
-		{"local", strings.Repeat("x", 4<<20+1), true},
+		{"upstream", "small", nil, ""},
+		{"local", strings.Repeat("x", 4<<20+1), []fault.Rule{{ID: "replay", Enabled: true, Fault: fault.Fault{Type: "dup-webhook"}}}, "exceeds replay cap"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Script: []Step{{HTTP: &HTTP{Method: "POST", Path: "/", Body: tc.body}}}}, "")
-			if (err != nil) != tc.wantError {
-				t.Fatalf("error = %v, want error %v", err, tc.wantError)
+			_, err := Run(context.Background(), Tape{Version: 1, Target: s.URL, Rules: tc.rules, Script: []Step{{HTTP: &HTTP{Method: "POST", Path: "/", Body: tc.body}}}}, "")
+			if tc.wantError == "" && err != nil || tc.wantError != "" && (err == nil || !strings.Contains(err.Error(), tc.wantError)) {
+				t.Fatalf("error = %v, want %q", err, tc.wantError)
 			}
 		})
 	}

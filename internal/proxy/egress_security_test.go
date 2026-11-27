@@ -35,6 +35,47 @@ func TestRestrictedEgressAddresses(t *testing.T) {
 	}
 }
 
+func TestEmbeddedProxyKeepsRestrictedEgressOutOfLoopbackPool(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	p := New(nil, fault.Config{}, nil)
+	defer p.Close()
+	server := httptest.NewServer(p)
+	defer server.Close()
+	proxyURL, _ := url.Parse(server.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: time.Second}
+	defer client.CloseIdleConnections()
+	resp, err := client.Get(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("known loopback: got %d", resp.StatusCode)
+	}
+	for _, bind := range []net.Addr{nil, &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 8080}} {
+		r := httptest.NewRequest(http.MethodGet, upstream.URL, nil)
+		if bind != nil {
+			r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, bind))
+		}
+		w := httptest.NewRecorder()
+		p.ServeHTTP(w, r)
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("bind %v: got %d, want denial", bind, w.Code)
+		}
+	}
+	optedIn := New(nil, fault.Config{}, nil)
+	defer optedIn.Close()
+	optedIn.SetOptions(Options{AllowLoopbackEgress: true})
+	w := httptest.NewRecorder()
+	optedIn.ServeHTTP(w, httptest.NewRequest(http.MethodGet, upstream.URL, nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("explicit opt-in with no binding: got %d", w.Code)
+	}
+}
+
 func TestForwardEgressListenerPolicy(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
 	defer up.Close()

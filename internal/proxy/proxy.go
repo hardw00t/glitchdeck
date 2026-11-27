@@ -45,10 +45,12 @@ type Record struct {
 	Proto              string
 	Body               []byte
 	WebSocket          bool
+	SSE                bool
 	At                 time.Time
 	MITM               bool
 	UnrecordableBody   bool
 	BodyTruncated      bool
+	HasTrailers        bool
 	BodyCaptureStarted bool
 }
 type Proxy struct {
@@ -57,8 +59,7 @@ type Proxy struct {
 	seq                atomic.Uint64
 	requests           atomic.Uint64
 	bus                *telemetry.Bus
-	transport          *http.Transport
-	h2c                *http.Transport
+	transports         [4]*http.Transport
 	gate               sync.Mutex
 	admission          sync.Mutex
 	generation         uint64
@@ -119,7 +120,6 @@ func New(target *url.URL, cfg fault.Config, bus *telemetry.Bus) *Proxy {
 		p.target = &u
 	}
 	close(p.done)
-	p.transport, p.h2c = p.newTransport(false), p.newTransport(true)
 	p.SetConfig(cfg)
 	return p
 }
@@ -178,9 +178,9 @@ func (p *Proxy) Close() {
 	p.closed = true
 	p.cancel()
 	s := p.server
+	transports := p.transports
 	p.mu.Unlock()
-	p.transport.CloseIdleConnections()
-	p.h2c.CloseIdleConnections()
+	closeIdleTransports(transports)
 	if s != nil {
 		_ = s.Close()
 	}
@@ -401,6 +401,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stop := context.AfterFunc(session, cancel)
 	defer stop()
 	defer cancel()
+	incoming := r
 	r = r.WithContext(ctx)
 	proto := "h1"
 	recordProto := ""
@@ -437,6 +438,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	runID := r.Header.Get("X-Glitchdeck-Run")
 	var body []byte
 	var streamedBytes atomic.Int64
+	var previewMu sync.Mutex
+	var preview []byte
 	var upstreamHeaders http.Header
 	var grpcStatus *int
 	grpcSource, grpcMessage := "proxy", ""
@@ -445,6 +448,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sseEvents := 0
 	if !ws {
 		defer func() {
+			previewMu.Lock()
+			snippet := string(preview)
+			previewMu.Unlock()
 			if isGRPC {
 				p.grpcEvent(gen, seq, r, status, grpcStatus, grpcSource, grpcMessage, kind, action, h2Error, ruleID, applied, grpcIn.Count(), grpcOut.Count(), start)
 			}
@@ -458,10 +464,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			p.publish(gen, "http_req", map[string]any{
 				"seq": seq, "ts_ms": start.UnixMilli(), "method": r.Method, "path": r.URL.RequestURI(),
-				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": int64(len(body)) + streamedBytes.Load(), "resp_bytes": n,
+				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": streamedBytes.Load(), "resp_bytes": n,
 				"fault": kind, "replay_index": 0, "request_headers": inspectorHeaders(r.Header),
 				"applied": applied, "rule_id": ruleID,
-				"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": string(body[:min(len(body), 256)]),
+				"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": snippet,
 				"proto": r.Proto, "protocol": protocol, "scheme": scheme, "host": host, "stream_id": streamID, "sse": isSSE,
 				"sse_events": sseEvents, "grpc_status": grpcStatus, "fault_action": action, "fault_skipped": skip, "end": end, "run_id": runID, "tunnel": tunnel,
 			})
@@ -471,13 +477,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Glitchdeck-Seq", strconv.FormatUint(seq, 10))
 	}
 	var capturing bool
+	hasTrailers := len(r.Trailer) > 0
 	record := func(captured []byte, missing, truncated bool) {
 		if p.OnRequest == nil {
 			return
 		}
 		rec := Record{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header, Body: captured,
-			WebSocket: ws, At: start, Proto: recordProto, UnrecordableBody: missing, BodyTruncated: truncated,
-			BodyCaptureStarted: capturing, MITM: meta.MITM}
+			WebSocket: ws, SSE: isSSE, At: start, Proto: recordProto, UnrecordableBody: missing, BodyTruncated: truncated,
+			BodyCaptureStarted: capturing, MITM: meta.MITM, HasTrailers: hasTrailers}
 		if r.URL.IsAbs() {
 			rec.URL = r.URL.String()
 		} else if meta.MITM {
@@ -585,6 +592,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if buffered && hasBody {
 		var err error
 		body, err = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+		r.Trailer = incoming.Trailer
+		hasTrailers = hasTrailers || len(r.Trailer) != 0
+		streamedBytes.Add(int64(len(body)))
+		preview = body[:min(len(body), 256)]
 		if err != nil || len(body) > maxBody {
 			if capturing {
 				record(body[:min(len(body), maxBody)], err != nil, len(body) > maxBody)
@@ -610,9 +621,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if kind == "rate-limit" {
 		var recorded []byte
 		missing, truncated := hasBody, false
-		if capture {
+		if capture && !isGRPC {
 			var readErr error
 			recorded, readErr = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+			hasTrailers = hasTrailers || len(incoming.Trailer) != 0
+			streamedBytes.Add(int64(len(recorded)))
+			preview = recorded[:min(len(recorded), 256)]
 			missing, truncated = readErr != nil, len(recorded) > maxBody
 			recorded = recorded[:min(len(recorded), maxBody)]
 		}
@@ -627,6 +641,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		markApplied()
 		return
 	}
+	if !buffered && !hasBody {
+		record(nil, false, false)
+	}
 	if kind == "latency-wave" && !wait(ctx, time.Duration(fault.Latency(cfg.Seed, seq, params))*time.Millisecond) {
 		if capturing {
 			record(nil, true, false)
@@ -639,7 +656,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	q := p.upstream(r, body, ctx)
 	if q == nil {
-		if !buffered {
+		if !buffered && hasBody {
 			record(nil, hasBody, false)
 		}
 		status, end = 502, "upstream_error"
@@ -649,45 +666,48 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if kind == "sse-glitch" {
 		q.Header.Del("Accept-Encoding")
 	}
-	var finishRecord func(force bool) bool
+	var finishRecord func(bool)
+	var recordMu sync.Mutex
+	recorded, classified, sseNotified := buffered || !hasBody, false, false
+	notifySSE := func() {
+		if recorded && classified && isSSE && !sseNotified && p.OnSSE != nil {
+			sseNotified = true
+			p.callback(gen, func() { p.OnSSE(seq) })
+		}
+	}
 	if !buffered && hasBody {
-		b := &countingBody{ReadCloser: r.Body, count: &streamedBytes, record: capture, capture: capture}
+		b := &countingBody{ReadCloser: r.Body, incoming: incoming, count: &streamedBytes, capture: capture, previewMu: &previewMu, preview: &preview}
 		if isGRPC {
 			b.grpc = &grpcIn
 		}
-		q.Body, q.ContentLength, q.Trailer = b, r.ContentLength, r.Trailer
-		if capture {
-			finishRecord = func(force bool) bool {
-				b.mu.Lock()
-				captured := b.body
-				// A full-duplex response can start before the request is fully read.
-				missing := !b.eof && (r.ContentLength < 0 || b.count.Load() < r.ContentLength)
-				if missing && !force {
-					b.mu.Unlock()
-					return false
-				}
-				b.capture = false
-				truncated := b.truncated
-				b.mu.Unlock()
-				record(captured, missing, truncated)
-				return true
+		finishRecord = func(force bool) {
+			recordMu.Lock()
+			defer recordMu.Unlock()
+			if recorded {
+				return
 			}
-			defer func() {
-				if finishRecord != nil {
-					finishRecord(true)
-					if isSSE && p.OnSSE != nil {
-						p.callback(gen, func() { p.OnSSE(seq) })
-					}
-				}
-			}()
+			b.mu.Lock()
+			missing := !capture || b.failed || !b.eof && (r.ContentLength < 0 || b.count.Load() < r.ContentLength)
+			if missing && capture && !force {
+				b.mu.Unlock()
+				return
+			}
+			captured, truncated := b.body, b.truncated
+			hasTrailers = hasTrailers || b.hasTrailers
+			b.capture = false
+			b.mu.Unlock()
+			record(captured, missing, truncated)
+			recorded = true
+			notifySSE()
 		}
-	} else if !buffered {
-		record(nil, false, false)
+		b.done = func() { finishRecord(true) }
+		q.Body, q.ContentLength, q.Trailer = b, r.ContentLength, r.Trailer
+		defer finishRecord(true)
 	}
-	transport := p.transport
-	if r.ProtoMajor == 2 && q.URL.Scheme == "http" {
-		transport = p.h2c
+	if !buffered && hasBody && r.ProtoMajor == 1 {
+		_ = http.NewResponseController(w).EnableFullDuplex()
 	}
+	transport := p.transportFor(ctx, r.ProtoMajor == 2 && q.URL.Scheme == "http")
 	if meta.Tap != nil && streamID != 0 && !meta.Tap.AdmitUpstream(streamID) {
 		meta.Tap.Reset(streamID, 7)
 		panic(http.ErrAbortHandler)
@@ -713,12 +733,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	status, upstreamHeaders = resp.StatusCode, resp.Header
 	media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	encoding := resp.Header.Get("Content-Encoding")
+	recordMu.Lock()
 	isSSE = media == "text/event-stream" && (encoding == "" || strings.EqualFold(encoding, "identity"))
-	if finishRecord != nil && finishRecord(false) {
-		finishRecord = nil
-	}
-	if isSSE && finishRecord == nil && p.OnSSE != nil {
-		p.callback(gen, func() { p.OnSSE(seq) })
+	classified = true
+	notifySSE()
+	recordMu.Unlock()
+	if finishRecord != nil {
+		finishRecord(false)
 	}
 	switch kind {
 	case "dup-webhook":
@@ -861,14 +882,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type countingBody struct {
 	io.ReadCloser
-	count     *atomic.Int64
-	grpc      *grpcwire.MsgCounter
-	mu        sync.Mutex
-	record    bool
-	capture   bool
-	body      []byte
-	truncated bool
-	eof       bool
+	count       *atomic.Int64
+	grpc        *grpcwire.MsgCounter
+	mu          sync.Mutex
+	previewMu   *sync.Mutex
+	preview     *[]byte
+	done        func()
+	capture     bool
+	body        []byte
+	truncated   bool
+	eof         bool
+	failed      bool
+	incoming    *http.Request
+	hasTrailers bool
 }
 
 func (b *countingBody) Read(p []byte) (int, error) {
@@ -876,10 +902,10 @@ func (b *countingBody) Read(p []byte) (int, error) {
 	if b.grpc != nil {
 		_, _ = b.grpc.Write(p[:n])
 	}
-	if !b.record {
-		b.count.Add(int64(n))
-		return n, err
-	}
+	b.previewMu.Lock()
+	remainingPreview := 256 - len(*b.preview)
+	*b.preview = append(*b.preview, p[:min(n, remainingPreview)]...)
+	b.previewMu.Unlock()
 	b.mu.Lock()
 	b.count.Add(int64(n))
 	if b.capture {
@@ -888,11 +914,20 @@ func (b *countingBody) Read(p []byte) (int, error) {
 		b.truncated = b.truncated || n > remaining
 	}
 	if err == io.EOF {
+		b.hasTrailers = len(b.incoming.Trailer) != 0
 		b.eof = true
+	} else if err != nil {
+		b.failed = true
 	}
 	b.mu.Unlock()
+	if err != nil && b.done != nil {
+		b.done()
+	}
 	return n, err
 }
+
+// The downstream HTTP server owns the inbound body's lifetime.
+func (b *countingBody) Close() error { return nil }
 
 type flushWriter struct{ http.ResponseWriter }
 

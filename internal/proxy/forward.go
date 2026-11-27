@@ -65,9 +65,8 @@ func (p *Proxy) SetOptions(o Options) {
 	defer p.mu.Unlock()
 	o.UpstreamAllow = slices.Clone(o.UpstreamAllow)
 	p.options = o
-	p.transport.CloseIdleConnections()
-	p.h2c.CloseIdleConnections()
-	p.transport, p.h2c = p.newTransport(false), p.newTransport(true)
+	closeIdleTransports(p.transports)
+	p.transports = [4]*http.Transport{}
 }
 
 func (p *Proxy) TLSInfo() (bool, string) {
@@ -202,16 +201,18 @@ func restrictedEgress(ip netip.Addr) bool {
 	return !ip.IsValid() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
-func (p *Proxy) restrictEgress() bool {
+func (p *Proxy) restrictEgressLocked(ctx context.Context) bool {
 	if p.options.AllowLoopbackEgress {
 		return false
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.front == nil {
-		return false
+	bind, _ := ctx.Value(http.LocalAddrContextKey).(net.Addr)
+	if p.front != nil {
+		bind = p.front.Listener.Addr()
 	}
-	host, _, err := net.SplitHostPort(p.front.Listener.Addr().String())
+	if bind == nil {
+		return true
+	}
+	host, _, err := net.SplitHostPort(bind.String())
 	if err != nil {
 		return true
 	}
@@ -220,6 +221,13 @@ func (p *Proxy) restrictEgress() bool {
 }
 
 func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	p.mu.Lock()
+	restrict := p.restrictEgressLocked(ctx)
+	p.mu.Unlock()
+	return p.dialWithPolicy(ctx, network, addr, restrict)
+}
+
+func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restrict bool) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
@@ -228,7 +236,6 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 		return nil, errors.New("egress denied")
 	}
 	d := &net.Dialer{}
-	restrict := p.restrictEgress()
 	if restrict {
 		d.Control = func(_, address string, _ syscall.RawConn) error {
 			host, _, err := net.SplitHostPort(address)
@@ -267,10 +274,38 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 	return nil, last
 }
 
-func (p *Proxy) newTransport(h2c bool) *http.Transport {
+func closeIdleTransports(transports [4]*http.Transport) {
+	for _, t := range transports {
+		if t != nil {
+			t.CloseIdleConnections()
+		}
+	}
+}
+
+func (p *Proxy) transportFor(ctx context.Context, h2c bool) *http.Transport {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	restrict := p.restrictEgressLocked(ctx)
+	// A restricted request must not borrow an already-dialed loopback connection.
+	i := 0
+	if restrict {
+		i += 2
+	}
+	if h2c {
+		i++
+	}
+	if p.transports[i] == nil {
+		p.transports[i] = p.newTransport(h2c, restrict)
+	}
+	return p.transports[i]
+}
+
+func (p *Proxy) newTransport(h2c, restrict bool) *http.Transport {
 	t := &http.Transport{
-		DisableCompression:  true,
-		DialContext:         p.dial,
+		DisableCompression: true,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return p.dialWithPolicy(ctx, network, address, restrict)
+		},
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        100,
 		IdleConnTimeout:     90 * time.Second,
