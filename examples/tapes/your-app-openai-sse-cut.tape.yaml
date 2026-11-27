@@ -1,0 +1,9 @@
+# Run with glitchdeck exec and an OpenAI-compatible streaming client.
+version: 2
+name: your-app-openai-sse-cut
+target: http://127.0.0.1:3000
+rules:
+  - id: openai-stream-cut
+    enabled: true
+    match: {method: POST, path_prefix: /v1/chat/completions}
+    fault: {type: sse-glitch, params: {action: eof_early, http_clean: true}}

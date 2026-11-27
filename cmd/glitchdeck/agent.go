@@ -21,8 +21,11 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 )
 
-var version = "dev"
-var commit = "unknown"
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
 
 type listFlag []string
 
@@ -192,10 +195,33 @@ func caCommand(args []string) int {
 }
 
 func buildVersion() string {
-	if info, ok := debug.ReadBuildInfo(); ok && version == "dev" && info.Main.Version != "(devel)" {
-		return info.Main.Version
+	v, _, _ := buildMetadata()
+	return v
+}
+
+func buildMetadata() (v, rev, date string) {
+	v, rev, date = version, commit, buildDate
+	if v != "dev" {
+		return
 	}
-	return version
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			v = info.Main.Version
+		}
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				if rev == "none" {
+					rev = setting.Value
+				}
+			case "vcs.time":
+				if date == "unknown" {
+					date = setting.Value
+				}
+			}
+		}
+	}
+	return
 }
 
 func versionCommand(args []string) int {
@@ -204,19 +230,17 @@ func versionCommand(args []string) int {
 	if f.Parse(args) != nil || f.NArg() != 0 {
 		return 2
 	}
+	v, rev, date := buildMetadata()
 	if *asJSON {
-		rev := commit
-		if info, ok := debug.ReadBuildInfo(); ok && rev == "unknown" {
-			for _, setting := range info.Settings {
-				if setting.Key == "vcs.revision" {
-					rev = setting.Value
-					break
-				}
-			}
-		}
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"schema": "glitchdeck.v2", "command": "version", "ok": true, "data": map[string]string{"version": buildVersion(), "commit": rev, "go": runtime.Version()}})
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"schema": "glitchdeck.v2", "command": "version", "ok": true,
+			"data": map[string]string{
+				"version": v, "commit": rev, "build_date": date,
+				"go": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH,
+			},
+		})
 	} else {
-		fmt.Println(buildVersion())
+		fmt.Printf("glitchdeck %s (commit %s, built %s)\n", v, rev, date)
 	}
 	return 0
 }

@@ -48,7 +48,7 @@ func run(args []string) int {
 		return mcpCommand(args[1:])
 	case "ca":
 		return caCommand(args[1:])
-	case "version":
+	case "version", "--version", "-v":
 		return versionCommand(args[1:])
 	case "report":
 		return reportCommand(args[1:])
