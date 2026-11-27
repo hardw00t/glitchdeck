@@ -43,6 +43,23 @@ func v1Keys(doc *yaml.Node) error {
 	return nil
 }
 
+func integerFaultBounds(doc *yaml.Node) error {
+	expect := yamlField(doc.Content[0], "expect")
+	for _, fault := range yamlItems(yamlField(expect, "faults")) {
+		for _, name := range [...]string{"min_applied", "max_applied"} {
+			if value := yamlField(fault, name); value != nil {
+				if value.Kind == yaml.AliasNode {
+					value = value.Alias
+				}
+				if value.Kind != yaml.ScalarNode || value.ShortTag() != "!!int" {
+					return fmt.Errorf("expect.faults %s must be a nonnegative integer", name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func yamlItems(n *yaml.Node) []*yaml.Node {
 	if n != nil && n.Kind == yaml.AliasNode {
 		n = n.Alias
@@ -62,9 +79,15 @@ func yamlField(n *yaml.Node, key string) *yaml.Node {
 	}
 	for i := 0; i < len(n.Content); i += 2 {
 		k, v := n.Content[i], n.Content[i+1]
+		if k.Kind == yaml.AliasNode {
+			k = k.Alias
+		}
 		if k.Value == key {
 			return v
 		}
+	}
+	for i := 0; i < len(n.Content); i += 2 {
+		k, v := n.Content[i], n.Content[i+1]
 		if k.Tag == "!!merge" {
 			if found := yamlField(v, key); found != nil {
 				return found

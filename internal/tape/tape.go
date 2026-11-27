@@ -116,12 +116,18 @@ func Decode(r io.Reader) (Tape, error) {
 		}
 		return t, err
 	}
-	if t.Version == 1 {
+	if t.Version == 1 || len(t.Expect.Faults) != 0 {
 		var doc yaml.Node
 		if err := yaml.Unmarshal(raw.Bytes(), &doc); err != nil {
 			return t, err
 		}
-		if err := v1Keys(&doc); err != nil {
+		var err error
+		if t.Version == 1 {
+			err = v1Keys(&doc)
+		} else {
+			err = integerFaultBounds(&doc)
+		}
+		if err != nil {
 			return t, err
 		}
 	}
@@ -337,6 +343,9 @@ func validate(t Tape) error {
 			if x.MinEvents != nil && *x.MinEvents < 0 || x.MaxEvents != nil && *x.MaxEvents < 0 ||
 				x.MaxGapMS != nil && *x.MaxGapMS < 0 {
 				return fmt.Errorf("assertion %q: min_events, max_events and max_gap_ms cannot be negative", a.Name)
+			}
+			if x.MinEvents != nil && x.MaxEvents != nil && *x.MinEvents > *x.MaxEvents {
+				return fmt.Errorf("assertion %q: min_events exceeds max_events", a.Name)
 			}
 		}
 	}

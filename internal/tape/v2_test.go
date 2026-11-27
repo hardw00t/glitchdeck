@@ -34,6 +34,30 @@ func TestDecodeRejectsInvalidChildExit(t *testing.T) {
 	}
 }
 
+func TestDecodeFaultBoundsRequireIntegerScalars(t *testing.T) {
+	const base = "version: 2\nrules: [{id: r, fault: {type: tcp-rst}}]\n"
+	for _, tc := range []struct {
+		name, doc, field string
+	}{
+		{"negative fraction", "expect: {faults: [{rule: r, min_applied: -0.5}]}\n", "min_applied"},
+		{"positive fraction", "expect: {faults: [{rule: r, max_applied: 2.5}]}\n", "max_applied"},
+		{"float zero", "expect: {faults: [{rule: r, min_applied: 0.0}]}\n", "min_applied"},
+		{"alias", "expect: {faults: [{rule: r, min_applied: &zero 0, max_applied: *zero}]}\n", ""},
+		{"float alias", "expect: {faults: [{rule: r, max_applied: &float 0.0, min_applied: *float}]}\n", "min_applied"},
+		{"alias key", "name: &key min_applied\nexpect: {faults: [{rule: r, ? *key : 0.5}]}\n", "min_applied"},
+		{"merged fraction", "expect: {faults: [{<<: &base {rule: r, max_applied: 0.5}}]}\n", "max_applied"},
+		{"overridden fraction", "expect: {faults: [{<<: &base {rule: r, max_applied: 0.5}, max_applied: 0}]}\n", ""},
+		{"unknown field", "expect: {faults: [{rule: r, min_applied: 0, unexpected: 0}]}\n", "unexpected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Decode(strings.NewReader(base + tc.doc))
+			if tc.field == "" && err != nil || tc.field != "" && (err == nil || !strings.Contains(err.Error(), tc.field)) {
+				t.Fatalf("expected validation of %q: %v", tc.field, err)
+			}
+		})
+	}
+}
+
 func TestAssertionDiagnosticsAreBounded(t *testing.T) {
 	data := `{"large":"` + strings.Repeat("x", 1<<20) + `"}`
 	got := CheckAssertionJSON([]byte(data), map[string]any{"large": "small"}, nil)

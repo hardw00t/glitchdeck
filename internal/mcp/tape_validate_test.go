@@ -42,6 +42,7 @@ func TestTapeValidateStdio(t *testing.T) {
 		{name: "invalid target", args: map[string]string{"tape_yaml": badTarget}, errText: "HTTP or HTTPS"},
 		{name: "unknown expected rule", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: missing, max_applied: 0}]}\n"}, errText: "missing"},
 		{name: "inverted bounds", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: limit, min_applied: 1, max_applied: 0}]}\n"}, errText: "min_applied"},
+		{name: "fractional bound", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: limit, max_applied: 1.5}]}\n"}, errText: "max_applied"},
 		{name: "valid path", args: map[string]string{"tape_path": "valid.tape.yaml"}, want: map[string]any{"ok": true, "version": float64(2), "name": "second", "rules": float64(1)}},
 		{name: "absolute path in workdir", args: map[string]string{"tape_path": filepath.Join(workdir, "valid.tape.yaml")}, want: map[string]any{"ok": true, "version": float64(2), "name": "second", "rules": float64(1)}},
 		{name: "invalid tape at path", args: map[string]string{"tape_path": "invalid.tape.yaml"}, errText: "unknown_field"},
