@@ -126,6 +126,7 @@ func TestRecordingRedactsHeadersAndQueryValues(t *testing.T) {
 		h.Set(k, "fixture-secret")
 	}
 	h.Set("Content-Type", "application/json")
+	h.Set("Referer", "http://localhost/previous?token=referer-secret")
 	query := "?api_key=sk-123&keep=a%20b&ToKeN=other-secret;hidden-suffix&keep=c&%53ig=hidden&apikey=private&key=key-value&access_token=access-value&secret=secret-value&signature=sig-value"
 	now := time.Now()
 	r.request(proxy.Record{Seq: 1, Method: "GET", Path: "/reverse" + query, Header: h, At: now})
@@ -137,7 +138,7 @@ func TestRecordingRedactsHeadersAndQueryValues(t *testing.T) {
 	if err := tape.Encode(&data, doc); err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"fixture-secret", "sk-123", "other-secret", "hidden", "private", "key-value", "access-value", "secret-value", "sig-value"} {
+	for _, secret := range []string{"fixture-secret", "referer-secret", "sk-123", "other-secret", "hidden", "private", "key-value", "access-value", "secret-value", "sig-value"} {
 		if strings.Contains(data.String(), secret) {
 			t.Errorf("tape contains %q: %s", secret, data.String())
 		}
@@ -145,6 +146,29 @@ func TestRecordingRedactsHeadersAndQueryValues(t *testing.T) {
 	if !strings.Contains(data.String(), "Content-Type: application/json") ||
 		strings.Count(data.String(), "keep=a%20b") != 3 || strings.Count(data.String(), "keep=c") != 3 {
 		t.Fatalf("unrelated header or query values lost: %s", data.String())
+	}
+}
+
+func TestRecordingRedactsSemicolonParametersAndSensitiveSuffixes(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{"/?keep=a%20b;token=secret&x=%2f", "/?keep=a%20b;token=REDACTED&x=%2f"},
+		{"/?token=prefix;suffix&keep=x", "/?token=REDACTED&keep=x"},
+		{"/?token=prefix;keep=value&x=y", "/?token=REDACTED&x=y"},
+		{"/?a=b;%53ig=private;other=z", "/?a=b;%53ig=REDACTED"},
+	} {
+		if got := redactQuery(tc.input); got != tc.want {
+			t.Errorf("redactQuery(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestRecordingWithTrailersIsIncomplete(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	r.request(proxy.Record{Seq: 1, Method: "POST", Path: "/", At: time.Now(), HasTrailers: true})
+	doc := r.tape(fault.Config{})
+	if !doc.Incomplete || !strings.Contains(doc.IncompleteReason, "trailer") {
+		t.Fatalf("trailer-bearing recording marked complete: %+v", doc)
 	}
 }
 

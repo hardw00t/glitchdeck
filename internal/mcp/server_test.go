@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hardw00t/glitchdeck/internal/tape"
+	"gopkg.in/yaml.v3"
 )
 
 func TestHandshakeAndList(t *testing.T) {
@@ -124,6 +128,106 @@ func TestTapeExportReportsDroppedEntries(t *testing.T) {
 	if data, _ := got["yaml"].(string); got["truncated"] != true || got["dropped_entries"] != 2 ||
 		!strings.Contains(data, "truncated: true") || !strings.Contains(data, "dropped_entries: 2") {
 		t.Fatalf("tape export omitted truncation: %v", got)
+	}
+}
+
+func TestTapeExportFitsBodyBudgets(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		path   string
+		budget int
+	}{
+		{"inline", "", 64 << 10},
+		{"file", "capture.yaml", 1 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer(nil, nil, Options{Workdir: t.TempDir()})
+			s.ctx = context.Background()
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := io.Copy(io.Discard, r.Body); err != nil {
+					http.Error(w, "upload incomplete", http.StatusBadRequest)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(upstream.Close)
+			start, _ := s.call("proxy_start", fmt.Appendf(nil, `{"target":%q,"record":true}`, upstream.URL))
+			if start["error"] != nil {
+				t.Fatal(start)
+			}
+			t.Cleanup(s.stop)
+			body := strings.Repeat("a", tc.budget+10000)
+			for _, payload := range []string{body, "last"} {
+				resp, err := http.Post(start["proxy_url"].(string)+"/upload", "text/plain", strings.NewReader(payload))
+				if err != nil {
+					t.Fatal(err)
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusNoContent {
+					t.Fatalf("upload status: %d", resp.StatusCode)
+				}
+			}
+			args, _ := json.Marshal(map[string]string{"name": "budget", "out_path": tc.path})
+			got, _ := s.call("tape_export", args)
+			if got["error"] != nil {
+				t.Fatal(got)
+			}
+			data, _ := got["yaml"].(string)
+			if tc.path != "" {
+				b, err := os.ReadFile(got["out_path"].(string))
+				if err != nil {
+					t.Fatal(err)
+				}
+				data = string(b)
+			}
+			if len(data) > tc.budget {
+				t.Fatalf("export size %d exceeds %d", len(data), tc.budget)
+			}
+			var doc tape.Tape
+			err := yaml.Unmarshal([]byte(data), &doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tape.Decode(strings.NewReader(data)); err == nil {
+				t.Fatal("incomplete tape accepted for replay")
+			}
+			if len(doc.Script) != 2 || doc.Script[0].Seq >= doc.Script[1].Seq || doc.Script[1].HTTP.Body != "last" {
+				t.Fatalf("script order or later body changed: %+v", doc.Script)
+			}
+			omitted := len(body) - len(doc.Script[0].HTTP.Body)
+			if omitted <= 0 || !doc.Incomplete || !doc.Truncated || doc.OmittedBodyBytes != omitted || got["omitted_body_bytes"] != omitted {
+				t.Fatalf("missing truncation metadata: result=%v tape=%+v omitted=%d", got, doc, omitted)
+			}
+		})
+	}
+}
+
+func TestEncodeExportBoundsBinaryAndUTF8Bodies(t *testing.T) {
+	for _, body := range []string{
+		strings.Repeat("界", 30000),
+		strings.Repeat("\x00\xff\"", 30000),
+	} {
+		original := &tape.HTTP{Method: "POST", Path: "/", Body: body}
+		doc := tape.Tape{Version: 1, Script: []tape.Step{{HTTP: original}}}
+		data, err := encodeExport(&doc, 64<<10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) > 64<<10 {
+			t.Fatalf("export exceeds budget: %d", len(data))
+		}
+		var decoded tape.Tape
+		if err := yaml.Unmarshal([]byte(data), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		retained := decoded.Script[0].HTTP.Body
+		if !strings.HasPrefix(body, retained) || decoded.OmittedBodyBytes != len(body)-len(retained) || !decoded.Incomplete || !decoded.Truncated {
+			t.Fatalf("incorrect body or metadata: retained=%d omitted=%d", len(retained), decoded.OmittedBodyBytes)
+		}
+		if original.Body != body {
+			t.Fatal("export mutated recording")
+		}
 	}
 }
 

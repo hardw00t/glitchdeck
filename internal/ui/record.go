@@ -287,6 +287,9 @@ func (r *recorder) request(req proxy.Record) {
 	} else if req.UnrecordableBody {
 		r.markIncomplete("streamed request body was not captured")
 	}
+	if req.HasTrailers {
+		r.markIncomplete("request trailers were not captured")
+	}
 	if req.URL != "" {
 		u, err := url.Parse(req.URL)
 		if err != nil || !strings.EqualFold(u.Hostname(), "localhost") && !net.ParseIP(u.Hostname()).IsLoopback() {
@@ -294,7 +297,7 @@ func (r *recorder) request(req proxy.Record) {
 		}
 	}
 	req.Path, req.URL = redactQuery(req.Path), redactQuery(req.URL)
-	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM}
+	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE}
 	if req.WebSocket {
 		if req.MITM || req.URL != "" {
 			r.markIncomplete("forwarded WebSocket authority cannot be replayed")
@@ -313,7 +316,7 @@ func (r *recorder) request(req proxy.Record) {
 		for k, v := range req.Header {
 			name := strings.ToLower(k)
 			switch name {
-			case "authorization", "proxy-authorization", "cookie", "set-cookie", "connection", "upgrade", "transfer-encoding", "content-length", "expect", "te", "trailer", "x-glitchdeck-run", "x-glitchdeck-seq":
+			case "authorization", "proxy-authorization", "cookie", "set-cookie", "referer", "connection", "upgrade", "transfer-encoding", "content-length", "expect", "te", "trailer", "x-glitchdeck-run", "x-glitchdeck-seq":
 				continue
 			}
 			if strings.Contains(name, "secret") || strings.Contains(name, "token") ||
@@ -340,26 +343,36 @@ func redactQuery(raw string) string {
 	}
 	var out strings.Builder
 	for start := 0; start < len(query); {
-		end := strings.IndexByte(query[start:], '&')
+		end := strings.IndexAny(query[start:], "&;")
 		if end < 0 {
 			end = len(query)
 		} else {
 			end += start
 		}
-		if key, _, hasValue := strings.Cut(query[start:end], "="); hasValue {
-			decoded, _ := url.QueryUnescape(key)
+		key, _, hasValue := strings.Cut(query[start:end], "=")
+		decoded, _ := url.QueryUnescape(key)
+		sensitive := false
+		if hasValue {
 			switch strings.ToLower(decoded) {
 			case "api_key", "apikey", "key", "token", "access_token", "secret", "sig", "signature":
-				if out.Len() == 0 {
-					out.WriteString(base)
-					out.WriteByte('?')
-				}
-				out.WriteString(query[:start])
-				out.WriteString(key)
-				out.WriteString("=REDACTED")
-				query, start = query[end:], 0
-				continue
+				sensitive = true
 			}
+		}
+		if sensitive {
+			if out.Len() == 0 {
+				out.WriteString(base)
+				out.WriteByte('?')
+			}
+			out.WriteString(query[:start])
+			out.WriteString(key)
+			out.WriteString("=REDACTED")
+			if next := strings.IndexByte(query[end:], '&'); next >= 0 {
+				end += next
+			} else {
+				end = len(query)
+			}
+			query, start = query[end:], 0
+			continue
 		}
 		start = end + 1
 	}

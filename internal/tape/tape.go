@@ -47,6 +47,7 @@ type Tape struct {
 	IncompleteReason string         `yaml:"incomplete_reason,omitempty" json:"incomplete_reason,omitempty"`
 	Truncated        bool           `yaml:"truncated,omitempty" json:"truncated,omitempty"`
 	DroppedEntries   int            `yaml:"dropped_entries,omitempty" json:"dropped_entries,omitempty"`
+	OmittedBodyBytes int            `yaml:"omitted_body_bytes,omitempty" json:"omitted_body_bytes,omitempty"`
 	ConfigChanges    []ConfigChange `yaml:"config_changes,omitempty" json:"config_changes,omitempty"`
 	Assertions       []Assertion    `yaml:"assertions" json:"assertions"`
 	TLSMITM          bool           `yaml:"tls_mitm,omitempty" json:"tls_mitm,omitempty"`
@@ -162,6 +163,9 @@ func validate(t Tape) error {
 	}
 	if t.DroppedEntries < 0 {
 		return fmt.Errorf("dropped_entries cannot be negative")
+	}
+	if t.OmittedBodyBytes < 0 {
+		return fmt.Errorf("omitted_body_bytes cannot be negative")
 	}
 	switch value := t.Expect.ChildExit.(type) {
 	case nil:

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/hardw00t/glitchdeck/internal/demo"
 	"github.com/hardw00t/glitchdeck/internal/fault"
@@ -612,28 +613,35 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		} else {
 			t.Target = s.target
 		}
-		var b strings.Builder
-		if e = tape.Encode(&b, t); e != nil {
+		limit := 64 << 10
+		if a.OutPath != "" {
+			limit = 1 << 20
+		}
+		b, e := encodeExport(&t, limit)
+		if e != nil {
+			if e == errExportSize {
+				if a.OutPath == "" {
+					return fail("INVALID_PATH", "use out_path for large tapes"), false
+				}
+				return fail("INVALID_TAPE", "tape exceeds 1 MiB"), false
+			}
 			return fail("INVALID_TAPE", e.Error()), false
 		}
 		res := map[string]any{"name": a.Name, "steps": len(t.Script), "rules": len(t.Rules), "incomplete": t.Incomplete}
 		if t.Truncated {
 			res["truncated"], res["dropped_entries"] = true, t.DroppedEntries
 		}
+		if t.OmittedBodyBytes > 0 {
+			res["omitted_body_bytes"] = t.OmittedBodyBytes
+		}
 		if a.OutPath == "" {
-			if b.Len() > 64<<10 {
-				return fail("INVALID_PATH", "use out_path for large tapes"), false
-			}
-			res["yaml"] = b.String()
+			res["yaml"] = b
 		} else {
 			path, e := s.outputPath(a.OutPath)
-			if b.Len() > 1<<20 {
-				return fail("INVALID_TAPE", "tape exceeds 1 MiB"), false
-			}
 			if e != nil {
 				return fail("INVALID_PATH", e.Error()), false
 			}
-			if e = s.writeTape(path, []byte(b.String())); e != nil {
+			if e = s.writeTape(path, []byte(b)); e != nil {
 				return fail("INVALID_PATH", e.Error()), false
 			}
 			res["out_path"] = path
@@ -733,6 +741,83 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 	default:
 		return nil, true
 	}
+}
+
+var errExportSize = errors.New("tape exceeds export size limit without request bodies")
+
+func encodeExport(t *tape.Tape, limit int) (string, error) {
+	encode := func() (string, error) {
+		var b strings.Builder
+		err := tape.Encode(&b, *t)
+		return b.String(), err
+	}
+	data, err := encode()
+	if err != nil || len(data) <= limit {
+		return data, err
+	}
+	t.Script = append([]tape.Step(nil), t.Script...)
+	type capturedBody struct {
+		target *string
+		value  string
+	}
+	var bodies []capturedBody
+	total := 0
+	for i := range t.Script {
+		step := &t.Script[i]
+		var body *string
+		if step.HTTP != nil {
+			h := *step.HTTP
+			step.HTTP = &h
+			body = &h.Body
+		} else if step.Stream != nil {
+			stream := *step.Stream
+			step.Stream = &stream
+			body = &stream.Body
+		}
+		if body != nil && *body != "" {
+			bodies = append(bodies, capturedBody{body, *body})
+			total += len(*body)
+		}
+	}
+	if total == 0 {
+		return "", errExportSize
+	}
+	previousOmitted := t.OmittedBodyBytes
+	t.Truncated, t.Incomplete = true, true
+	if t.IncompleteReason == "" {
+		t.IncompleteReason = "recorded request body was truncated for export"
+	}
+	retain := func(n int) {
+		t.OmittedBodyBytes = previousOmitted + total - n
+		for i := len(bodies) - 1; i >= 0; i-- {
+			keep := min(n, len(bodies[i].value))
+			*bodies[i].target = bodies[i].value[:keep]
+			n -= keep
+		}
+	}
+	retain(0)
+	data, err = encode()
+	if err != nil {
+		return "", err
+	}
+	if len(data) > limit {
+		return "", errExportSize
+	}
+	best, low, high := data, 0, total-1
+	bestRetained := 0
+	for low <= high {
+		mid := low + (high-low)/2
+		retain(mid)
+		candidate, encodeErr := encode()
+		if encodeErr == nil && len(candidate) <= limit {
+			best, bestRetained = candidate, mid
+			low = mid + 1
+		} else {
+			high = mid - 1
+		}
+	}
+	retain(bestRetained)
+	return best, nil
 }
 func faultSummary(c fault.Config, seq uint64) map[string]any {
 	ids := []string{}
