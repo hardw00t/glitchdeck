@@ -37,6 +37,9 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	dialCtx, stopDial := context.WithTimeout(ctx, 5*time.Second)
 	defer stopDial()
 	addr := net.JoinHostPort(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port()))
+	if !r.URL.IsAbs() && !MetaFrom(r.Context()).MITM && !p.options.RequireUpstreamAllow {
+		dialCtx = context.WithValue(dialCtx, reverseTargetKey{}, true)
+	}
 	up, err := p.dial(dialCtx, "tcp", addr)
 	if err != nil {
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
@@ -50,9 +53,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	defer stop()
 	_ = up.SetDeadline(time.Now().Add(5 * time.Second))
 	if q.URL.Scheme == "https" {
-		cfg := p.transport.TLSClientConfig.Clone()
-		cfg.ServerName = q.URL.Hostname()
-		cfg.NextProtos = []string{"http/1.1"}
+		cfg := &tls.Config{RootCAs: p.options.UpstreamCA, InsecureSkipVerify: p.options.InsecureUpstream, MinVersion: tls.VersionTLS12, ServerName: q.URL.Hostname(), NextProtos: []string{"http/1.1"}}
 		secure := tls.Client(up, cfg)
 		if err := secure.HandshakeContext(dialCtx); err != nil {
 			http.Error(w, "upstream handshake failed", http.StatusBadGateway)
@@ -222,7 +223,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 		if dir == "c2s" && f.Opcode == 1 && f.Fin && p.OnClientFrame != nil {
 			p.callback(gen, func() { p.OnClientFrame(seq, f.Payload) })
 		}
-		action := ""
+		action, ruleID := "", ""
 		var params map[string]any
 		cfg := *p.cfg.Load()
 		rule := fault.MatchRequest(cfg, match)
@@ -236,8 +237,9 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			every := fault.Int(params, "every", 1)
 			if (direction == "both" || direction == dir) && frameSeq >= uint64(after) && (frameSeq-uint64(after))%uint64(every) == 0 {
 				action = fault.String(params, "action", "drop")
-				p.countRule(gen, rule.ID, "matched", "")
-				p.countRule(gen, rule.ID, "applied", "")
+				ruleID = rule.ID
+				p.countRule(gen, rule, "matched", "")
+				p.countRule(gen, rule, "applied", "")
 			}
 		}
 		if dir == "s2c" && p.OnServerFrame != nil {
@@ -250,7 +252,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 				preview = string(snippet)
 			}
 		}
-		p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "frame_seq": frameSeq, "ts_ms": time.Now().UnixMilli(), "dir": dir, "opcode": f.Opcode, "bytes": len(f.Payload), "fault": action, "preview": preview})
+		p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "frame_seq": frameSeq, "ts_ms": time.Now().UnixMilli(), "dir": dir, "opcode": f.Opcode, "bytes": len(f.Payload), "fault": action, "fault_type": "ws-glitch", "rule_id": ruleID, "applied": action != "", "action": action, "preview": preview})
 		data := f.Opcode == 0 || f.Opcode == 1 || f.Opcode == 2
 		switch action {
 		case "drop":

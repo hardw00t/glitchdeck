@@ -106,6 +106,10 @@ type front struct {
 	acceptErr error
 	off       bool
 	minter    *tlsmitm.Minter
+	mu        sync.Mutex
+	routing   map[net.Conn]struct{}
+	workers   sync.WaitGroup
+	closing   bool
 }
 
 func (p *Proxy) Serve(listener net.Listener) error {
@@ -115,7 +119,7 @@ func (p *Proxy) Serve(listener net.Listener) error {
 		_ = listener.Close()
 		return errors.New("proxy already served or closed")
 	}
-	f := &front{Listener: listener, accepted: make(chan *connWithMeta), stopped: make(chan struct{}), off: p.options.H2TapOff}
+	f := &front{Listener: listener, accepted: make(chan *connWithMeta), stopped: make(chan struct{}), off: p.options.H2TapOff, routing: make(map[net.Conn]struct{})}
 	if p.options.CA != nil {
 		f.minter = tlsmitm.NewMinter(p.options.CA, 0, 0)
 	}
@@ -157,7 +161,19 @@ func (f *front) accept() {
 			})
 			return
 		}
+		f.mu.Lock()
+		if f.closing {
+			f.mu.Unlock()
+			_ = c.Close()
+			<-slots
+			return
+		}
+		f.routing[c] = struct{}{}
+		f.workers.Add(1)
+		f.mu.Unlock()
 		go func() {
+			defer f.workers.Done()
+			defer func() { f.mu.Lock(); delete(f.routing, c); f.mu.Unlock() }()
 			defer func() { <-slots }()
 			f.route(c, ConnMeta{})
 		}()
@@ -175,11 +191,18 @@ func (f *front) Accept() (net.Conn, error) {
 
 func (f *front) Close() error {
 	var err error
+	f.mu.Lock()
+	f.closing = true
+	for c := range f.routing {
+		_ = c.Close()
+	}
+	f.mu.Unlock()
 	f.closeOnce.Do(func() {
 		f.acceptErr = net.ErrClosed
 		close(f.stopped)
 		err = f.Listener.Close()
 	})
+	f.workers.Wait()
 	return err
 }
 

@@ -2,6 +2,8 @@ package ui
 
 import (
 	"encoding/json"
+	"net"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -94,6 +96,7 @@ func (r *recorder) attach(p *proxy.Proxy) {
 	p.OnServerFrame = r.serverFrame
 	p.OnUnsupportedFrame = r.unsupportedFrame
 	p.OnSSE = r.markSSE
+	p.OnBlindTunnel = r.blindTunnel
 }
 
 func (r *recorder) markSSE(seq uint64) {
@@ -127,7 +130,7 @@ func (r *recorder) reset() {
 	r.clear()
 }
 
-func (r *recorder) start(seq uint64, activeWS int, cfg fault.Config) recordingStatus {
+func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config) recordingStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.running {
@@ -139,8 +142,8 @@ func (r *recorder) start(seq uint64, activeWS int, cfg fault.Config) recordingSt
 			r.markIncomplete("initial configuration exceeded the recording byte budget")
 		}
 		r.streams = make(map[uint64]*recorded)
-		if activeWS != 0 {
-			r.markIncomplete("WebSocket connection already open when recording started")
+		if activeStreams != 0 {
+			r.markIncomplete("WebSocket or blind CONNECT tunnel already open when recording started")
 		}
 	}
 	return r.snapshot()
@@ -238,6 +241,14 @@ func (r *recorder) unsupportedFrame(seq uint64) {
 	}
 }
 
+func (r *recorder) blindTunnel(seq uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.running && seq > r.startSeq {
+		r.markIncomplete("blind CONNECT traffic cannot be recorded")
+	}
+}
+
 func (r *recorder) request(req proxy.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -247,8 +258,17 @@ func (r *recorder) request(req proxy.Record) {
 	if req.UnrecordableBody {
 		r.markIncomplete("streamed request body was not captured")
 	}
+	if req.URL != "" {
+		u, err := url.Parse(req.URL)
+		if err != nil || !strings.EqualFold(u.Hostname(), "localhost") && !net.ParseIP(u.Hostname()).IsLoopback() {
+			r.markIncomplete("forwarded traffic requires explicit upstream authorization for replay")
+		}
+	}
 	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM}
 	if req.WebSocket {
+		if req.MITM || req.URL != "" {
+			r.markIncomplete("forwarded WebSocket authority cannot be replayed")
+		}
 		if req.Header.Get("Sec-WebSocket-Protocol") != "" {
 			r.markIncomplete("WebSocket subprotocol offers were not captured")
 		}
@@ -407,7 +427,7 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 			if e.sse {
 				h := e.http
 				step.HTTP = nil
-				step.Stream = &tape.Stream{Method: h.Method, Path: h.Path, URL: h.URL, Headers: h.Headers, Body: h.Body}
+				step.Stream = &tape.Stream{Method: h.Method, Path: h.Path, URL: h.URL, Proto: h.Proto, Headers: h.Headers, Body: h.Body}
 			}
 		}
 		if e.ws != nil {

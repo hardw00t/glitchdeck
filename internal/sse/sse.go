@@ -31,10 +31,11 @@ type Frame struct {
 func (f Frame) IsDone() bool { return strings.TrimSpace(f.Data) == "[DONE]" }
 
 type Reader struct {
-	r     *bufio.Reader
-	max   int
-	tail  []byte
-	first bool
+	r       *bufio.Reader
+	max     int
+	tail    []byte
+	first   bool
+	afterCR bool
 }
 
 func NewReader(r io.Reader, maxLine int) *Reader {
@@ -61,6 +62,14 @@ func (r *Reader) Next() (Frame, error) {
 				r.tail = f.Raw
 				return Frame{}, err
 			}
+			if r.afterCR {
+				r.afterCR = false
+				if b == '\n' {
+					f.Raw = append(f.Raw, b)
+					start++
+					continue
+				}
+			}
 			f.Raw = append(f.Raw, b)
 			if len(f.Raw)-start > r.max || len(f.Raw) > max(maxFrame, r.max) {
 				r.tail = f.Raw
@@ -69,9 +78,13 @@ func (r *Reader) Next() (Frame, error) {
 			if b == '\r' || b == '\n' {
 				end = len(f.Raw) - 1
 				if b == '\r' {
-					if next, err := r.r.Peek(1); err == nil && next[0] == '\n' {
-						_, _ = r.r.Discard(1)
-						f.Raw = append(f.Raw, '\n')
+					if r.r.Buffered() != 0 {
+						if next, _ := r.r.Peek(1); next[0] == '\n' {
+							_, _ = r.r.Discard(1)
+							f.Raw = append(f.Raw, '\n')
+						}
+					} else {
+						r.afterCR = true
 					}
 				}
 				break

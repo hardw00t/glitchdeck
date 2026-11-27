@@ -158,7 +158,7 @@ func (s Store) Load() (*CA, error) {
 		return nil, e
 	}
 	block, _ = pem.Decode(certPEM)
-	if block == nil {
+	if block == nil || block.Type != "CERTIFICATE" {
 		return nil, errors.New("invalid CA certificate")
 	}
 	cert, e := x509.ParseCertificate(block.Bytes)
@@ -169,7 +169,20 @@ func (s Store) Load() (*CA, error) {
 	if !cert.IsCA || !ok || !pub.Equal(&key.PublicKey) {
 		return nil, errors.New("CA key mismatch")
 	}
-	return &CA{cert, key, certPEM}, nil
+	if err := signingValidity(cert, time.Now()); err != nil {
+		return nil, err
+	}
+	return &CA{cert, key, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})}, nil
+}
+
+func signingValidity(cert *x509.Certificate, now time.Time) error {
+	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("CA certificate lacks certificate-signing usage")
+	}
+	if now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
+		return errors.New("CA certificate is outside its validity period")
+	}
+	return nil
 }
 
 func (s Store) checkDir() error {
@@ -217,6 +230,10 @@ func (m *Minter) For(host string) (*tls.Certificate, error) {
 	if m.key == nil || host == "" {
 		return nil, errors.New("invalid leaf host")
 	}
+	now := time.Now()
+	if err := signingValidity(m.ca.Cert, now); err != nil {
+		return nil, err
+	}
 	if e := m.entries[host]; e != nil {
 		v := e.Value.(cacheEntry)
 		if time.Since(v.at) < m.ttl {
@@ -230,8 +247,7 @@ func (m *Minter) For(host string) (*tls.Certificate, error) {
 	if e != nil {
 		return nil, e
 	}
-	now := time.Now()
-	t := &x509.Certificate{SerialNumber: sn, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(24 * time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, AuthorityKeyId: m.ca.Cert.SubjectKeyId}
+	t := &x509.Certificate{SerialNumber: sn, NotBefore: latestTime(now.Add(-time.Hour), m.ca.Cert.NotBefore), NotAfter: earliestTime(now.Add(24*time.Hour), m.ca.Cert.NotAfter), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, AuthorityKeyId: m.ca.Cert.SubjectKeyId}
 	if ip := net.ParseIP(host); ip != nil {
 		t.IPAddresses = []net.IP{ip}
 	} else {
@@ -253,4 +269,18 @@ func (m *Minter) For(host string) (*tls.Certificate, error) {
 		m.lru.Remove(old)
 	}
 	return c, nil
+}
+
+func latestTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return b
+	}
+	return a
+}
+
+func earliestTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }

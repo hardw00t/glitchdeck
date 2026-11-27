@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -24,14 +25,18 @@ type service struct {
 	charges []entry
 	ticks   int
 	llm     map[string]int
+	mux     *http.ServeMux
+	sockets map[net.Conn]struct{}
+	closed  bool
 }
 
 func New() http.Handler {
-	s := &service{orders: []entry{}, charges: []entry{}, llm: map[string]int{}}
+	s := &service{orders: []entry{}, charges: []entry{}, llm: map[string]int{}, sockets: map[net.Conn]struct{}{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/checkout", s.checkout)
 	mux.HandleFunc("/webhooks/payment", s.payment)
 	mux.HandleFunc("/api/state", s.state)
+	mux.HandleFunc("/api/summary", s.summary)
 	mux.HandleFunc("/api/reset", s.reset)
 	mux.HandleFunc("/ws/ticker", s.ticker)
 	mux.HandleFunc("/api/chat/stream", s.stream)
@@ -39,13 +44,26 @@ func New() http.Handler {
 	mux.HandleFunc("/v1/messages", s.stream)
 	mux.HandleFunc("/api/stream-result", s.streamResult)
 	mux.HandleFunc("/glitchdeck.demo.v1.Quotes/Get", s.quote)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if (r.URL.Path == "/ws/ticker" || (r.Method != http.MethodGet && r.Method != http.MethodHead)) && !localweb.Allowed(r, "") {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		mux.ServeHTTP(w, r)
-	})
+	s.mux = mux
+	return s
+}
+
+func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if (r.URL.Path == "/ws/ticker" || (r.Method != http.MethodGet && r.Method != http.MethodHead)) && !localweb.Allowed(r, "") {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
+
+func (s *service) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	for conn := range s.sockets {
+		conn.Close()
+	}
+	return nil
 }
 func (s *service) charge(e entry) {
 	for _, old := range s.charges {
@@ -120,6 +138,24 @@ func (s *service) state(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"orders": s.orders, "charges": s.charges, "duplicate_charges": duplicates, "total_charged_cents": total, "ws_ticks_sent": s.ticks, "ws_broken": false, "llm_runs": s.llm["runs"], "llm_completed": s.llm["complete"], "llm_wedged": s.llm["wedged"], "llm_truncated": s.llm["truncated"], "llm_parse_errors": s.llm["parse_error"], "llm_silent_truncations": s.llm["silent_truncation"]})
 }
+
+func (s *service) summary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total, duplicates := 0, 0
+	for _, c := range s.charges {
+		total += c.AmountCents
+		if c.Duplicate {
+			duplicates++
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"orders_count": len(s.orders), "charges_count": len(s.charges), "duplicate_charges": duplicates, "total_charged_cents": total, "ws_ticks_sent": s.ticks})
+}
 func (s *service) reset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
@@ -156,6 +192,19 @@ func (s *service) ticker(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		conn.Close()
+		return
+	}
+	s.sockets[conn] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.sockets, conn)
+		s.mu.Unlock()
+	}()
 	defer conn.Close()
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	fmt.Fprintf(rw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", wsframe.AcceptKey(r.Header.Get("Sec-WebSocket-Key")))

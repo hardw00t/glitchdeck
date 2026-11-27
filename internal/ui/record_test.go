@@ -59,6 +59,25 @@ func TestUnsupportedTrafficMarksTapeIncomplete(t *testing.T) {
 	}
 }
 
+func TestRecordingDoesNotRetargetForwardedWebSocket(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	r.request(proxy.Record{Seq: 1, URL: "https://127.0.0.1/ws", Path: "/ws", WebSocket: true, MITM: true, At: time.Now()})
+	if doc := r.tape(fault.Config{}); !doc.Incomplete {
+		t.Fatal("forwarded WebSocket could be replayed against the reverse target")
+	}
+}
+
+func TestRecordedSSEKeepsProtocol(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	r.request(proxy.Record{Seq: 1, Path: "/events", Proto: "h2c", At: time.Now()})
+	r.markSSE(1)
+	if doc := r.tape(fault.Config{}); len(doc.Script) != 1 || doc.Script[0].Stream == nil || doc.Script[0].Stream.Proto != "h2c" {
+		t.Fatalf("protocol lost in SSE step: %+v", doc.Script)
+	}
+}
+
 func TestRecordingBudgetIncludesConfigSnapshots(t *testing.T) {
 	rule := func(seed uint64, size int) fault.Config {
 		return fault.Config{Seed: seed, Rules: []fault.Rule{{

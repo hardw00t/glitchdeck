@@ -133,8 +133,8 @@ func (c *control) startRecording(w http.ResponseWriter, r *http.Request) {
 	c.cfgMu.Lock()
 	cfg := c.p.Config()
 	var status recordingStatus
-	c.p.CaptureBoundary(func(nextSeq uint64, activeWS int) {
-		status = c.rec.start(nextSeq-1, activeWS, cfg)
+	c.p.CaptureBoundary(func(nextSeq uint64, activeStreams int) {
+		status = c.rec.start(nextSeq-1, activeStreams, cfg)
 	})
 	c.cfgMu.Unlock()
 	respond(w, status)

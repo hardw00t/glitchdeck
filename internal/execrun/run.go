@@ -1,12 +1,14 @@
 package execrun
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +17,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -108,6 +112,13 @@ func (e *Envelope) SetResults(results []tape.Result) {
 		}
 	}
 }
+
+type helperReport struct {
+	Leaked     []int  `json:"leaked"`
+	SpawnCode  int    `json:"spawn_code"`
+	SpawnError string `json:"spawn_error"`
+}
+
 func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	start := time.Now()
 	target := t.Target
@@ -174,10 +185,34 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		seed = *o.Seed
 	}
 	bus := telemetry.New()
+	evidence := newAssertionEvidence(t)
+	bus.SetObserver(evidence.observe)
 	p := proxy.New(parsed, fault.Config{Seed: seed, Rules: t.Rules}, bus)
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
 	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), InsecureUpstream: o.InsecureUpstream}
+	var scheduleStart time.Time
+	var configMu sync.Mutex
+	applied := make([]bool, len(t.ConfigChanges))
+	applyChanges := func(seq uint64) {
+		configMu.Lock()
+		defer configMu.Unlock()
+		for i, change := range t.ConfigChanges {
+			if applied[i] {
+				continue
+			}
+			due := change.AtMS != nil && time.Since(scheduleStart) >= time.Duration(*change.AtMS)*time.Millisecond
+			if change.AtMS == nil {
+				due = seq != 0 && seq >= change.BeforeSeq
+			}
+			if due {
+				p.SetConfig(fault.Config{Seed: change.Seed, Rules: change.Rules})
+				applied[i] = true
+			}
+		}
+	}
+	opts.BeforeRequest = applyChanges
+	opts.OnAdmission = evidence.admit
 	if o.UpstreamCA != "" {
 		data, x := os.ReadFile(o.UpstreamCA)
 		if x != nil {
@@ -282,6 +317,24 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		go server.Serve(l)
 		defer server.Close()
 	}
+	scheduleStart = time.Now()
+	scheduleCtx, stopSchedule := context.WithCancel(ctx)
+	defer stopSchedule()
+	for _, change := range t.ConfigChanges {
+		if change.AtMS == nil {
+			continue
+		}
+		at := *change.AtMS
+		go func() {
+			timer := time.NewTimer(time.Until(scheduleStart.Add(time.Duration(at) * time.Millisecond)))
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				applyChanges(0)
+			case <-scheduleCtx.Done():
+			}
+		}()
+	}
 	go p.Serve(listener)
 	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+o.NoProxy, "no_proxy="+o.NoProxy, "NODE_USE_ENV_PROXY=1")
 	if e.Exec.UIURL != "" {
@@ -303,7 +356,34 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if err = setupProcess(cmd, o.Grace); err != nil {
 		return finish(3, "PROCESS_SETUP_FAILED", err)
 	}
+	reportReader, reportWriter, err := isolateProcess(cmd, o.Grace)
+	if err != nil {
+		return finish(3, "PROCESS_SETUP_FAILED", err)
+	}
+	if reportReader != nil {
+		defer reportReader.Close()
+	}
+	ready := make(chan struct{})
+	if reportReader != nil {
+		cancelProcess := cmd.Cancel
+		cmd.Cancel = func() error {
+			<-ready
+			return cancelProcess()
+		}
+	}
+	relayGrace := o.Grace
+	if reportReader != nil {
+		relayGrace = 0
+	}
+	startSignals, stopSignals := forwardSignals(relayGrace)
+	defer stopSignals()
 	err = cmd.Start()
+	if reportWriter != nil {
+		_ = reportWriter.Close()
+	}
+	if err != nil {
+		close(ready)
+	}
 	if err != nil {
 		code := 125
 		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
@@ -311,14 +391,45 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		} else if errors.Is(err, os.ErrPermission) {
 			code = 126
 		}
+		if code == 127 && !strings.ContainsRune(o.Command[0], os.PathSeparator) {
+			for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+				if dir == "" {
+					dir = "."
+				}
+				info, statErr := os.Stat(filepath.Join(dir, o.Command[0]))
+				if statErr == nil && !info.IsDir() && info.Mode().Perm()&0111 == 0 {
+					code = 126
+					break
+				}
+			}
+		}
 		return finish(code, "EXEC_SPAWN_FAILED", err)
 	}
 	e.Exec.PID = cmd.Process.Pid
-	stopSignals := forwardSignals(cmd)
+	var helperOutput *bufio.Reader
+	if reportReader != nil {
+		helperOutput = bufio.NewReader(reportReader)
+		line, _ := helperOutput.ReadString('\n')
+		if pid, err := strconv.Atoi(strings.TrimSpace(line)); err == nil && pid > 0 {
+			e.Exec.PID = pid
+		}
+	}
+	close(ready)
+	startSignals(cmd)
 	waitErr := cmd.Wait()
 	timedOut := waitErr != nil && errors.Is(childCtx.Err(), context.DeadlineExceeded)
 	leaked := cleanupProcess(cmd, o.Grace)
-	stopSignals()
+	var helper helperReport
+	if reportReader != nil {
+		if err := json.NewDecoder(helperOutput).Decode(&helper); err != nil {
+			return finish(3, "PROCESS_CLEANUP_FAILED", fmt.Errorf("missing process cleanup result: %w", err))
+		}
+		leaked = helper.Leaked
+	}
+	if helper.SpawnCode != 0 {
+		return finish(helper.SpawnCode, "EXEC_SPAWN_FAILED", errors.New(helper.SpawnError))
+	}
+	cancel()
 	if len(leaked) > 0 {
 		e.Exec.LeakedPIDs = leaked
 	}
@@ -336,25 +447,20 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if cmd.ProcessState != nil {
 		e.Exec.ExitCode = cmd.ProcessState.ExitCode()
 	}
-	waitErr = p.Wait(childCtx)
+	httpTape := t
+	httpTape.Assertions = nil
+	for _, a := range t.Assertions {
+		if a.HTTPGet != "" {
+			httpTape.Assertions = append(httpTape.Assertions, a)
+		}
+	}
+	httpResults := assertions(ctx, httpTape, "http://"+listener.Addr().String(), target, opts.ProxyAuth, nil)
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
+	waitErr = p.Drain(drainCtx)
+	cancelDrain()
 	e.Summary.RequestsTotal = p.RequestsTotal()
 	stats := p.Stats()
-	rules := append([]fault.Rule(nil), t.Rules...)
-	for _, change := range t.ConfigChanges {
-		rules = append(rules, change.Rules...)
-	}
-	seenRules := make(map[string]bool)
-	for _, r := range rules {
-		if seenRules[r.ID] {
-			continue
-		}
-		seenRules[r.ID] = true
-		n := stats[r.ID].Applied
-		if n > 0 {
-			e.FaultsTriggered = append(e.FaultsTriggered, map[string]any{"rule_id": r.ID, "type": r.Fault.Type, "count": n})
-			e.Summary.FaultsTriggered += n
-		}
-	}
+	e.SetAppliedFaults(p.AppliedFaults())
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))
 	}
@@ -363,21 +469,26 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		return finish(124, "TIMEOUT", context.DeadlineExceeded)
 	}
 	if waitErr != nil {
-		if errors.Is(waitErr, context.DeadlineExceeded) {
-			e.Exec.TimedOut = true
-			return finish(124, "TIMEOUT", waitErr)
-		}
 		return finish(3, "PROXY_WAIT_FAILED", waitErr)
 	}
-	results := assertions(ctx, t, "http://"+listener.Addr().String(), target, opts.ProxyAuth, bus.History(4096))
+	protocolTape := t
+	protocolTape.Assertions = nil
+	for _, a := range t.Assertions {
+		if a.HTTPGet == "" {
+			protocolTape.Assertions = append(protocolTape.Assertions, a)
+		}
+	}
+	results := append(httpResults, assertions(ctx, protocolTape, "", target, opts.ProxyAuth, evidence.history())...)
 	e.SetResults(results)
 	failed := e.Summary.AssertionsFailed > 0
 	for _, x := range t.Expect.Faults {
 		n := stats[x.Rule].Applied
+		result := tape.Result{Name: "fault " + x.Rule, Failures: []string{}}
 		if x.MinApplied != nil && n < *x.MinApplied || x.MaxApplied != nil && n > *x.MaxApplied {
 			failed = true
-			e.SetResults([]tape.Result{{Name: "fault " + x.Rule, Failures: []string{fmt.Sprintf("applied count %d outside expected range", n)}}})
+			result.Failures = append(result.Failures, fmt.Sprintf("applied count %d outside expected range", n))
 		}
+		e.SetResults([]tape.Result{result})
 	}
 	expected := t.Expect.ChildExit
 	matched := e.Exec.ExitCode == 0

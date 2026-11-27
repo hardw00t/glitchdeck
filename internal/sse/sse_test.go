@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReaderPreservesFrames(t *testing.T) {
@@ -33,6 +34,23 @@ func TestReaderLineEndings(t *testing.T) {
 	}
 	if _, err := r.Next(); err != io.EOF || string(r.Tail()) != "untouched-tail" {
 		t.Fatalf("trailing data lost: %q %v", r.Tail(), err)
+	}
+}
+
+func TestReaderDispatchesCRWithoutNextByte(t *testing.T) {
+	r, w := io.Pipe()
+	defer r.Close()
+	defer w.Close()
+	done := make(chan Frame, 1)
+	go func() { f, _ := NewReader(r, 0).Next(); done <- f }()
+	go func() { _, _ = io.WriteString(w, "data: one\r\r") }()
+	select {
+	case f := <-done:
+		if f.Data != "one" {
+			t.Fatalf("frame=%+v", f)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CR-delimited event blocked")
 	}
 }
 

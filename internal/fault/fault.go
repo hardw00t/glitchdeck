@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"math"
 	"math/rand/v2"
+	"mime"
 	"net"
 	"strconv"
 	"strings"
@@ -189,7 +190,7 @@ func MatchRequest(c Config, q Query) *Rule {
 		if !r.Enabled || (r.Fault.Type == "ws-glitch") != q.WS || (r.Match.Method != "" && !strings.EqualFold(r.Match.Method, q.Method)) || !strings.HasPrefix(q.Path, r.Match.PathPrefix) {
 			continue
 		}
-		if r.Fault.Type == "h2-glitch" && q.Proto != "h2" || r.Fault.Type == "grpc-glitch" && (q.Proto != "h2" || !strings.HasPrefix(strings.ToLower(q.ContentType), "application/grpc")) {
+		if r.Fault.Type == "h2-glitch" && q.Proto != "h2" || r.Fault.Type == "grpc-glitch" && (q.Proto != "h2" || !NativeGRPC(q.ContentType)) {
 			continue
 		}
 		if r.Match.Proto != "" && r.Match.Proto != q.Proto || r.Match.Scheme != "" && r.Match.Scheme != q.Scheme {
@@ -223,6 +224,11 @@ func MatchRequest(c Config, q Query) *Rule {
 	}
 	return nil
 }
+func NativeGRPC(contentType string) bool {
+	media, _, err := mime.ParseMediaType(contentType)
+	return err == nil && (media == "application/grpc" || strings.HasPrefix(media, "application/grpc+"))
+}
+
 func RuleHash(id string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(id))
@@ -246,7 +252,7 @@ func H2Code(v any) (uint32, error) {
 		}
 	} else {
 		n := Int(map[string]any{"v": v}, "v", -1)
-		if n >= 0 && n < len(names) {
+		if (paramRange{min: 0, max: len(names) - 1}).valid(v) && n >= 0 && n < len(names) {
 			return uint32(n), nil
 		}
 	}
@@ -266,7 +272,7 @@ func GRPCCode(v any) (int, error) {
 		}
 	} else {
 		n := Int(map[string]any{"v": v}, "v", -1)
-		if n >= 0 && n <= 16 {
+		if (paramRange{min: 0, max: 16}).valid(v) && n >= 0 && n <= 16 {
 			return n, nil
 		}
 	}

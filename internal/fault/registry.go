@@ -112,9 +112,13 @@ func init() {
 func validateV2(r Rule) error {
 	s := Registry[r.Fault.Type]
 	p := r.Fault.Params
+	action := String(p, "action", s.Actions[0])
+	if action == "early_eof" {
+		action = "eof_early"
+	}
 	for k, v := range p {
 		spec, ok := s.Params[k]
-		if !ok || !spec.valid(v) && !(r.Fault.Type == "sse-glitch" && k == "action" && v == "early_eof") {
+		if !ok || len(spec.Actions) != 0 && !slices.Contains(spec.Actions, action) || !spec.valid(v) && !(r.Fault.Type == "sse-glitch" && k == "action" && v == "early_eof") {
 			return invalidParam(r.ID, k)
 		}
 	}

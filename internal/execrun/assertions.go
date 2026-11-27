@@ -14,7 +14,7 @@ import (
 
 func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password string, events []telemetry.Event) []tape.Result {
 	out := make([]tape.Result, 0, len(t.Assertions))
-	client := http.Client{Timeout: 10 * time.Second}
+	client := http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	for _, a := range t.Assertions {
 		if a.HTTPGet == "" {
 			out = append(out, observedAssertion(a, t, events))

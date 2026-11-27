@@ -74,21 +74,20 @@ func testTape(args []string) int {
 	if len(files) == 1 {
 		filename = files[0]
 	}
+	version := 0
 	fail := func(machine string, err error) int {
 		e := execrun.NewEnvelope("test", filename, *target)
 		e.ExitCode = 2
 		e.Error = map[string]string{"code": machine, "message": err.Error()}
 		if *report != "" {
-			data, marshalErr := json.Marshal(e)
-			if marshalErr == nil {
-				marshalErr = os.WriteFile(*report, append(data, '\n'), 0600)
-			}
-			if marshalErr != nil {
-				fmt.Fprintln(os.Stderr, marshalErr)
+			if err := execrun.WriteReport(*report, e); err != nil {
+				fmt.Fprintln(os.Stderr, err)
 			}
 		}
 		if wantJSON {
-			_ = json.NewEncoder(os.Stdout).Encode(e)
+			if version != 1 {
+				_ = json.NewEncoder(os.Stdout).Encode(e)
+			}
 			cli.Error(os.Stderr, strings.ToLower(machine), err, 2)
 		} else {
 			fmt.Fprintln(os.Stderr, err)
@@ -110,6 +109,7 @@ func testTape(args []string) int {
 	if err != nil {
 		return fail("TAPE_INVALID", err)
 	}
+	version = t.Version
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -136,28 +136,9 @@ func testTape(args []string) int {
 	envelope.DurationMS = time.Since(started).Milliseconds()
 	envelope.SetResults(results)
 	envelope.Summary.RequestsTotal = runReport.RequestsTotal
-	rules := append([]fault.Rule(nil), t.Rules...)
-	for _, change := range t.ConfigChanges {
-		rules = append(rules, change.Rules...)
-	}
-	seenRules := make(map[string]bool)
-	for _, rule := range rules {
-		if seenRules[rule.ID] {
-			continue
-		}
-		seenRules[rule.ID] = true
-		n := runReport.Rules[rule.ID].Applied
-		if n > 0 {
-			envelope.FaultsTriggered = append(envelope.FaultsTriggered, map[string]any{"rule_id": rule.ID, "type": rule.Fault.Type, "count": n})
-			envelope.Summary.FaultsTriggered += n
-		}
-	}
+	envelope.SetAppliedFaults(runReport.AppliedFaults)
 	if *report != "" {
-		data, e := json.Marshal(envelope)
-		if e == nil {
-			e = os.WriteFile(*report, append(data, '\n'), 0600)
-		}
-		if e != nil {
+		if e := execrun.WriteReport(*report, envelope); e != nil {
 			return fail("TAPE_IO", e)
 		}
 	}
@@ -311,6 +292,9 @@ func serve(args []string, isDemo bool) int {
 			if errors.Is(err, tlsmitm.ErrInsecurePerms) {
 				code = "ca_insecure_perms"
 			}
+			if errors.Is(err, os.ErrNotExist) && *caDir != "" {
+				err = fmt.Errorf("CA store is not initialized; run glitchdeck ca init --ca-dir %q", *caDir)
+			}
 			return fail(code, err)
 		}
 	}
@@ -329,12 +313,16 @@ func serve(args []string, isDemo bool) int {
 		listeners = append(listeners, appListener)
 	}
 	errs := make(chan error, len(servers)+1)
+	var events <-chan telemetry.Event
+	var stopEvents func()
+	if *asJSON {
+		_, events, stopEvents = bus.Subscribe()
+	}
 	go func() { errs <- p.Serve(pl) }()
 	for i, s := range servers {
 		l := listeners[i]
 		go func(s *http.Server) { errs <- s.Serve(l) }(s)
 	}
-	var stopEvents func()
 	var eventsDone chan struct{}
 	if *asJSON {
 		var fingerprint any
@@ -350,14 +338,17 @@ func serve(args []string, isDemo bool) int {
 			demoValue = demoURL
 		}
 		json.NewEncoder(os.Stdout).Encode(map[string]any{"type": "ready", "proxy": "http://" + pl.Addr().String(), "ui": "http://" + ul.Addr().String(), "demo": demoValue, "tls": map[string]any{"enabled": *tlsEnabled, "ca_cert": certPath, "fingerprint": fingerprint}})
-		_, events, unsubscribe := bus.Subscribe()
-		stopEvents = unsubscribe
+		encoder := json.NewEncoder(os.Stdout)
 		eventsDone = make(chan struct{})
 		go func() {
 			defer close(eventsDone)
-			enc := json.NewEncoder(os.Stdout)
+			var lastID uint64
 			for event := range events {
-				_ = enc.Encode(map[string]any{"type": "event", "event": event})
+				if event.ID > lastID+1 {
+					_ = encoder.Encode(map[string]any{"type": "event_gap", "first_id": lastID + 1, "last_id": event.ID - 1})
+				}
+				_ = encoder.Encode(map[string]any{"type": "event", "event": event})
+				lastID = event.ID
 			}
 		}()
 	} else {

@@ -30,6 +30,7 @@ const TransportErrorHeader = "X-Glitchdeck-Transport-Error"
 type Outcome struct {
 	Seq       uint64
 	Reset     bool
+	H2Fault   bool
 	Err       error
 	WSAction  string
 	WSMessage uint64
@@ -57,18 +58,23 @@ type Proxy struct {
 	transport          *http.Transport
 	h2c                *http.Transport
 	gate               sync.Mutex
+	admission          sync.Mutex
 	generation         uint64
 	activeWS           int
+	activeTunnels      int
 	mu                 sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
 	pending            int
 	done               chan struct{}
 	closed             bool
+	draining           bool
 	options            Options
 	server             *http.Server
 	front              *front
 	stats              map[string]RuleStats
+	applied            map[AppliedFault]uint64
+	OnBlindTunnel      func(uint64)
 	OnSSE              func(uint64)
 	OnRequest          func(Record)
 	OnClientFrame      func(uint64, []byte)
@@ -136,7 +142,7 @@ func (p *Proxy) ActiveWebSockets() int { p.gate.Lock(); defer p.gate.Unlock(); r
 func (p *Proxy) CaptureBoundary(fn func(uint64, int)) {
 	p.gate.Lock()
 	defer p.gate.Unlock()
-	fn(p.seq.Load()+1, p.activeWS)
+	fn(p.seq.Load()+1, p.activeWS+p.activeTunnels)
 }
 func (p *Proxy) Reset() { p.ResetWith(nil) }
 func (p *Proxy) ResetWith(fn func()) {
@@ -146,8 +152,11 @@ func (p *Proxy) ResetWith(fn func()) {
 	p.cancel()
 	p.generation++
 	p.activeWS = 0
+	p.activeTunnels = 0
 	p.mu.Unlock()
+	p.gate.Unlock()
 	_ = p.Wait(context.Background())
+	p.gate.Lock()
 	p.mu.Lock()
 	if !p.closed {
 		p.ctx, p.cancel = context.WithCancel(context.Background())
@@ -155,6 +164,7 @@ func (p *Proxy) ResetWith(fn func()) {
 	p.seq.Store(0)
 	p.requests.Store(0)
 	clear(p.stats)
+	clear(p.applied)
 	p.mu.Unlock()
 	if fn != nil {
 		fn()
@@ -199,6 +209,23 @@ func (p *Proxy) Wait(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+func (p *Proxy) Drain(ctx context.Context) error {
+	p.gate.Lock()
+	p.mu.Lock()
+	p.draining = true
+	ch := p.done
+	p.mu.Unlock()
+	p.gate.Unlock()
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type reverseTargetKey struct{}
+
 func (p *Proxy) publish(gen uint64, kind string, v any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -208,15 +235,18 @@ func (p *Proxy) publish(gen uint64, kind string, v any) {
 }
 func (p *Proxy) outcome(gen uint64, o Outcome) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if gen == p.generation && p.OnOutcome != nil {
-		p.OnOutcome(o)
+	fn := p.OnOutcome
+	valid := gen == p.generation
+	p.mu.Unlock()
+	if valid && fn != nil {
+		fn(o)
 	}
 }
 func (p *Proxy) callback(gen uint64, fn func()) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if gen == p.generation {
+	valid := gen == p.generation
+	p.mu.Unlock()
+	if valid {
 		fn()
 	}
 }
@@ -253,6 +283,15 @@ func (p *Proxy) upstream(r *http.Request, body []byte, ctx context.Context) *htt
 	return q
 }
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.mu.Lock()
+	if p.closed || p.draining {
+		p.mu.Unlock()
+		http.Error(w, "proxy closed", http.StatusServiceUnavailable)
+		return
+	}
+	p.beginPendingLocked()
+	p.mu.Unlock()
+	defer p.finishPending()
 	if !prepareProtocolRequest(r) {
 		http.Error(w, "request does not match CONNECT authority", http.StatusMisdirectedRequest)
 		return
@@ -276,21 +315,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else if p.target != nil {
+		if p.options.RequireUpstreamAllow && !p.allowed(p.target.Hostname(), upstreamPort(p.target.Scheme, p.target.Port())) {
+			http.Error(w, "egress denied", http.StatusForbidden)
+			return
+		}
 		scheme, host = p.target.Scheme, p.target.Host
 	} else {
 		scheme, host = "http", r.Host
 	}
+	p.admission.Lock()
 	p.gate.Lock()
 	p.mu.Lock()
-	session, gen, closed := p.ctx, p.generation, p.closed
+	session, gen, closed := p.ctx, p.generation, p.closed || p.draining
 	p.mu.Unlock()
 	if closed || session.Err() != nil {
 		p.gate.Unlock()
+		p.admission.Unlock()
 		http.Error(w, "proxy closed", 503)
 		return
 	}
 	seq := p.seq.Add(1)
+	p.gate.Unlock()
+	if p.options.BeforeRequest != nil {
+		p.options.BeforeRequest(seq)
+	}
 	cfg := *p.cfg.Load()
+	if p.options.OnAdmission != nil {
+		p.options.OnAdmission(seq, r.Method, r.URL.RequestURI(), host)
+	}
+	p.admission.Unlock()
+	p.gate.Lock()
 	ws := r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
 	if ws {
 		p.activeWS++
@@ -323,7 +377,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	meta := MetaFrom(ctx)
 	streamID := streamFrom(ctx)
 	ctype := r.Header.Get("Content-Type")
-	isGRPC := strings.HasPrefix(strings.ToLower(ctype), "application/grpc")
+	isGRPC := r.ProtoMajor == 2 && fault.NativeGRPC(ctype)
 	match := fault.Query{Method: r.Method, Path: r.URL.Path, Host: host, Scheme: scheme, Proto: proto, ContentType: ctype, Seq: seq, WS: ws}
 	rule := fault.MatchRequest(cfg, match)
 	var kind, action, skip, h2Error string
@@ -331,8 +385,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if rule != nil {
 		kind, params = rule.Fault.Type, rule.Fault.Params
 		if !ws {
-			p.countRule(gen, rule.ID, "matched", "")
+			p.countRule(gen, rule, "matched", "")
 		}
+	}
+	applied := false
+	ruleID := ""
+	if rule != nil {
+		ruleID = rule.ID
+	}
+	markApplied := func() {
+		applied = true
+		p.countRule(gen, rule, "applied", "")
 	}
 	status, n, end := 0, int64(0), "complete"
 	runID := r.Header.Get("X-Glitchdeck-Run")
@@ -347,7 +410,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ws {
 		defer func() {
 			if isGRPC {
-				p.grpcEvent(gen, seq, r, status, grpcStatus, grpcSource, grpcMessage, kind, action, h2Error, grpcIn.Count(), grpcOut.Count(), start)
+				p.grpcEvent(gen, seq, r, status, grpcStatus, grpcSource, grpcMessage, kind, action, h2Error, ruleID, applied, grpcIn.Count(), grpcOut.Count(), start)
 			}
 			var tunnel string
 			if meta.MITM {
@@ -361,6 +424,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"seq": seq, "ts_ms": start.UnixMilli(), "method": r.Method, "path": r.URL.RequestURI(),
 				"status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": int64(len(body)) + streamedBytes.Load(), "resp_bytes": n,
 				"fault": kind, "replay_index": 0, "request_headers": inspectorHeaders(r.Header),
+				"applied": applied, "rule_id": ruleID,
 				"response_headers": inspectorHeaders(upstreamHeaders), "body_snippet": string(body[:min(len(body), 256)]),
 				"proto": r.Proto, "protocol": protocol, "scheme": scheme, "host": host, "stream_id": streamID, "sse": isSSE,
 				"sse_events": sseEvents, "grpc_status": grpcStatus, "fault_action": action, "fault_skipped": skip, "end": end, "run_id": runID, "tunnel": tunnel,
@@ -378,6 +442,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			WebSocket: ws, At: start, Proto: recordProto, UnrecordableBody: missing, MITM: meta.MITM}
 		if r.URL.IsAbs() {
 			rec.URL = r.URL.String()
+		} else if meta.MITM {
+			rec.URL = scheme + "://" + host + r.URL.RequestURI()
 		}
 		p.callback(gen, func() { p.OnRequest(rec) })
 	}
@@ -393,19 +459,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h2Error = h2Names[plan.Code]
 		if meta.Tap == nil || streamID == 0 {
-			record(nil, false)
+			record(nil, r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0)
 			h2Error, end, skip = "INTERNAL_ERROR", "h2_rst", "untapped"
-			p.countRule(gen, rule.ID, "skipped", skip)
+			p.countRule(gen, rule, "skipped", skip)
 			panic(http.ErrAbortHandler)
 		}
-		cutsStream = plan.Kind == "rst" || plan.LastStream < streamID
+		cutsStream = plan.Kind == "rst"
 		plan.Applied = new(atomic.Bool)
 		p.mu.Lock()
 		p.beginPendingLocked()
 		p.mu.Unlock()
 		defer p.finishPending()
-		planDone := meta.Tap.Arm(streamID, plan)
+		planDone := meta.Tap.ArmContext(ctx, streamID, plan)
 		defer func() {
+			if !plan.BeforeHdrs && plan.AfterBytes == 0 && status != 0 {
+				flushPlanned = true
+				_ = http.NewResponseController(w).Flush()
+			}
 			if flushPlanned && (plan.BeforeHdrs || n >= plan.AfterBytes) {
 				// HTTP/2 Flush can return before the buffered frame reaches the tap.
 				select {
@@ -415,7 +485,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if plan.Applied.Load() {
-				p.countRule(gen, rule.ID, "applied", "")
+				markApplied()
+				p.outcome(gen, Outcome{Seq: seq, H2Fault: true})
 				if cutsStream {
 					n = min(n, plan.AfterBytes)
 					grpcStatus, grpcSource, grpcMessage = nil, "proxy", ""
@@ -425,21 +496,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if end == "h2_rst" || end == "h2_goaway" {
 					end = "complete"
 				}
-				p.countRule(gen, rule.ID, "skipped", skip)
+				p.countRule(gen, rule, "skipped", skip)
 			}
 		}()
 		if plan.BeforeHdrs {
-			record(nil, false)
+			record(nil, r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0)
 			flushPlanned = true
 			_ = http.NewResponseController(w).Flush()
 			return
 		}
 	}
 	if !ws && kind == "tcp-rst" && fault.Bool(params, "before_headers", false) {
-		record(nil, false)
+		record(nil, r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0)
 		resetWriter(w, func() {
 			end = "rst"
-			p.countRule(gen, rule.ID, "applied", "")
+			markApplied()
 			p.outcome(gen, Outcome{Seq: seq, Reset: true})
 		})
 		return
@@ -465,7 +536,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				code = 14
 			}
 			injectGRPC(code, fault.String(params, "message", ""), "injected")
-			p.countRule(gen, rule.ID, "applied", "")
+			markApplied()
 			return
 		}
 	}
@@ -498,12 +569,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		count, _ := io.WriteString(w, fault.String(params, "body", ""))
 		n = int64(count)
-		p.countRule(gen, rule.ID, "applied", "")
+		markApplied()
 		return
 	}
 	if kind == "latency-wave" && !wait(ctx, time.Duration(fault.Latency(cfg.Seed, seq, params))*time.Millisecond) {
 		end = "client_cancel"
 		panic(http.ErrAbortHandler)
+	}
+	if !r.URL.IsAbs() && !meta.MITM && !p.options.RequireUpstreamAllow {
+		ctx = context.WithValue(ctx, reverseTargetKey{}, true)
 	}
 	q := p.upstream(r, body, ctx)
 	if q == nil {
@@ -524,6 +598,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	transport := p.transport
 	if r.ProtoMajor == 2 && q.URL.Scheme == "http" {
 		transport = p.h2c
+	}
+	if meta.Tap != nil && streamID != 0 && !meta.Tap.AdmitUpstream(streamID) {
+		meta.Tap.Reset(streamID, 7)
+		panic(http.ErrAbortHandler)
 	}
 	resp, err := transport.RoundTrip(q)
 	if err != nil {
@@ -554,12 +632,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "dup-webhook":
 		if fault.Int(params, "count", 2) > 1 {
 			if buffered || r.Body == nil || r.Body == http.NoBody {
-				p.replays(r, body, seq, gen, params)
-				p.countRule(gen, rule.ID, "applied", "")
+				if p.replays(r, body, seq, gen, rule, params, transport) {
+					markApplied()
+				}
 			} else {
 				err := errors.New("cannot replay streamed request body")
 				p.outcome(gen, Outcome{Seq: seq, Err: err})
-				p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": kind, "error": err.Error()})
+				p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": kind, "rule_id": ruleID, "applied": false, "error": err.Error()})
 			}
 		}
 	case "tcp-rst":
@@ -567,14 +646,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			n = resetResponse(w, resp, r.Method, fault.Int(params, "after_bytes", 0), cancel, func(err error) {
 				if err == nil {
 					end = "rst"
-					p.countRule(gen, rule.ID, "applied", "")
+					markApplied()
 				}
 				p.outcome(gen, Outcome{Seq: seq, Reset: err == nil, Err: err})
 			})
 			return
 		}
 	case "byte-trickle", "latency-wave":
-		p.countRule(gen, rule.ID, "applied", "")
+		markApplied()
 	case "sse-glitch":
 		action = fault.String(params, "action", "stall")
 		if action == "early_eof" {
@@ -585,13 +664,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if media == "text/event-stream" {
 				skip = "encoded"
 			}
-			p.countRule(gen, rule.ID, "skipped", skip)
+			p.countRule(gen, rule, "skipped", skip)
 		}
 	}
 	if isSSE && r.ProtoMajor == 1 && sseNeedsHijack(rule) {
 		result := p.relayHijackedSSE(ctx, w, resp, rule, cfg.Seed, seq, gen, start, runID)
 		n, sseEvents, end, skip = result.bytes, result.events, requestSSEEnd(result.end), result.skip
-		if result.err != nil {
+		applied = applied || result.applied
+		if result.err != nil && result.end != "client_cancel" {
 			p.outcome(gen, Outcome{Seq: seq, Err: result.err})
 		}
 		return
@@ -626,6 +706,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isSSE && kind != "byte-trickle" && plan.Applied == nil {
 		result := p.relaySSE(ctx, w, resp.Body, rule, cfg.Seed, seq, gen, start, runID)
 		n, sseEvents, end, skip = result.bytes, result.events, requestSSEEnd(result.end), result.skip
+		applied = applied || result.applied
 		if r.ProtoMajor == 2 && (result.end == "rst" || result.end == "eof_early" && !fault.Bool(params, "http_clean", true)) {
 			code := uint32(0)
 			if result.end == "rst" {
@@ -638,7 +719,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				panic(http.ErrAbortHandler)
 			}
 		}
-		if result.err != nil {
+		if result.err != nil && result.end != "client_cancel" {
 			p.outcome(gen, Outcome{Seq: seq, Err: result.err})
 			if result.end == "upstream_error" {
 				panic(http.ErrAbortHandler)
@@ -664,7 +745,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n, injected, err = relayGRPCMessages(flushWriter{w}, responseBody, grpcAfter, code, message)
 		if injected {
 			grpcStatus, grpcSource, grpcMessage = &code, "injected", message
-			p.countRule(gen, rule.ID, "applied", "")
+			markApplied()
 			return
 		}
 	} else if kind == "byte-trickle" {
@@ -808,10 +889,11 @@ func trickle(ctx context.Context, w http.ResponseWriter, body io.Reader, params 
 	}
 }
 func rst(c net.Conn) {
-	if t, ok := rawConn(c).(interface{ SetLinger(int) error }); ok {
+	raw := rawConn(c)
+	if t, ok := raw.(interface{ SetLinger(int) error }); ok {
 		_ = t.SetLinger(0)
 	}
-	_ = c.Close()
+	_ = raw.Close()
 }
 func resetWriter(w http.ResponseWriter, injected func()) {
 	h, ok := w.(http.Hijacker)
@@ -865,23 +947,29 @@ func resetResponse(w http.ResponseWriter, resp *http.Response, method string, n 
 	result(copyErr)
 	return count
 }
-func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, params map[string]any) {
+func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, rule *fault.Rule, params map[string]any, transport *http.Transport) bool {
 	count := fault.Int(params, "count", 2)
 	delay := fault.Int(params, "delay_ms", 150)
 	p.mu.Lock()
 	if p.closed || p.ctx.Err() != nil || gen != p.generation {
 		p.mu.Unlock()
-		return
+		return false
 	}
 	ctx := p.ctx
-	overloaded := false
+	started := false
+	var replayErr error
 	for i := 1; i < count; i++ {
 		if p.pending >= 64 {
-			overloaded = true
+			replayErr = errors.New("webhook replay capacity exceeded")
+			break
+		}
+		q := p.upstream(r, body, ctx)
+		if q == nil || !p.allowed(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port())) {
+			replayErr = errors.New("webhook replay egress denied")
 			break
 		}
 		p.beginPendingLocked()
-		q := p.upstream(r, body, ctx)
+		started = true
 		if fault.Bool(params, "replay_header", false) {
 			q.Header.Set("X-Glitchdeck-Replay", strconv.Itoa(i))
 		}
@@ -893,7 +981,7 @@ func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, params ma
 			replayCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel()
 			start := time.Now()
-			resp, err := p.transport.RoundTrip(q.WithContext(replayCtx))
+			resp, err := transport.RoundTrip(q.WithContext(replayCtx))
 			status := 0
 			var n int64
 			if err == nil {
@@ -904,13 +992,13 @@ func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, params ma
 			if err != nil && ctx.Err() == nil {
 				p.outcome(gen, Outcome{Seq: seq, Err: err})
 			}
-			p.publish(gen, "http_req", map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "replay_index": index})
+			p.publish(gen, "http_req", map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "rule_id": rule.ID, "applied": true, "replay_index": index})
 		}(i)
 	}
 	p.mu.Unlock()
-	if overloaded {
-		err := errors.New("webhook replay capacity exceeded")
-		p.outcome(gen, Outcome{Seq: seq, Err: err})
-		p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": "dup-webhook", "error": err.Error()})
+	if replayErr != nil {
+		p.outcome(gen, Outcome{Seq: seq, Err: replayErr})
+		p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": "dup-webhook", "rule_id": rule.ID, "applied": false, "error": replayErr.Error()})
 	}
+	return started
 }

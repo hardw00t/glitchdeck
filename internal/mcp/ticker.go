@@ -3,6 +3,7 @@ package mcp
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -37,13 +38,45 @@ func (s *Server) ticker(frames int) error {
 	if resp.StatusCode != 101 {
 		return fmt.Errorf("websocket status %d", resp.StatusCode)
 	}
-	for range frames {
+	var message []byte
+	fragmented := false
+	for received := 0; received < frames; {
 		frame, err := wsframe.Read(reader, false)
 		if err != nil {
 			return err
 		}
-		if frame.Opcode == 8 {
+		switch frame.Opcode {
+		case 8:
 			return fmt.Errorf("websocket closed")
+		case 9:
+			if err := wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 10, Payload: frame.Payload}, true); err != nil {
+				return err
+			}
+			continue
+		case 10:
+			continue
+		case 1:
+			if fragmented {
+				return fmt.Errorf("unexpected websocket message")
+			}
+			message = message[:0]
+		case 0:
+			if !fragmented {
+				return fmt.Errorf("unexpected websocket continuation")
+			}
+		default:
+			return fmt.Errorf("unexpected websocket message type")
+		}
+		if len(message)+len(frame.Payload) > wsframe.MaxPayload {
+			return fmt.Errorf("websocket message too large")
+		}
+		message = append(message, frame.Payload...)
+		fragmented = !frame.Fin
+		if frame.Fin {
+			if !json.Valid(message) {
+				return fmt.Errorf("invalid ticker JSON")
+			}
+			received++
 		}
 	}
 	return wsframe.Write(conn, wsframe.Frame{Fin: true, Opcode: 8, Payload: []byte{3, 232}}, true)

@@ -13,6 +13,68 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/fault"
 )
 
+func TestV1RejectsV2KeysInConfigurationChanges(t *testing.T) {
+	for _, rule := range []string{
+		`{id: late, match: {host: ""}, fault: {type: rate-limit}}`,
+		`{id: late, fault: {type: h2-glitch}}`,
+	} {
+		doc := "version: 1\ntarget: demo\nconfig_changes:\n  - before_seq: 1\n    rules: [" + rule + "]\n"
+		if _, err := Decode(strings.NewReader(doc)); err == nil || !strings.Contains(err.Error(), "version: 2") {
+			t.Fatalf("v1 accepted v2 rule %s: %v", rule, err)
+		}
+	}
+}
+
+func TestDecodeRejectsInvalidChildExit(t *testing.T) {
+	for _, value := range []string{"true", "1.5", "non-zero"} {
+		doc := "version: 2\ntarget: demo\nexpect: {child_exit: " + value + "}\n"
+		if _, err := Decode(strings.NewReader(doc)); err == nil || !strings.Contains(err.Error(), "child_exit") {
+			t.Fatalf("invalid child exit %s: %v", value, err)
+		}
+	}
+}
+
+func TestAssertionDiagnosticsAreBounded(t *testing.T) {
+	data := `{"large":"` + strings.Repeat("x", 1<<20) + `"}`
+	got := CheckAssertionJSON([]byte(data), map[string]any{"large": "small"}, nil)
+	if len(got) != 1 || len(got[0]) > 1024 || !strings.Contains(got[0], "truncated") {
+		t.Fatalf("unbounded assertion diagnostic: %d entries", len(got))
+	}
+}
+
+func TestRejectPathOnlyTLSProtocol(t *testing.T) {
+	for _, step := range []string{"http: {path: /, proto: h2}", "grpc: {path: /, proto: h2}", "stream: {path: /, proto: h2}"} {
+		doc := "version: 2\ntarget: demo\nscript:\n  - " + step + "\n"
+		if _, err := Decode(strings.NewReader(doc)); err == nil || !strings.Contains(err.Error(), "requires an HTTPS URL") {
+			t.Fatalf("invalid protocol declaration %s: %v", step, err)
+		}
+	}
+}
+
+func TestGRPCMixedCaseHTTPSUsesProxy(t *testing.T) {
+	proxyHit := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHit <- r.Method + " " + r.Host
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	// Route selection must use the scheme parsed by net/url, not its original spelling.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := runGRPC(ctx, server.URL, GRPC{URL: "HTTPS://127.0.0.1:1/service/Call"})
+	if err == nil {
+		t.Fatal("proxy rejection did not fail gRPC request")
+	}
+	select {
+	case got := <-proxyHit:
+		if got != "CONNECT 127.0.0.1:1" {
+			t.Fatalf("proxy received %q", got)
+		}
+	default:
+		t.Fatal("request did not use the local proxy")
+	}
+}
+
 func TestStreamParserAndReport(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -133,5 +195,22 @@ func TestH2TapeCountsWireFault(t *testing.T) {
 				t.Fatalf("fault report: %+v, error %v", stats, err)
 			}
 		})
+	}
+}
+
+func TestH2TapeRecognizesTimelineTCPReset(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	doc := Tape{
+		Version: 2, Target: "demo",
+		Script: []Step{{HTTP: &HTTP{Path: "/api/state", Proto: "h2c"}}},
+		ConfigChanges: []ConfigChange{{BeforeSeq: 1, Rules: []fault.Rule{{
+			ID: "cut", Enabled: true, Match: fault.Match{Proto: "h2"},
+			Fault: fault.Fault{Type: "tcp-rst", Params: map[string]any{"before_headers": true}},
+		}}}},
+	}
+	_, report, err := RunWithReport(ctx, doc, "")
+	if err != nil || report.Rules["cut"].Applied != 1 {
+		t.Fatalf("timeline reset was not recognized: %+v, %v", report, err)
 	}
 }

@@ -81,6 +81,8 @@ func TestTapeReportIncludesChangedRule(t *testing.T) {
 	report := filepath.Join(dir, "report.json")
 	data := `version: 2
 target: demo
+rules:
+  - {id: changed, enabled: false, fault: {type: rate-limit}}
 config_changes:
   - before_seq: 1
     rules:
@@ -109,8 +111,56 @@ script:
 		Summary struct {
 			FaultsTriggered uint64 `json:"faults_triggered"`
 		} `json:"summary"`
+		Faults []struct {
+			RuleID string `json:"rule_id"`
+			Type   string `json:"type"`
+		} `json:"faults_triggered"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil || got.Summary.FaultsTriggered != 1 {
+	if err := json.Unmarshal(raw, &got); err != nil || got.Summary.FaultsTriggered != 1 || len(got.Faults) != 1 || got.Faults[0].RuleID != "changed" || got.Faults[0].Type != "dup-webhook" {
 		t.Fatalf("report %s: %v", raw, err)
+	}
+}
+
+func TestV1RuntimeErrorKeepsJSONStdoutEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tape.yaml")
+	report := filepath.Join(dir, "report.json")
+	if err := os.WriteFile(path, []byte("version: 1\ntarget: \"\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	old := os.Stdout
+	os.Stdout = writer
+	code := run([]string{"test", "--json", "--report", report, path})
+	os.Stdout = old
+	writer.Close()
+	out, err := io.ReadAll(reader)
+	if err != nil || len(out) != 0 || code != 2 {
+		t.Fatalf("exit %d, stdout %q, read error %v", code, out, err)
+	}
+	if data, err := os.ReadFile(report); err != nil || !json.Valid(data) {
+		t.Fatalf("missing JSON report: %s (%v)", data, err)
+	}
+}
+
+func TestDemoMissingCAExplainsInitialization(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "new-ca")
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	old := os.Stderr
+	os.Stderr = writer
+	code := run([]string{"demo", "--ca-dir", dir, "--listen", "127.0.0.1:0", "--ui", "127.0.0.1:0", "--app", "127.0.0.1:0"})
+	os.Stderr = old
+	writer.Close()
+	out, err := io.ReadAll(reader)
+	if err != nil || code != 2 || !strings.Contains(string(out), "glitchdeck ca init --ca-dir") || !strings.Contains(string(out), dir) {
+		t.Fatalf("exit %d, stderr %q, read error %v", code, out, err)
 	}
 }

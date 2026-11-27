@@ -59,8 +59,7 @@ func execCommand(args []string) int {
 	}
 	emit := func(e execrun.Envelope) int {
 		if *report != "" {
-			data, _ := json.Marshal(e)
-			if err := os.WriteFile(*report, append(data, '\n'), 0600); err != nil {
+			if err := execrun.WriteReport(*report, e); err != nil {
 				e.ExitCode, e.OK = 3, false
 				e.Error = map[string]string{"code": "TAPE_IO", "message": err.Error()}
 			}
@@ -85,10 +84,13 @@ func execCommand(args []string) int {
 		return emit(e)
 	}
 	sep := slices.Index(args, "--")
-	if err := f.Parse(args); err != nil {
+	if sep < 0 {
+		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
+	}
+	if err := f.Parse(args[:sep]); err != nil {
 		return fail("USAGE_ERROR", err)
 	}
-	if sep < 0 || *path == "" || f.NArg() == 0 || o.Timeout <= 0 || o.Grace <= 0 {
+	if *path == "" || f.NArg() != 0 || sep+1 == len(args) || o.Timeout <= 0 || o.Grace <= 0 {
 		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
 	}
 	file, err := os.Open(*path)
@@ -105,7 +107,7 @@ func execCommand(args []string) int {
 			o.Seed = seed
 		}
 	})
-	o.Command, o.TapePath, o.JSON, o.UpstreamAllow = f.Args(), *path, *asJSON, allow
+	o.Command, o.TapePath, o.JSON, o.UpstreamAllow = args[sep+1:], *path, *asJSON, allow
 	return emit(execrun.Run(context.Background(), t, o))
 }
 
@@ -115,7 +117,13 @@ func mcpCommand(args []string) int {
 	if f.Parse(args) != nil || f.NArg() != 0 {
 		return 2
 	}
-	if err := mcp.NewServer(os.Stdin, os.Stdout, mcp.Options{Workdir: *workdir, Version: buildVersion()}).Serve(); err != nil {
+	output, err := mcp.OwnedStdioOutput()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 3
+	}
+	defer output.Close()
+	if err := mcp.NewServer(os.Stdin, output, mcp.Options{Workdir: *workdir, Version: buildVersion(), CloseOutputOnCancel: true}).Serve(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}

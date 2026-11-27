@@ -124,7 +124,7 @@ const definitions = [
   {
     type: "h2-grpc", name: "H2 / gRPC", desc: "DISRUPT H2 & RPC FRAMES",
     params: {action:"rst_stream"}, match:{probability:100},
-    controls: [["Mode","action","select",[["rst_stream","RST_STREAM"],["goaway","GOAWAY"],["grpc_14","gRPC 14 UNAVAILABLE"],["grpc_4","gRPC 4 DEADLINE"]]],["Rate","probability","range",0,100,1,"%"],["Target","path_prefix","select",[["","All H2/gRPC"],["/grpc.","/grpc.*"],["/api/","/api/*"]]]],
+    controls: [["Mode","action","select",[["rst_stream","RST_STREAM"],["goaway","GOAWAY"],["grpc_14","gRPC 14 UNAVAILABLE"],["grpc_4","gRPC 4 DEADLINE"]]],["Rate","probability","range",0,100,1,"%"],["Target","path_prefix","select",[["","ALL"],["/grpc.","/grpc.*"],["/api/","/api/*"]]]],
   },
 ];
 let config = { rules: [] },
@@ -140,7 +140,8 @@ let config = { rules: [] },
   demo = false,
   refreshTimer;
 const reduced = matchMedia("(prefers-reduced-motion: reduce)");
-const ruleFor = (type) => config.rules.find((r) => type === "h2-grpc" ? r.id === "h2-grpc" || ["h2-glitch", "grpc-glitch"].includes(r.fault.type) : r.fault.type === type);
+const moduleType = (type) => type === "h2-glitch" || type === "grpc-glitch" ? "h2-grpc" : type;
+const ruleFor = (type) => config.rules.find((r) => moduleType(r.fault.type) === type);
 const defaultRule = (d) => ({
   id: d.type,
   enabled: false,
@@ -199,7 +200,7 @@ async function patchRule(rule, patch) {
       const state = await api("/api/state");
       config.rules = normalize(state.rules);
       ensureRules();
-      const current = ruleFor(rule.id === "h2-grpc" ? "h2-grpc" : rule.fault.type);
+      const current = ruleFor(moduleType(rule.fault.type));
       if (current.virtual) {
         Object.assign(
           current,

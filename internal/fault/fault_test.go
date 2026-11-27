@@ -26,3 +26,24 @@ func TestRejectInvalidFault(t *testing.T) {
 		t.Fatal("accepted unknown fault")
 	}
 }
+
+func TestNativeGRPCAndParameterValidation(t *testing.T) {
+	for _, media := range []string{"application/grpc-web", "application/grpc-web+proto", "application/grpcfoo"} {
+		if NativeGRPC(media) {
+			t.Fatalf("accepted %q", media)
+		}
+	}
+	if !NativeGRPC("application/grpc+proto; charset=utf-8") {
+		t.Fatal("rejected native grpc")
+	}
+	if _, err := H2Code(1.5); err == nil {
+		t.Fatal("accepted fractional h2 code")
+	}
+	if _, err := GRPCCode(1.5); err == nil {
+		t.Fatal("accepted fractional grpc code")
+	}
+	c := Config{Rules: []Rule{{ID: "x", Fault: Fault{Type: "sse-glitch", Params: map[string]any{"action": "truncate", "event_type": "message"}}}}}
+	if Validate(c) == nil {
+		t.Fatal("accepted action-incompatible parameter")
+	}
+}

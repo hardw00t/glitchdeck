@@ -119,3 +119,44 @@ func TestTickerPingAndClose(t *testing.T) {
 		t.Fatalf("close: %v %v", frame, err)
 	}
 }
+
+func TestSummaryDoesNotExposeOrderHistory(t *testing.T) {
+	h := New()
+	for range 20 {
+		r := httptest.NewRequest("POST", "/webhooks/payment", strings.NewReader(`{"order_id":"same","amount_cents":10}`))
+		r.Host = "127.0.0.1"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/summary", nil))
+	var state map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if state["charges_count"] != float64(20) || state["total_charged_cents"] != float64(200) || state["charges"] != nil {
+		t.Fatal(state)
+	}
+}
+
+func TestCloseStopsHijackedTicker(t *testing.T) {
+	h := New()
+	s := httptest.NewServer(h)
+	defer s.Close()
+	c, err := net.Dial("tcp", s.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(time.Second))
+	fmt.Fprintf(c, "GET /ws/ticker HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\n\r\n", s.Listener.Addr())
+	r := bufio.NewReader(c)
+	if resp, err := http.ReadResponse(r, &http.Request{Method: "GET"}); err != nil || resp.StatusCode != 101 {
+		t.Fatalf("handshake: %v %v", resp, err)
+	}
+	if err := h.(interface{ Close() error }).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wsframe.Read(r, false); err == nil {
+		t.Fatal("ticker remained open")
+	}
+}

@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func (p *Proxy) admitTunnel(record bool) (context.Context, uint64, uint64) {
+func (p *Proxy) admitTunnel(record, active bool) (context.Context, uint64, uint64) {
 	p.gate.Lock()
 	defer p.gate.Unlock()
 	p.mu.Lock()
@@ -20,12 +20,15 @@ func (p *Proxy) admitTunnel(record bool) (context.Context, uint64, uint64) {
 	var seq uint64
 	if record && !p.closed {
 		seq = p.seq.Add(1)
+		if active {
+			p.activeTunnels++
+		}
 	}
 	return p.ctx, seq, p.generation
 }
 
 func (p *Proxy) tunnelSequence() (uint64, uint64) {
-	_, seq, gen := p.admitTunnel(true)
+	_, seq, gen := p.admitTunnel(true, false)
 	return seq, gen
 }
 
@@ -35,7 +38,19 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	n, portErr := strconv.ParseUint(port, 10, 16)
 	valid := r.ProtoMajor == 1 && err == nil && portErr == nil && n != 0 && p.allowed(host, port)
 	intercept := valid && p.options.CA != nil
-	ctx, seq, gen := p.admitTunnel(!intercept)
+	ctx, seq, gen := p.admitTunnel(!intercept, valid && !intercept)
+	if valid && !intercept && seq != 0 {
+		defer func() {
+			p.gate.Lock()
+			if gen == p.generation {
+				p.activeTunnels--
+			}
+			p.gate.Unlock()
+		}()
+	}
+	if valid && !intercept && seq != 0 && p.OnBlindTunnel != nil {
+		p.callback(gen, func() { p.OnBlindTunnel(seq) })
+	}
 	if !valid {
 		http.Error(w, "egress denied", http.StatusForbidden)
 		p.tunnelEvent(r, start, seq, gen, 403, "", "egress_denied", 0, 0)
@@ -96,12 +111,22 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	defer stopUp()
 	toUp := make(chan int64, 1)
 	go func() {
-		n, _ := io.Copy(upstream, rw.Reader)
-		closeWrite(upstream)
+		n, err := io.Copy(upstream, rw.Reader)
+		if err != nil {
+			_ = c.Close()
+			_ = upstream.Close()
+		} else {
+			closeWrite(upstream)
+		}
 		toUp <- n
 	}()
-	fromUp, _ := io.Copy(c, upstream)
-	closeWrite(c)
+	fromUp, err := io.Copy(c, upstream)
+	if err != nil {
+		_ = c.Close()
+		_ = upstream.Close()
+	} else {
+		closeWrite(c)
+	}
 	sent := <-toUp
 	p.tunnelEvent(r, start, seq, gen, 200, "blind", "", sent, fromUp)
 }

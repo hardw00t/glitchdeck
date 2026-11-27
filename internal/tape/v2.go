@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/sse"
 )
@@ -26,6 +25,7 @@ type Stream struct {
 	Method        string            `yaml:"method,omitempty" json:"method,omitempty"`
 	Path          string            `yaml:"path,omitempty" json:"path,omitempty"`
 	URL           string            `yaml:"url,omitempty" json:"url,omitempty"`
+	Proto         string            `yaml:"proto,omitempty" json:"proto,omitempty"`
 	Headers       map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 	Body          string            `yaml:"body,omitempty" json:"body,omitempty"`
 	IdleTimeoutMS int               `yaml:"idle_timeout_ms,omitempty" json:"idle_timeout_ms,omitempty"`
@@ -89,14 +89,16 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 	for k, v := range s.Headers {
 		req.Header.Set(k, v)
 	}
-	transport := &http.Transport{DisableKeepAlives: true}
-	if len(root) > 0 && root[0] != nil {
-		transport.TLSClientConfig = &tls.Config{RootCAs: root[0]}
+	var roots *x509.CertPool
+	if len(root) != 0 {
+		roots = root[0]
 	}
-	if s.URL != "" {
-		proxyURL, _ := url.Parse(base)
-		transport.Proxy = http.ProxyURL(proxyURL)
+	transport, err := replayTransport(req, base, s.URL != "", s.Proto, roots)
+	if err != nil {
+		result.End = "error"
+		return result
 	}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	type response struct {
 		resp *http.Response
@@ -135,6 +137,10 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 		}
 	}
 	defer resp.Body.Close()
+	if (s.Proto == "h2" || s.Proto == "h2c") && resp.ProtoMajor != 2 {
+		result.End = "error"
+		return result
+	}
 	type item struct {
 		frame sse.Frame
 		err   error
@@ -212,15 +218,72 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 	}
 }
 
-// HTTP/2 carries the target authority separately from the dial address.
-func routeH2CForward(tr *http.Transport, req *http.Request, base string) {
-	endpoint, _ := url.Parse(base)
-	tr.Protocols = proxy.H2CProtocols()
-	networkDialer := &net.Dialer{}
-	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return networkDialer.DialContext(ctx, network, endpoint.Host)
+func validateStepProtocol(rawURL, protocol string) error {
+	scheme := "http"
+	if rawURL != "" {
+		u, err := url.Parse(strings.ReplaceAll(rawURL, "${DEMO_TLS}", "https://127.0.0.1"))
+		if err != nil || !u.IsAbs() || u.Host == "" {
+			return fmt.Errorf("expected an absolute HTTP or HTTPS URL")
+		}
+		scheme = u.Scheme
 	}
-	req.Header.Set(proxy.ForwardH2CHeader, "1")
+	return validateProtocol(scheme, protocol)
+}
+
+func validateProtocol(scheme, protocol string) error {
+	if scheme != "https" && scheme != "http" {
+		return fmt.Errorf("expected HTTP or HTTPS scheme")
+	}
+	switch protocol {
+	case "", "h1":
+	case "h2":
+		if scheme != "https" {
+			return fmt.Errorf("h2 requires an HTTPS URL")
+		}
+	case "h2c":
+		if scheme != "http" {
+			return fmt.Errorf("h2c requires cleartext HTTP")
+		}
+	default:
+		return fmt.Errorf("invalid HTTP protocol %q", protocol)
+	}
+	return nil
+}
+
+func replayTransport(req *http.Request, base string, forward bool, protocol string, roots *x509.CertPool) (*http.Transport, error) {
+	if err := validateProtocol(req.URL.Scheme, protocol); err != nil {
+		return nil, err
+	}
+	endpoint, err := url.Parse(base)
+	if err != nil || endpoint.Host == "" {
+		return nil, fmt.Errorf("invalid replay proxy endpoint")
+	}
+	dialer := &net.Dialer{}
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, endpoint.Host)
+		},
+	}
+	switch protocol {
+	case "h2":
+		tr.Protocols = new(http.Protocols)
+		tr.Protocols.SetHTTP2(true)
+	case "h2c":
+		tr.Protocols = proxy.H2CProtocols()
+	}
+	if roots != nil {
+		tr.TLSClientConfig = &tls.Config{RootCAs: roots}
+	}
+	if forward {
+		if protocol == "h2c" {
+			// HTTP/2 carries the target authority separately from the dial address.
+			req.Header.Set(proxy.ForwardH2CHeader, "1")
+		} else {
+			tr.Proxy = http.ProxyURL(endpoint)
+		}
+	}
+	return tr, nil
 }
 
 func runGRPC(ctx context.Context, base string, g GRPC, root ...*x509.CertPool) (int, error) {
@@ -237,27 +300,29 @@ func runGRPC(ctx context.Context, base string, g GRPC, root ...*x509.CertPool) (
 		defer cancel()
 	}
 	path := base + g.Path
-	transport := &http.Transport{Protocols: proxy.H2CProtocols()}
-	if len(root) > 0 && root[0] != nil {
-		transport.TLSClientConfig = &tls.Config{RootCAs: root[0]}
+	var roots *x509.CertPool
+	if len(root) != 0 {
+		roots = root[0]
 	}
 	if g.URL != "" {
 		path = g.URL
-		if strings.HasPrefix(path, "https://") {
-			proxyURL, _ := url.Parse(base)
-			transport.Proxy = http.ProxyURL(proxyURL)
-			transport.Protocols = nil
-			transport.ForceAttemptHTTP2 = true
-		}
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", path, bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}
-	defer transport.CloseIdleConnections()
-	if g.URL != "" && req.URL.Scheme == "http" {
-		routeH2CForward(transport, req, base)
+	protocol := g.Proto
+	if protocol == "" {
+		protocol = "h2c"
+		if req.URL.Scheme == "https" {
+			protocol = "h2"
+		}
 	}
+	transport, err := replayTransport(req, base, g.URL != "", protocol, roots)
+	if err != nil {
+		return 0, err
+	}
+	defer transport.CloseIdleConnections()
 	req.Header.Set("Content-Type", "application/grpc")
 	req.Header.Set("TE", "trailers")
 	if g.TimeoutMS > 0 {
@@ -272,6 +337,9 @@ func runGRPC(ctx context.Context, base string, g GRPC, root ...*x509.CertPool) (
 		return 0, err
 	}
 	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		return 0, fmt.Errorf("expected HTTP/2, got %s", resp.Proto)
+	}
 	_, err = io.Copy(io.Discard, resp.Body)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
@@ -317,13 +385,4 @@ func checkStream(a Assertion, e streamEvidence) []string {
 		add("max_gap_ms", *x.MaxGapMS, e.MaxGapMS)
 	}
 	return out
-}
-
-func h2FaultApplied(rules []fault.Rule, before, after map[string]proxy.RuleStats) bool {
-	for _, r := range rules {
-		if r.Fault.Type == "h2-glitch" && after[r.ID].Applied > before[r.ID].Applied {
-			return true
-		}
-	}
-	return false
 }

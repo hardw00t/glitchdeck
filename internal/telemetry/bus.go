@@ -23,9 +23,16 @@ type Bus struct {
 	ring         [historySize]Event
 	write, count int
 	subs         map[chan Event]struct{}
+	observer     func(Event)
 }
 
 func New() *Bus { return &Bus{subs: make(map[chan Event]struct{})} }
+
+func (b *Bus) SetObserver(observer func(Event)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.observer = observer
+}
 
 func (b *Bus) Publish(kind string, data any) {
 	payload, err := json.Marshal(data)
@@ -36,6 +43,9 @@ func (b *Bus) Publish(kind string, data any) {
 	defer b.mu.Unlock()
 	b.id++
 	e := Event{ID: b.id, Type: kind, Data: payload}
+	if b.observer != nil {
+		b.observer(e)
+	}
 	if kind == "http_req" || kind == "ws_frame" || kind == "sse_event" || kind == "grpc_call" {
 		b.ring[b.write] = e
 		b.write = (b.write + 1) % len(b.ring)

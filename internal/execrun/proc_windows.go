@@ -3,6 +3,7 @@
 package execrun
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -14,4 +15,9 @@ func setupProcess(cmd *exec.Cmd, grace time.Duration) error {
 	return nil
 }
 func cleanupProcess(cmd *exec.Cmd, grace time.Duration) []int { return nil }
-func forwardSignals(cmd *exec.Cmd) func()                     { return func() {} }
+func forwardSignals(grace time.Duration) (func(*exec.Cmd), func()) {
+	return func(*exec.Cmd) {}, func() {}
+}
+func isolateProcess(cmd *exec.Cmd, grace time.Duration) (*os.File, *os.File, error) {
+	return nil, nil, nil
+}

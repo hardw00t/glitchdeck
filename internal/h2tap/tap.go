@@ -3,6 +3,7 @@ package h2tap
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -57,6 +58,9 @@ type Conn struct {
 	closing      *time.Timer
 	recvMax      atomic.Int32
 	decoderLimit atomic.Uint32
+	admitted     uint32
+	cutoff       uint32
+	hasCutoff    bool
 }
 
 func New(conn net.Conn) *Conn {
@@ -126,6 +130,9 @@ func (c *Conn) receive() {
 	for {
 		h, data, err := readFrame(r, int(c.recvMax.Load()))
 		if err != nil {
+			if errors.Is(err, errFrameSize) {
+				c.protocolError(lastOpened, 6)
+			}
 			return
 		}
 		if h.Type != frameHeaders {
@@ -171,7 +178,11 @@ func (c *Conn) receive() {
 			}
 			h, data, err = readFrame(r, int(c.recvMax.Load()))
 			if err != nil || h.Type != frameCont || h.Stream != first.Stream {
-				c.protocolError(lastOpened, 1)
+				code := uint32(1)
+				if errors.Is(err, errFrameSize) {
+					code = 6
+				}
+				c.protocolError(lastOpened, code)
 				return
 			}
 		}
@@ -192,6 +203,18 @@ func (c *Conn) receive() {
 		if _, err := dec.Write(block.Bytes()); err != nil || dec.Close() != nil || size > maxHeaderList {
 			c.protocolError(lastOpened, 9)
 			return
+		}
+		c.mu.Lock()
+		refused := c.hasCutoff && first.Stream > c.cutoff
+		c.mu.Unlock()
+		if refused {
+			c.mu.Lock()
+			err := c.send(wordFrame(frameRST, first.Stream, 7))
+			c.mu.Unlock()
+			if err != nil {
+				return
+			}
+			continue
 		}
 		if first.Stream > lastOpened {
 			lastOpened = first.Stream
@@ -225,8 +248,33 @@ func (c *Conn) Arm(stream uint32, plan Plan) <-chan struct{} {
 	c.plans[stream] = &planned{Plan: plan, done: done}
 	return done
 }
+func (c *Conn) ArmContext(ctx context.Context, stream uint32, plan Plan) <-chan struct{} {
+	done := c.Arm(stream, plan)
+	go func() {
+		select {
+		case <-ctx.Done():
+			c.mu.Lock()
+			c.forgetPlan(stream)
+			c.mu.Unlock()
+		case <-done:
+		case <-c.done:
+		}
+	}()
+	return done
+}
 
 func (c *Conn) Done() <-chan struct{} { return c.done }
+
+// AdmitUpstream records a stream before it can produce upstream side effects.
+func (c *Conn) AdmitUpstream(stream uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hasCutoff && stream > c.cutoff {
+		return false
+	}
+	c.admitted = max(c.admitted, stream)
+	return true
+}
 
 func (c *Conn) forgetPlan(stream uint32) {
 	if p := c.plans[stream]; p != nil {
@@ -294,6 +342,10 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 func (c *Conn) writeFrame(h FrameHeader, raw []byte) error {
 	body := raw[frameHead:]
+	if h.Type == frameGoAway && len(body) >= 8 && c.hasCutoff {
+		binary.BigEndian.PutUint32(body, min(binary.BigEndian.Uint32(body)&0x7fffffff, c.cutoff))
+		c.cutoff = binary.BigEndian.Uint32(body)
+	}
 	if h.Type == frameSetting && h.Flags&flagAck == 0 {
 		for b := body; len(b) >= 6; b = b[6:] {
 			v := binary.BigEndian.Uint32(b[2:])
@@ -311,10 +363,27 @@ func (c *Conn) writeFrame(h FrameHeader, raw []byte) error {
 		}
 		return nil
 	}
+	if h.Type == frameHeaders && c.hasCutoff && h.Stream > c.cutoff {
+		return c.reset(h.Stream, 7)
+	}
+	if h.Type == frameHeaders {
+		if p := c.plans[h.Stream]; p != nil && !p.BeforeHdrs && p.AfterBytes == 0 && p.Kind == "rst" {
+			raw[4] &^= flagEndStream
+		}
+	}
 	if p := c.plans[h.Stream]; p != nil {
 		afterHeaders := !p.BeforeHdrs && p.AfterBytes == 0 && (h.Type == frameHeaders || h.Type == frameCont) && h.Flags&flagEndHeaders != 0
 		fire := p.BeforeHdrs && h.Type == frameHeaders || afterHeaders || !p.BeforeHdrs && h.Type == frameData && p.sent+int64(h.Length) >= p.AfterBytes
 		if fire {
+			if afterHeaders {
+				c.admitted = max(c.admitted, h.Stream)
+			}
+			if p.Kind == "goaway" {
+				p.LastStream = max(p.LastStream, c.admitted)
+				if c.hasCutoff {
+					p.LastStream = min(p.LastStream, c.cutoff)
+				}
+			}
 			delete(c.plans, h.Stream)
 			defer close(p.done)
 			if afterHeaders {
@@ -345,7 +414,12 @@ func (c *Conn) writeFrame(h FrameHeader, raw []byte) error {
 				}
 				return c.kill(h.Stream)
 			}
-			if err := c.goAway(p.LastStream, p.Code, p.Debug); err != nil {
+			last := max(p.LastStream, c.admitted)
+			if c.hasCutoff {
+				last = min(last, c.cutoff)
+			}
+			c.cutoff, c.hasCutoff = last, true
+			if err := c.goAway(last, p.Code, p.Debug); err != nil {
 				return err
 			}
 			if p.Applied != nil {
@@ -354,7 +428,7 @@ func (c *Conn) writeFrame(h FrameHeader, raw []byte) error {
 			if c.closing == nil {
 				c.closing = time.AfterFunc(p.CloseAfter, func() { _ = c.Close() })
 			}
-			if h.Stream > p.LastStream {
+			if h.Stream > last {
 				return c.kill(h.Stream)
 			}
 		} else if h.Type == frameData {
@@ -363,6 +437,9 @@ func (c *Conn) writeFrame(h FrameHeader, raw []byte) error {
 		if h.Flags&flagEndStream != 0 && (h.Type == frameData || h.Type == frameHeaders && (p.AfterBytes != 0 || h.Flags&flagEndHeaders != 0)) || h.Type == frameRST {
 			c.forgetPlan(h.Stream)
 		}
+	}
+	if h.Type == frameHeaders {
+		c.admitted = max(c.admitted, h.Stream)
 	}
 	return c.send(raw)
 }
@@ -401,6 +478,11 @@ func (c *Conn) enqueue(b []byte) error {
 }
 
 func (c *Conn) goAway(stream, code uint32, debug []byte) error {
+	stream = max(stream, c.admitted)
+	if c.hasCutoff {
+		stream = min(stream, c.cutoff)
+	}
+	c.cutoff, c.hasCutoff = stream, true
 	body := binary.BigEndian.AppendUint32(nil, stream)
 	body = binary.BigEndian.AppendUint32(body, code)
 	return c.send(appendFrame(nil, frameGoAway, 0, 0, append(body, debug...)))

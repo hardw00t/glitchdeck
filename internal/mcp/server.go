@@ -24,8 +24,9 @@ import (
 )
 
 type Options struct {
-	Workdir string
-	Version string
+	Workdir             string
+	Version             string
+	CloseOutputOnCancel bool
 }
 type Server struct {
 	in               io.Reader
@@ -58,6 +59,21 @@ func (s *Server) Serve() error {
 	defer cancel()
 	s.ctx = ctx
 	defer s.stop()
+	if s.opts.CloseOutputOnCancel {
+		if closer, ok := s.out.(io.Closer); ok {
+			done := make(chan struct{})
+			exited := make(chan struct{})
+			go func() {
+				defer close(exited)
+				select {
+				case <-ctx.Done():
+					_ = closer.Close()
+				case <-done:
+				}
+			}()
+			defer func() { close(done); <-exited; _ = closer.Close() }()
+		}
+	}
 	type line struct {
 		data []byte
 		err  error
@@ -67,7 +83,7 @@ func (s *Server) Serve() error {
 		scanner := bufio.NewScanner(s.in)
 		scanner.Buffer(make([]byte, 64<<10), 4<<20)
 		for scanner.Scan() {
-			b := append([]byte(nil), scanner.Bytes()...)
+			b := append([]byte{}, scanner.Bytes()...)
 			select {
 			case lines <- line{data: b}:
 			case <-ctx.Done():
@@ -90,106 +106,133 @@ func (s *Server) Serve() error {
 		if l.data == nil {
 			return l.err
 		}
-		var r request
-		var result any
-		var code int
-		message := ""
-		if !json.Valid(l.data) {
-			code = -32700
-			message = "Parse error"
-		} else if json.Unmarshal(l.data, &r) != nil || r.JSONRPC != "2.0" || r.Method == "" || !validID(r.ID) {
-			code = -32600
-			message = "Invalid Request"
-		} else if strings.HasPrefix(r.Method, "notifications/") && len(r.ID) == 0 {
-			continue
-		} else {
-			func() {
-				defer func() {
-					if recover() != nil {
-						code = -32603
-						message = "Internal error"
+		handle := func(data []byte) map[string]any {
+			var r request
+			var result any
+			var code int
+			message := ""
+			if !json.Valid(data) {
+				code = -32700
+				message = "Parse error"
+			} else if json.Unmarshal(data, &r) != nil || r.JSONRPC != "2.0" || r.Method == "" || !validID(r.ID) {
+				code = -32600
+				message = "Invalid Request"
+			} else if strings.HasPrefix(r.Method, "notifications/") && len(r.ID) == 0 {
+				return nil
+			} else {
+				func() {
+					defer func() {
+						if recover() != nil {
+							code = -32603
+							message = "Internal error"
+						}
+					}()
+					switch r.Method {
+					case "initialize":
+						var p struct {
+							ProtocolVersion string `json:"protocolVersion"`
+						}
+						if len(r.Params) > 0 && (json.Unmarshal(r.Params, &p) != nil || string(r.Params) == "null") {
+							code = -32602
+							message = "Invalid params"
+							break
+						}
+						v := p.ProtocolVersion
+						if v != "2024-11-05" && v != "2025-03-26" {
+							v = "2025-03-26"
+						}
+						result = map[string]any{"protocolVersion": v, "capabilities": map[string]any{"tools": map[string]any{"listChanged": false}}, "serverInfo": map[string]string{"name": "glitchdeck", "version": s.opts.Version}, "instructions": "Use local tapes and fault rules to reproduce network failures."}
+					case "ping":
+						result = map[string]any{}
+					case "tools/list":
+						result = map[string]any{"tools": tools()}
+					case "tools/call":
+						var p struct {
+							Name      string          `json:"name"`
+							Arguments json.RawMessage `json:"arguments"`
+							Meta      json.RawMessage `json:"_meta"`
+						}
+						dec := json.NewDecoder(strings.NewReader(string(r.Params)))
+						dec.DisallowUnknownFields()
+						if dec.Decode(&p) != nil || p.Name == "" {
+							code = -32602
+							message = "Invalid params"
+							break
+						}
+						var obj map[string]json.RawMessage
+						if len(p.Arguments) == 0 {
+							p.Arguments = []byte("{}")
+						}
+						if json.Unmarshal(p.Arguments, &obj) != nil || obj == nil || !validArgs(p.Name, obj) {
+							code = -32602
+							message = "Invalid params"
+							break
+						}
+						value, invalid := s.call(p.Name, p.Arguments)
+						if invalid {
+							code = -32602
+							message = "Invalid params"
+							break
+						}
+						b, e := json.Marshal(value)
+						if e != nil {
+							code = -32603
+							message = "Internal error"
+							break
+						}
+						_, isErr := value["error"].(map[string]string)
+						result = map[string]any{"content": []any{map[string]string{"type": "text", "text": string(b)}}, "structuredContent": value, "isError": isErr}
+					default:
+						code = -32601
+						message = "Method not found"
 					}
 				}()
-				switch r.Method {
-				case "initialize":
-					var p struct {
-						ProtocolVersion string `json:"protocolVersion"`
+			}
+			if len(r.ID) == 0 && code != -32700 && code != -32600 {
+				return nil
+			}
+			id := r.ID
+			if len(id) == 0 || !validID(id) {
+				id = []byte("null")
+			}
+			response := map[string]any{"jsonrpc": "2.0", "id": id}
+			if code != 0 {
+				response["error"] = map[string]any{"code": code, "message": message}
+			} else {
+				response["result"] = result
+			}
+			return response
+		}
+		var response any
+		trimmed := strings.TrimSpace(string(l.data))
+		if strings.HasPrefix(trimmed, "[") && json.Valid(l.data) {
+			var batch []json.RawMessage
+			_ = json.Unmarshal(l.data, &batch)
+			if len(batch) == 0 {
+				response = map[string]any{"jsonrpc": "2.0", "id": nil, "error": map[string]any{"code": -32600, "message": "Invalid Request"}}
+			} else {
+				replies := make([]map[string]any, 0, len(batch))
+				for _, item := range batch {
+					if reply := handle(item); reply != nil {
+						replies = append(replies, reply)
 					}
-					if len(r.Params) > 0 && (json.Unmarshal(r.Params, &p) != nil || string(r.Params) == "null") {
-						code = -32602
-						message = "Invalid params"
-						break
-					}
-					v := p.ProtocolVersion
-					if v != "2024-11-05" && v != "2025-03-26" {
-						v = "2025-03-26"
-					}
-					result = map[string]any{"protocolVersion": v, "capabilities": map[string]any{"tools": map[string]any{"listChanged": false}}, "serverInfo": map[string]string{"name": "glitchdeck", "version": s.opts.Version}, "instructions": "Use local tapes and fault rules to reproduce network failures."}
-				case "ping":
-					result = map[string]any{}
-				case "tools/list":
-					result = map[string]any{"tools": tools()}
-				case "tools/call":
-					var p struct {
-						Name      string          `json:"name"`
-						Arguments json.RawMessage `json:"arguments"`
-					}
-					dec := json.NewDecoder(strings.NewReader(string(r.Params)))
-					dec.DisallowUnknownFields()
-					if dec.Decode(&p) != nil || p.Name == "" {
-						code = -32602
-						message = "Invalid params"
-						break
-					}
-					var obj map[string]json.RawMessage
-					if len(p.Arguments) == 0 {
-						p.Arguments = []byte("{}")
-					}
-					if json.Unmarshal(p.Arguments, &obj) != nil || obj == nil || !validArgs(p.Name, obj) {
-						code = -32602
-						message = "Invalid params"
-						break
-					}
-					value, invalid := s.call(p.Name, p.Arguments)
-					if invalid {
-						code = -32602
-						message = "Invalid params"
-						break
-					}
-					b, e := json.Marshal(value)
-					if e != nil {
-						code = -32603
-						message = "Internal error"
-						break
-					}
-					_, isErr := value["error"].(map[string]string)
-					result = map[string]any{"content": []any{map[string]string{"type": "text", "text": string(b)}}, "structuredContent": value, "isError": isErr}
-				default:
-					code = -32601
-					message = "Method not found"
 				}
-			}()
+				if len(replies) > 0 {
+					response = replies
+				}
+			}
+		} else if reply := handle(l.data); reply != nil {
+			response = reply
 		}
-		if len(r.ID) == 0 && code != -32700 && code != -32600 {
-			continue
-		}
-		id := r.ID
-		if len(id) == 0 || !validID(id) {
-			id = []byte("null")
-		}
-		response := map[string]any{"jsonrpc": "2.0", "id": id}
-		if code != 0 {
-			response["error"] = map[string]any{"code": code, "message": message}
-		} else {
-			response["result"] = result
-		}
-		if err := enc.Encode(response); err != nil {
-			return err
+		if response != nil {
+			if err := enc.Encode(response); err != nil {
+				return err
+			}
 		}
 	}
 }
 func validID(id json.RawMessage) bool {
-	if len(id) == 0 || string(id) == "null" {
+	if len(id) == 0 {
 		return true
 	}
 	var x any
@@ -198,9 +241,12 @@ func validID(id json.RawMessage) bool {
 	if d.Decode(&x) != nil {
 		return false
 	}
-	switch x.(type) {
-	case string, json.Number:
+	switch v := x.(type) {
+	case string:
 		return true
+	case json.Number:
+		_, err := v.Int64()
+		return err == nil
 	}
 	return false
 }
@@ -224,6 +270,9 @@ func (s *Server) stop() {
 		s.recording = nil
 	}
 	if s.app != nil {
+		if closer, ok := s.app.Handler.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		_ = s.app.Close()
 		s.app = nil
 	}
@@ -349,6 +398,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 				}
 			}
 		}
+		if len(cfg.Rules) > 64 {
+			return fail("INVALID_RULE", "at most 64 rules are allowed"), false
+		}
 		if e := fault.Validate(cfg); e != nil {
 			return fail("INVALID_RULE", e.Error()), false
 		}
@@ -371,7 +423,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		cfg := s.p.Config()
 		kept := cfg.Rules[:0]
 		for _, r := range cfg.Rules {
-			keep := len(a.RuleIDs) > 0
+			keep := a.RuleIDs != nil
 			for _, id := range a.RuleIDs {
 				if id == r.ID {
 					keep = false
@@ -416,7 +468,8 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			var d map[string]any
 			_ = json.Unmarshal(event.Data, &d)
 			faultName, _ := d["fault"].(string)
-			if a.FaultedOnly && faultName == "" && d["fault_id"] == nil {
+			applied, known := d["applied"].(bool)
+			if a.FaultedOnly && ((known && !applied) || (!known && faultName == "" && d["fault_id"] == nil)) {
 				continue
 			}
 			if len(events) == a.Limit {
@@ -424,7 +477,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 				break
 			}
 			item := map[string]any{"id": event.ID, "type": event.Type}
-			for _, k := range []string{"seq", "method", "path", "status", "latency_ms", "fault_id", "fault_type", "error", "action"} {
+			for _, k := range []string{"seq", "conn_id", "frame_seq", "method", "path", "status", "http_status", "grpc_status", "grpc_status_name", "latency_ms", "fault_id", "rule_id", "fault_type", "error", "action", "fault_action", "dir", "applied"} {
 				if v, ok := d[k]; ok {
 					if str, ok := v.(string); ok && len(str) > 256 {
 						v = str[:256]
@@ -432,7 +485,10 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 					item[k] = v
 				}
 			}
-			if faultName != "" {
+			if id, ok := d["rule_id"]; ok {
+				item["fault_id"] = id
+			}
+			if faultName != "" && item["fault_type"] == nil {
 				item["fault_type"] = faultName
 			}
 			events = append(events, item)
@@ -500,22 +556,11 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		if name == "" {
 			name = t.Name
 		}
-		types := map[string]string{}
-		for _, rule := range t.Rules {
-			types[rule.ID] = rule.Fault.Type
-		}
-		for _, change := range t.ConfigChanges {
-			for _, rule := range change.Rules {
-				types[rule.ID] = rule.Fault.Type
-			}
-		}
 		triggered := []any{}
 		var total uint64
-		for id, stats := range report.Rules {
-			if stats.Applied > 0 {
-				triggered = append(triggered, map[string]any{"rule_id": id, "type": types[id], "count": stats.Applied})
-				total += stats.Applied
-			}
+		for _, applied := range report.AppliedFaults {
+			triggered = append(triggered, map[string]any{"rule_id": applied.RuleID, "type": applied.Type, "count": applied.Count})
+			total += applied.Count
 		}
 		return map[string]any{"schema_version": 2, "command": "test", "ok": code == 0, "exit_code": code, "tape": name, "target": target, "duration_ms": time.Since(start).Milliseconds(), "summary": map[string]any{"assertions_total": len(results), "assertions_failed": failed, "assertions_passed": len(results) - failed, "requests_total": report.RequestsTotal, "faults_triggered": total}, "faults_triggered": triggered, "assertions": assertions, "error": nil}, false
 	case "tape_export":
@@ -550,6 +595,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			res["yaml"] = b.String()
 		} else {
 			path, e := s.outputPath(a.OutPath)
+			if b.Len() > 1<<20 {
+				return fail("INVALID_TAPE", "tape exceeds 1 MiB"), false
+			}
 			if e != nil {
 				return fail("INVALID_PATH", e.Error()), false
 			}
@@ -615,11 +663,15 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			client := http.Client{Timeout: 5 * time.Second}
 			resp, e := client.Do(req)
 			if e != nil {
-				return fail("TIMEOUT", e.Error()), false
+				status = 0
+				errorText = e.Error()
+			} else {
+				status = resp.StatusCode
+				if _, e := io.Copy(io.Discard, resp.Body); e != nil {
+					errorText = e.Error()
+				}
+				resp.Body.Close()
 			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			status = resp.StatusCode
 		}
 		if a.Action == "webhook" {
 			ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
@@ -629,14 +681,19 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			}
 		}
 		client := http.Client{Timeout: 5 * time.Second}
-		stateReq, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, s.target+"/api/state", nil)
+		stateReq, _ := http.NewRequestWithContext(s.ctx, http.MethodGet, s.target+"/api/summary", nil)
 		stateResp, e := client.Do(stateReq)
 		if e != nil {
-			return fail("TIMEOUT", e.Error()), false
+			if ne, ok := e.(net.Error); ok && ne.Timeout() {
+				return fail("TIMEOUT", e.Error()), false
+			}
+			return fail("DEMO_ERROR", e.Error()), false
 		}
 		defer stateResp.Body.Close()
 		var state any
-		_ = json.NewDecoder(stateResp.Body).Decode(&state)
+		if e := json.NewDecoder(stateResp.Body).Decode(&state); e != nil {
+			return fail("DEMO_ERROR", e.Error()), false
+		}
 		return map[string]any{"action": a.Action, "status": status, "error": errorText, "state": state}, false
 	default:
 		return nil, true

@@ -43,6 +43,8 @@ func frameHeader(b []byte) FrameHeader {
 	}
 }
 
+var errFrameSize = errors.New("HTTP/2 frame exceeds advertised size")
+
 func ReadFrame(r io.Reader) (FrameHeader, []byte, error) { return readFrame(r, frameMax) }
 
 func readFrame(r io.Reader, max int) (FrameHeader, []byte, error) {
@@ -52,7 +54,7 @@ func readFrame(r io.Reader, max int) (FrameHeader, []byte, error) {
 	}
 	h := frameHeader(header[:])
 	if h.Length > max {
-		return h, nil, errors.New("HTTP/2 frame exceeds advertised size")
+		return h, nil, errFrameSize
 	}
 	payload := make([]byte, h.Length)
 	_, err := io.ReadFull(r, payload)
@@ -71,7 +73,7 @@ func wordFrame(kind byte, stream, value uint32) []byte {
 }
 
 func headerPayload(h FrameHeader, payload []byte) ([]byte, error) {
-	if h.Flags&flagPadded != 0 {
+	if h.Type == frameHeaders && h.Flags&flagPadded != 0 {
 		if len(payload) == 0 || int(payload[0]) >= len(payload) {
 			return nil, errors.New("invalid HTTP/2 padding")
 		}

@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -99,7 +100,8 @@ type Result struct {
 
 func Decode(r io.Reader) (Tape, error) {
 	var t Tape
-	d := yaml.NewDecoder(r)
+	var raw bytes.Buffer
+	d := yaml.NewDecoder(io.TeeReader(r, &raw))
 	d.KnownFields(true)
 	if err := d.Decode(&t); err != nil {
 		return t, err
@@ -110,6 +112,15 @@ func Decode(r io.Reader) (Tape, error) {
 			return t, fmt.Errorf("multiple tape documents")
 		}
 		return t, err
+	}
+	if t.Version == 1 {
+		var doc yaml.Node
+		if err := yaml.Unmarshal(raw.Bytes(), &doc); err != nil {
+			return t, err
+		}
+		if err := v1Keys(&doc); err != nil {
+			return t, err
+		}
 	}
 	if err := validate(t); err != nil {
 		return t, err
@@ -128,10 +139,8 @@ func validate(t Tape) error {
 		if t.TLSMITM || len(t.UpstreamAllow) != 0 || t.Expect.ChildExit != nil || len(t.Expect.Faults) != 0 {
 			return fmt.Errorf("new keys require version: 2")
 		}
-		for _, r := range t.Rules {
-			if r.Match.Host != "" || r.Match.Scheme != "" || r.Match.Proto != "" || r.Fault.Type == "sse-glitch" || r.Fault.Type == "h2-glitch" || r.Fault.Type == "grpc-glitch" {
-				return fmt.Errorf("new rule keys require version: 2")
-			}
+		if v2RuleSet(t.Rules) {
+			return fmt.Errorf("new rule keys require version: 2")
 		}
 		for _, s := range t.Script {
 			if s.Stream != nil || s.GRPC != nil || (s.HTTP != nil && (s.HTTP.URL != "" || s.HTTP.Proto != "")) {
@@ -143,6 +152,15 @@ func validate(t Tape) error {
 				return fmt.Errorf("new assertion keys require version: 2")
 			}
 		}
+	}
+	switch value := t.Expect.ChildExit.(type) {
+	case nil, int:
+	case string:
+		if _, err := strconv.Atoi(value); err != nil && value != "any" && value != "nonzero" {
+			return fmt.Errorf("invalid child_exit")
+		}
+	default:
+		return fmt.Errorf("invalid child_exit")
 	}
 	for _, entry := range t.UpstreamAllow {
 		for item := range strings.SplitSeq(entry, ",") {
@@ -161,6 +179,9 @@ func validate(t Tape) error {
 	for _, c := range t.ConfigChanges {
 		if c.BeforeSeq < lastChange || c.BeforeSeq == 0 || (c.AtMS != nil && (*c.AtMS < 0 || *c.AtMS > math.MaxInt64/int64(time.Millisecond))) {
 			return fmt.Errorf("invalid configuration timeline")
+		}
+		if t.Version == 1 && v2RuleSet(c.Rules) {
+			return fmt.Errorf("new rule keys require version: 2")
 		}
 		if err := fault.Validate(fault.Config{Seed: c.Seed, Rules: c.Rules}); err != nil {
 			return err
@@ -202,6 +223,9 @@ func validate(t Tape) error {
 			if s.HTTP.Proto != "" && s.HTTP.Proto != "h1" && s.HTTP.Proto != "h2c" && s.HTTP.Proto != "h2" {
 				return fmt.Errorf("invalid HTTP protocol")
 			}
+			if err := validateStepProtocol(s.HTTP.URL, s.HTTP.Proto); err != nil {
+				return err
+			}
 		}
 		if s.WS != nil {
 			n++
@@ -217,6 +241,9 @@ func validate(t Tape) error {
 			if (!validPath(s.Stream.Path) && s.Stream.URL == "") || s.Stream.IdleTimeoutMS < 0 || s.Stream.MaxMS < 0 {
 				return fmt.Errorf("invalid stream step")
 			}
+			if err := validateStepProtocol(s.Stream.URL, s.Stream.Proto); err != nil {
+				return err
+			}
 		}
 		if s.GRPC != nil {
 			n++
@@ -225,6 +252,9 @@ func validate(t Tape) error {
 			}
 			if s.GRPC.Proto != "" && s.GRPC.Proto != "h2c" && s.GRPC.Proto != "h2" {
 				return fmt.Errorf("invalid grpc protocol")
+			}
+			if err := validateStepProtocol(s.GRPC.URL, s.GRPC.Proto); err != nil {
+				return err
 			}
 		}
 		if s.SleepMS != 0 {
@@ -265,6 +295,16 @@ func validate(t Tape) error {
 	}
 	return nil
 }
+
+func v2RuleSet(rules []fault.Rule) bool {
+	for _, r := range rules {
+		if r.Match.Host != "" || r.Match.Scheme != "" || r.Match.Proto != "" || r.Fault.Type == "sse-glitch" || r.Fault.Type == "h2-glitch" || r.Fault.Type == "grpc-glitch" {
+			return true
+		}
+	}
+	return false
+}
+
 func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 	results, _, err := RunWithReport(ctx, t, targetOverride)
 	return results, err
@@ -273,6 +313,7 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 type RunReport struct {
 	RequestsTotal uint64
 	Rules         map[string]proxy.RuleStats
+	AppliedFaults []proxy.AppliedFault
 }
 
 func RunWithReport(ctx context.Context, t Tape, targetOverride string) ([]Result, RunReport, error) {
@@ -299,6 +340,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		target = targetOverride
 	}
 	var ca *tlsmitm.CA
+	var upstreamRoots *x509.CertPool
 	var roots *x509.CertPool
 	var demoTLS string
 	if t.TLSMITM {
@@ -324,6 +366,11 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		defer app.Close()
 		target = app.URL
 		if ca != nil {
+			upstreamRoots, _ = x509.SystemCertPool()
+			if upstreamRoots == nil {
+				upstreamRoots = x509.NewCertPool()
+			}
+			upstreamRoots.AddCert(ca.Cert)
 			cert, err := tlsmitm.NewMinter(ca, 1, time.Hour).For("localhost")
 			if err != nil {
 				return nil, err
@@ -343,12 +390,19 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		}
 	}
 	u, err := proxy.ParseTarget(target)
+	if err != nil && len(t.UpstreamAllow) != 0 {
+		u, err = proxy.ParseExplicitTarget(target)
+	}
 	if err != nil {
 		return nil, err
 	}
 	p := proxy.New(u, fault.Config{Seed: t.Seed, Rules: t.Rules}, telemetry.New())
-	defer func() { report.Rules = p.Stats(); report.RequestsTotal = p.RequestsTotal() }()
-	p.SetOptions(proxy.Options{CA: ca, UpstreamCA: roots, UpstreamAllow: t.UpstreamAllow, Demo: isDemo})
+	defer func() {
+		report.Rules = p.Stats()
+		report.RequestsTotal = p.RequestsTotal()
+		report.AppliedFaults = p.AppliedFaults()
+	}()
+	p.SetOptions(proxy.Options{CA: ca, UpstreamCA: upstreamRoots, UpstreamAllow: t.UpstreamAllow, Demo: isDemo, RequireUpstreamAllow: true})
 	var outcomeMu sync.Mutex
 	type wsEvidence struct {
 		drop    time.Time
@@ -371,6 +425,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			outcomes[o.Seq] = prev
 		}
 		prev.Reset = prev.Reset || o.Reset
+		prev.H2Fault = prev.H2Fault || o.H2Fault
 		if o.Err != nil {
 			prev.Err = o.Err
 		}
@@ -532,28 +587,21 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			for k, v := range s.HTTP.Headers {
 				req.Header.Set(k, v)
 			}
-			stepClient := client
-			if s.HTTP.URL != "" || s.HTTP.Proto == "h2c" {
-				tr := &http.Transport{DisableKeepAlives: true}
-				switch {
-				case s.HTTP.URL != "" && s.HTTP.Proto == "h2c" && req.URL.Scheme == "http":
-					routeH2CForward(tr, req, serverURL)
-				case s.HTTP.URL != "":
-					proxyURL, _ := url.Parse(serverURL)
-					tr.Proxy = http.ProxyURL(proxyURL)
-					tr.TLSClientConfig = &tls.Config{RootCAs: roots}
-					tr.ForceAttemptHTTP2 = s.HTTP.Proto == "h2"
-				default:
-					tr.Protocols = proxy.H2CProtocols()
-				}
-				stepClient = &http.Client{Transport: tr, CheckRedirect: client.CheckRedirect}
+			tr, e := replayTransport(req, serverURL, s.HTTP.URL != "", s.HTTP.Proto, roots)
+			if e != nil {
+				return nil, fmt.Errorf("step %s: %w", s.Name, e)
 			}
+			stepClient := &http.Client{Transport: tr, CheckRedirect: client.CheckRedirect}
 			seq := p.Seq() + 1
-			beforeStats := p.Stats()
 			resp, e := stepClient.Do(req)
+			tr.CloseIdleConnections()
 			transportFailure := false
 			if e == nil {
 				transportFailure = resp.Header.Get(proxy.TransportErrorHeader) != ""
+				if (s.HTTP.Proto == "h2" || s.HTTP.Proto == "h2c") && resp.ProtoMajor != 2 {
+					resp.Body.Close()
+					return nil, fmt.Errorf("step %s: expected HTTP/2, got %s", s.Name, resp.Proto)
+				}
 				_, e = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
 			}
@@ -572,7 +620,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			if transportFailure {
 				return nil, fmt.Errorf("step %s: proxy transport failure", s.Name)
 			}
-			if e != nil && !o.Reset && !h2FaultApplied(t.Rules, beforeStats, p.Stats()) {
+			if e != nil && !o.Reset && !o.H2Fault {
 				return nil, fmt.Errorf("step %s: %w", s.Name, e)
 			}
 		case s.WS != nil:
@@ -603,6 +651,9 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			}
 			streams = append(streams, streamResult{seq: seq, ticker: isDemo && strings.SplitN(s.WS.Path, "?", 2)[0] == "/ws/ticker", ch: stream})
 		case s.Stream != nil:
+			if err := validateStepProtocol(s.Stream.URL, s.Stream.Proto); err != nil {
+				return nil, fmt.Errorf("step %s: %w", s.Name, err)
+			}
 			sseResults[s.Name] = runStream(ctx, serverURL, *s.Stream, roots)
 		case s.GRPC != nil:
 			status, e := runGRPC(ctx, serverURL, *s.GRPC, roots)
@@ -655,6 +706,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 	}
 	outcomeMu.Unlock()
 	results := make([]Result, 0, len(t.Assertions))
+	diagnostics := assertionDiagnostics{remaining: assertionDiagnosticBudget}
 	for _, a := range t.Assertions {
 		result := Result{Name: a.Name, Failures: []string{}}
 		if a.StreamStep != "" {
@@ -742,7 +794,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 				if _, ok := data["ws_broken"]; ok && broken && isDemo && a.HTTPGet == "/api/state" {
 					data["ws_broken"] = true
 				}
-				result.Failures = append(result.Failures, checkAssertionData(data, a.JSONEq, nil)...)
+				result.Failures = append(result.Failures, diagnostics.compare(data, a.JSONEq, nil)...)
 			}
 		}
 		results = append(results, result)
@@ -790,10 +842,15 @@ func CheckAssertionJSON(body []byte, expected map[string]any, keys []string) []s
 	if err != nil {
 		return []string{"invalid JSON response: " + err.Error()}
 	}
-	return checkAssertionData(data, expected, keys)
+	budget := assertionDiagnostics{remaining: assertionDiagnosticBudget}
+	return budget.compare(data, expected, keys)
 }
 
-func checkAssertionData(data map[string]any, expected map[string]any, keys []string) []string {
+const assertionDiagnosticBudget = 64 << 10
+
+type assertionDiagnostics struct{ remaining int }
+
+func (d *assertionDiagnostics) compare(data map[string]any, expected map[string]any, keys []string) []string {
 	if keys == nil {
 		keys = make([]string, 0, len(expected))
 		for k := range expected {
@@ -802,6 +859,7 @@ func checkAssertionData(data map[string]any, expected map[string]any, keys []str
 		sort.Strings(keys)
 	}
 	var failures []string
+	var omitted int
 	for _, k := range keys {
 		var got any = data
 		present := true
@@ -817,22 +875,41 @@ func checkAssertionData(data map[string]any, expected map[string]any, keys []str
 			}
 		}
 		eb, _ := json.Marshal(expected[k])
-		gb, _ := json.Marshal(got)
-		var en, gn any
+		var en any
 		ed := json.NewDecoder(bytes.NewReader(eb))
 		ed.UseNumber()
 		ed.Decode(&en)
-		gd := json.NewDecoder(bytes.NewReader(gb))
-		gd.UseNumber()
-		gd.Decode(&gn)
-		if !present || !jsonEqual(en, gn) {
-			if !present {
-				gb = []byte("<missing>")
-			}
-			failures = append(failures, fmt.Sprintf("%s: expected %s, got %s", k, eb, gb))
+		if present && jsonEqual(en, got) {
+			continue
 		}
+		if d.remaining == 0 {
+			omitted++
+			continue
+		}
+		gb := []byte("<missing>")
+		if present {
+			gb, _ = json.Marshal(got)
+		}
+		failure := fmt.Sprintf("%s: expected %s, got %s", diagnosticPreview(k), diagnosticPreview(string(eb)), diagnosticPreview(string(gb)))
+		if len(failure) > d.remaining {
+			d.remaining = 0
+			omitted++
+			continue
+		}
+		d.remaining -= len(failure)
+		failures = append(failures, failure)
+	}
+	if omitted != 0 {
+		failures = append(failures, fmt.Sprintf("%d JSON mismatches omitted (diagnostics truncated)", omitted))
 	}
 	return failures
+}
+
+func diagnosticPreview(s string) string {
+	if len(s) <= 256 {
+		return s
+	}
+	return strings.ToValidUTF8(s[:256], "") + "… (truncated)"
 }
 func jsonEqual(a, b any) bool {
 	if x, ok := a.(json.Number); ok {

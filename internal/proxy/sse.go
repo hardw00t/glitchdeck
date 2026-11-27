@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -61,14 +62,17 @@ type sseResult struct {
 	bytes     int64
 	events    int
 	end, skip string
+	applied   bool
 	err       error
 }
 
 func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Reader, rule *fault.Rule, seed, seq, gen uint64, start time.Time, run string) (res sseResult) {
 	res.end = "eof"
 	kind, action := "", "none"
+	faultID := ""
 	var params map[string]any
 	if rule != nil && rule.Fault.Type == "sse-glitch" {
+		faultID = rule.ID
 		kind, params = rule.Fault.Type, rule.Fault.Params
 		action = fault.String(params, "action", "stall")
 		if action == "early_eof" {
@@ -79,30 +83,33 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 	if limit <= 0 {
 		limit = 512
 	}
-	applied := false
 	markApplied := func() {
-		if !applied {
-			applied = true
-			p.countRule(gen, rule.ID, "applied", "")
+		if !res.applied {
+			res.applied = true
+			p.countRule(gen, rule, "applied", "")
 		}
 	}
 	captured := 0
+	delivered, maxGap, lastDelivered := 0, int64(0), int64(0)
+	deliveredValid, deliveredDone := true, false
 	stream := streamFrom(ctx)
 	rc := http.NewResponseController(w)
 	defer rc.SetWriteDeadline(time.Time{})
 	defer func() {
-		if kind != "" && !applied {
+		if kind != "" && !res.applied {
 			reason := res.skip
 			if reason == "" {
 				reason = "not_triggered"
 			}
-			p.countRule(gen, rule.ID, "skipped", reason)
+			p.countRule(gen, rule, "skipped", reason)
 		}
 		p.publish(gen, "sse_event", map[string]any{
 			"seq": seq, "stream_id": stream, "run_id": run, "kind": "end", "event_index": 0,
 			"ts_ms": time.Now().UnixMilli(), "t_rel_ms": time.Since(start).Milliseconds(),
 			"end": res.end, "events": res.events, "duration_ms": time.Since(start).Milliseconds(),
 			"event": "", "id": nil, "data_bytes": 0, "raw_bytes": 0, "is_done": res.end == "done",
+			"delivered_events": delivered, "delivered_valid_json": deliveredValid, "delivered_done": deliveredDone, "delivered_max_gap_ms": maxGap,
+			"applied": res.applied, "fault_id": faultID,
 			"fault": kind, "action": "none", "stall_ms": 0, "preview": "",
 		})
 	}()
@@ -113,6 +120,7 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		if err == nil {
 			err = rc.Flush()
 		}
+		_ = rc.SetWriteDeadline(time.Time{})
 		if err != nil && !errors.Is(err, http.ErrNotSupported) {
 			res.end, res.err = "client_cancel", err
 			return false
@@ -218,6 +226,16 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		if !passThrough && current != "drop" && current != "eof_early" && !write(raw) {
 			return res
 		}
+		if f.Dispatch && current != "drop" && current != "eof_early" && current != "truncate" {
+			delivered++
+			now := time.Since(start).Milliseconds()
+			maxGap = max(maxGap, now-lastDelivered)
+			lastDelivered = now
+			deliveredDone = deliveredDone || f.IsDone()
+			if !f.IsDone() && f.Data != "" && !json.Valid([]byte(f.Data)) {
+				deliveredValid = false
+			}
+		}
 		if current != "none" {
 			markApplied()
 		}
@@ -242,6 +260,7 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 				"seq": seq, "stream_id": stream, "run_id": run, "kind": frameKind,
 				"event_index": res.events, "ts_ms": time.Now().UnixMilli(), "t_rel_ms": time.Since(start).Milliseconds(),
 				"event": eventName, "id": f.ID, "data_bytes": len(f.Data), "raw_bytes": len(f.Raw), "is_done": f.IsDone(),
+				"applied": current != "none", "fault_id": faultID,
 				"fault": kind, "action": current, "stall_ms": delay, "preview": preview,
 			})
 		}
@@ -340,6 +359,9 @@ func (p *Proxy) relayHijackedSSE(ctx context.Context, w http.ResponseWriter, res
 		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, _ = b.WriteString("0\r\n\r\n")
 		result.err = b.Flush()
+		if result.err != nil {
+			result.end = "client_cancel"
+		}
 	}
 	return result
 }

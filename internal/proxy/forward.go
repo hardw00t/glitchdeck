@@ -9,27 +9,51 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"sort"
 	"strings"
+	"time"
 
+	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/localweb"
 	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 )
 
 type Options struct {
-	CA               *tlsmitm.CA
-	Demo             bool
-	UpstreamAllow    []string
-	UpstreamCA       *x509.CertPool
-	InsecureUpstream bool
-	MITMALPN         string
-	H2TapOff         bool
-	SSETelemetryMax  int
-	ProxyAuth        string
+	CA                   *tlsmitm.CA
+	Demo                 bool
+	UpstreamAllow        []string
+	UpstreamCA           *x509.CertPool
+	InsecureUpstream     bool
+	MITMALPN             string
+	H2TapOff             bool
+	SSETelemetryMax      int
+	ProxyAuth            string
+	BeforeRequest        func(uint64)
+	OnAdmission          func(seq uint64, method, path, host string)
+	RequireUpstreamAllow bool
 }
 
 type RuleStats struct {
 	Matched, Applied, Skipped uint64
 	SkipReasons               map[string]uint64
+}
+
+type AppliedFault struct {
+	RuleID, Type string
+	Count        uint64
+}
+
+func (p *Proxy) AppliedFaults() []AppliedFault {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]AppliedFault, 0, len(p.applied))
+	for key, count := range p.applied {
+		out = append(out, AppliedFault{RuleID: key.RuleID, Type: key.Type, Count: count})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].RuleID < out[j].RuleID || out[i].RuleID == out[j].RuleID && out[i].Type < out[j].Type
+	})
+	return out
 }
 
 // SetOptions configures the proxy before serving any requests.
@@ -71,17 +95,22 @@ func cloneReasons(in map[string]uint64) map[string]uint64 {
 	return out
 }
 
-func (p *Proxy) countRule(gen uint64, id, kind, reason string) {
+func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if gen != p.generation {
 		return
 	}
+	id := rule.ID
 	v := p.stats[id]
 	switch kind {
 	case "matched":
 		v.Matched++
 	case "applied":
+		if p.applied == nil {
+			p.applied = make(map[AppliedFault]uint64)
+		}
+		p.applied[AppliedFault{RuleID: rule.ID, Type: rule.Fault.Type}]++
 		v.Applied++
 	case "skipped":
 		v.Skipped++
@@ -134,7 +163,7 @@ func (p *Proxy) allowed(host, port string) bool {
 	if host == "" {
 		return false
 	}
-	if p.explicit(host, port) || strings.EqualFold(host, "localhost") {
+	if strings.EqualFold(host, "localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -156,10 +185,6 @@ func (p *Proxy) allowed(host, port string) bool {
 	return false
 }
 
-func (p *Proxy) explicit(host, port string) bool {
-	return p.target != nil && strings.EqualFold(host, p.target.Hostname()) && port == upstreamPort(p.target.Scheme, p.target.Port())
-}
-
 func upstreamPort(scheme, port string) string {
 	if port != "" {
 		return port
@@ -175,7 +200,7 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 	if err != nil {
 		return nil, err
 	}
-	if !p.allowed(host, port) {
+	if !p.allowed(host, port) && !(ctx.Value(reverseTargetKey{}) == true && p.target != nil && !p.options.RequireUpstreamAllow && strings.EqualFold(host, p.target.Hostname()) && port == upstreamPort(p.target.Scheme, p.target.Port())) {
 		return nil, errors.New("egress denied")
 	}
 	d := &net.Dialer{}
@@ -186,14 +211,32 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 		}
 		return c, err
 	}
-	return d.DialContext(ctx, network, addr)
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var last error
+	for _, ip := range ips {
+		c, err := d.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+		if err == nil {
+			return c, nil
+		}
+		last = err
+	}
+	if last == nil {
+		last = errors.New("no upstream addresses")
+	}
+	return nil, last
 }
 
 func (p *Proxy) newTransport(h2c bool) *http.Transport {
 	t := &http.Transport{
-		DisableCompression: true,
-		DialContext:        p.dial,
-		ForceAttemptHTTP2:  true,
+		DisableCompression:  true,
+		DialContext:         p.dial,
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        100,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig: &tls.Config{
 			RootCAs: p.options.UpstreamCA, InsecureSkipVerify: p.options.InsecureUpstream, MinVersion: tls.VersionTLS12,
 		},

@@ -22,9 +22,6 @@ func relayGRPCMessages(w http.ResponseWriter, body io.Reader, count int, code in
 			return total, false, err
 		}
 		size := binary.BigEndian.Uint32(header[1:])
-		if size > 4<<20 {
-			return total, false, io.ErrShortBuffer
-		}
 		n, err := w.Write(header[:])
 		total += int64(n)
 		if err != nil {
@@ -60,7 +57,7 @@ func grpcHeader(resp *http.Response, key string) string {
 	return resp.Header.Get(key)
 }
 
-func (p *Proxy) grpcEvent(gen, seq uint64, r *http.Request, httpStatus int, code *int, source, message, kind, action, h2Error string, reqCount, respCount int, start time.Time) {
+func (p *Proxy) grpcEvent(gen, seq uint64, r *http.Request, httpStatus int, code *int, source, message, kind, action, h2Error, ruleID string, applied bool, reqCount, respCount int, start time.Time) {
 	service, method, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
 	deadline, _ := grpcwire.ParseTimeout(r.Header.Get("Grpc-Timeout"))
 	name := ""
@@ -72,5 +69,6 @@ func (p *Proxy) grpcEvent(gen, seq uint64, r *http.Request, httpStatus int, code
 		"http_status": httpStatus, "grpc_status": code, "grpc_status_name": name, "grpc_message": message,
 		"source": source, "req_messages": reqCount, "resp_messages": respCount, "deadline_ms": deadline.Milliseconds(),
 		"latency_ms": time.Since(start).Milliseconds(), "fault": kind, "action": action, "h2_error": h2Error,
+		"applied": applied, "rule_id": ruleID,
 	})
 }
