@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"slices"
 	"sort"
 	"strings"
@@ -221,6 +222,15 @@ func H2CProtocols() *http.Protocols {
 }
 
 func (p *Proxy) allowed(host, port string) bool {
+	return upstreamAllowed(host, port, p.options.UpstreamAllow)
+}
+
+// UpstreamAllowed applies the same target admission policy as the forward proxy.
+func UpstreamAllowed(target *url.URL, allow []string) bool {
+	return upstreamAllowed(target.Hostname(), upstreamPort(target.Scheme, target.Port()), allow)
+}
+
+func upstreamAllowed(host, port string, allow []string) bool {
 	if host == "" {
 		return false
 	}
@@ -231,7 +241,7 @@ func (p *Proxy) allowed(host, port string) bool {
 	if ip.IsLoopback() {
 		return true
 	}
-	for _, a := range p.options.UpstreamAllow {
+	for _, a := range allow {
 		for raw := range strings.SplitSeq(a, ",") {
 			item := strings.ToLower(strings.TrimSpace(raw))
 			h := strings.ToLower(host)

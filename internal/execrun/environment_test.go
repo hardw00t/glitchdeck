@@ -278,7 +278,7 @@ func TestDenoHintReflectsTLS(t *testing.T) {
 
 func TestAssertionFailureDoesNotExposeQuery(t *testing.T) {
 	tp := tape.Tape{Assertions: []tape.Assertion{{Name: "failure", HTTPGet: "/?token=example-secret", Direct: true}}}
-	result := assertions(context.Background(), tp, "", "http://127.0.0.1:0", "", nil)
+	result := assertions(context.Background(), tp, "", "http://127.0.0.1:0", "", nil, nil)
 	if len(result) != 1 || len(result[0].Failures) == 0 || strings.Contains(strings.Join(result[0].Failures, " "), "example-secret") {
 		t.Fatalf("unsafe assertion result: %+v", result)
 	}
@@ -292,7 +292,7 @@ func TestHTTPSAssertionUsesProvidedRoots(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AddCert(server.Certificate())
 	tp := tape.Tape{Assertions: []tape.Assertion{{HTTPGet: "/", Direct: true, ExpectStatus: http.StatusNoContent}}}
-	result := assertions(context.Background(), tp, "", server.URL, "", nil, roots)
+	result := assertions(context.Background(), tp, "", server.URL, "", nil, nil, roots)
 	if len(result) != 1 || len(result[0].Failures) != 0 {
 		t.Fatalf("trusted assertion failed: %+v", result)
 	}

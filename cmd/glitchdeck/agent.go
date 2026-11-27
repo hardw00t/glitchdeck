@@ -157,6 +157,9 @@ func execCommand(args []string) int {
 func mcpCommand(args []string) int {
 	f := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	workdir := f.String("workdir", ".", "working directory")
+	allowExec := f.Bool("allow-exec", false, "permit the MCP client to execute commands as the server user")
+	var allow listFlag
+	f.Var(&allow, "upstream-allow", "allow upstream for exec_run")
 	if showCommandHelp(f, args, "usage: glitchdeck mcp [flags]") {
 		return 0
 	}
@@ -169,7 +172,7 @@ func mcpCommand(args []string) int {
 		return 3
 	}
 	defer output.Close()
-	if err := mcp.NewServer(os.Stdin, output, mcp.Options{Workdir: *workdir, Version: buildVersion(), CloseOutputOnCancel: true}).Serve(); err != nil {
+	if err := mcp.NewServer(os.Stdin, output, mcp.Options{Workdir: *workdir, Version: buildVersion(), CloseOutputOnCancel: true, AllowExec: *allowExec, UpstreamAllow: allow}).Serve(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 3
 	}

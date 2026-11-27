@@ -40,8 +40,20 @@ func invalidRule(id, param, message string) error {
 	return &ValidationError{code, id, param, fmt.Sprintf("rule %q: %s", id, message)}
 }
 
-func invalidParam(id, param string) error {
-	return invalidRule(id, param, fmt.Sprintf("invalid parameter %q", param))
+func invalidParam(id, typ, param, action string) error {
+	message := fmt.Sprintf("invalid parameter %q", param)
+	if spec, ok := Registry[typ].Params[param]; ok {
+		options := spec.Enum
+		if len(spec.EnumByAction[action]) > 0 {
+			options = spec.EnumByAction[action]
+		}
+		if len(options) > 0 {
+			message += ": must be one of " + strings.Join(options, ", ")
+		} else if spec.Kind == "int" && spec.Max != 0 {
+			message += fmt.Sprintf(": must be an integer between %d and %d", spec.Min, spec.Max)
+		}
+	}
+	return invalidRule(id, param, message)
 }
 
 var Registry = map[string]TypeSpec{
@@ -150,10 +162,10 @@ func validateV2(r Rule) error {
 	for k, v := range p {
 		spec, ok := s.Params[k]
 		if !ok || len(spec.Actions) != 0 && !slices.Contains(spec.Actions, action) || !spec.valid(v) && !(r.Fault.Type == "sse-glitch" && k == "action" && v == "early_eof") {
-			return invalidParam(r.ID, k)
+			return invalidParam(r.ID, r.Fault.Type, k, action)
 		}
 		if options := spec.EnumByAction[action]; len(options) > 0 && !slices.Contains(options, String(p, k, "")) {
-			return invalidParam(r.ID, k)
+			return invalidParam(r.ID, r.Fault.Type, k, action)
 		}
 	}
 	if action := String(p, "action", s.Actions[0]); r.Fault.Type == "sse-glitch" && (action == "drop" || action == "corrupt_json") {
@@ -164,15 +176,15 @@ func validateV2(r Rule) error {
 	if r.Fault.Type == "sse-glitch" && action == "inject_error" {
 		provider := String(p, "provider", "auto")
 		if provider == "raw" && p["data"] == nil || provider != "raw" && (p["data"] != nil || p["event"] != nil) {
-			return invalidParam(r.ID, "data")
+			return invalidParam(r.ID, r.Fault.Type, "data", action)
 		}
 		if strings.ContainsAny(String(p, "event", ""), "\r\n") {
-			return invalidParam(r.ID, "event")
+			return invalidParam(r.ID, r.Fault.Type, "event", action)
 		}
 		if value, ok := p["error_type"].(string); ok {
 			for _, ch := range value {
 				if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '.' || ch == '-') {
-					return invalidParam(r.ID, "error_type")
+					return invalidParam(r.ID, r.Fault.Type, "error_type", action)
 				}
 			}
 		}

@@ -178,13 +178,13 @@ Configure the stdio server (the executable must be on `PATH`):
 Claude Code, project `.mcp.json`:
 
 ```json
-{"mcpServers":{"glitchdeck":{"type":"stdio","command":"glitchdeck","args":["mcp"]}}}
+{"mcpServers":{"glitchdeck":{"type":"stdio","command":"glitchdeck","args":["mcp","--allow-exec"]}}}
 ```
 
 Cursor, project `.cursor/mcp.json`:
 
 ```json
-{"mcpServers":{"glitchdeck":{"type":"stdio","command":"glitchdeck","args":["mcp"]}}}
+{"mcpServers":{"glitchdeck":{"type":"stdio","command":"glitchdeck","args":["mcp","--allow-exec"]}}}
 ```
 
 Codex, `~/.codex/config.toml`:
@@ -192,8 +192,10 @@ Codex, `~/.codex/config.toml`:
 ```toml
 [mcp_servers.glitchdeck]
 command = "glitchdeck"
-args = ["mcp"]
+args = ["mcp", "--allow-exec"]
 ```
+
+These examples opt in to command execution; omit `--allow-exec` to leave it disabled.
 
 ## Faults
 
@@ -217,7 +219,13 @@ Use the stdio configuration above for interactive MCP:
 glitchdeck mcp
 ```
 
-Use `proxy_start` with a loopback target or `demo`, `fault_set` to arm rules, and `wire_events` to inspect traffic. Use `tape_export` to save a recording, `tape_validate` to check a tape without running it, and `tape_run` to replay one. Tape input paths must stay within the MCP workdir (`.` by default). See [SKILL.md](SKILL.md) for the regression workflow.
+The ten tools are `proxy_start`, `proxy_stop`, `fault_set`, `fault_clear`, `wire_events`, `demo_trigger`, `tape_export`, `tape_validate`, `tape_run`, and `exec_run`. Use `proxy_start` with a loopback target or `demo`, `fault_set` to arm rules, and `wire_events` to inspect traffic. Tape input paths must stay within the MCP workdir (`.` by default). See [SKILL.md](SKILL.md) for the regression workflow.
+
+`--allow-exec` grants the MCP client arbitrary command execution as the server user, the same as giving it a shell. The workdir and egress policy confine **glitchdeck's own** file access and proxy, but they are **not** a sandbox for the child. The child can read any file and open direct sockets. Clients that already have a shell (Claude Code, Cursor, Codex) lose nothing by enabling it. Clients that don't must not get it silently.
+
+`exec_run` takes an argv array, not a shell command string; inspect `ok` in its report for assertion failures. Remote targets require the server's `--upstream-allow`; an MCP call can never widen `--upstream-allow`. The `cwd` is resolved within the workdir, but a writable symlink can be swapped between validation and process start (TOCTOU). Windows process cleanup is best-effort and does not guarantee stopping grandchildren.
+
+`tape_export` emits v2 by default; request `format: "v1"` for a compatible recording. Incomplete exports report `replayable: false`.
 
 Recordings strip common credential headers and `Referer`, and redact sensitive query values, including ambiguous semicolon-separated suffixes. Check bodies and other fields for credentials before sharing a tape. Ring eviction sets `truncated` and `dropped_entries`; MCP also reports `omitted_body_bytes` when it shortens bodies to fit the 64 KiB inline or 1 MiB file export limit. Recordings that omit bodies or trailers are incomplete and cannot be replayed.
 

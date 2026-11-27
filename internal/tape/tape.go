@@ -952,6 +952,15 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 
 // CheckAssertionJSON compares the selected dotted keys against a JSON object.
 func CheckAssertionJSON(body []byte, expected map[string]any, keys []string) []string {
+	return checkAssertionJSON(body, expected, keys, false)
+}
+
+// CheckAssertionJSONRedacted reports the first JSON mismatch without exposing values.
+func CheckAssertionJSONRedacted(body []byte, expected map[string]any) []string {
+	return checkAssertionJSON(body, expected, nil, true)
+}
+
+func checkAssertionJSON(body []byte, expected map[string]any, keys []string, redact bool) []string {
 	var data map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
@@ -965,15 +974,21 @@ func CheckAssertionJSON(body []byte, expected map[string]any, keys []string) []s
 		}
 	}
 	if err != nil {
+		if redact {
+			return []string{"invalid JSON response"}
+		}
 		return []string{"invalid JSON response: " + err.Error()}
 	}
-	budget := assertionDiagnostics{remaining: assertionDiagnosticBudget}
+	budget := assertionDiagnostics{remaining: assertionDiagnosticBudget, redact: redact}
 	return budget.compare(data, expected, keys)
 }
 
 const assertionDiagnosticBudget = 64 << 10
 
-type assertionDiagnostics struct{ remaining int }
+type assertionDiagnostics struct {
+	remaining int
+	redact    bool
+}
 
 func (d *assertionDiagnostics) compare(data map[string]any, expected map[string]any, keys []string) []string {
 	if keys == nil {
@@ -1006,6 +1021,12 @@ func (d *assertionDiagnostics) compare(data map[string]any, expected map[string]
 		ed.Decode(&en)
 		if present && jsonEqual(en, got) {
 			continue
+		}
+		if d.redact {
+			if !present {
+				return []string{diagnosticPreview(k) + ": missing JSON field"}
+			}
+			return []string{diagnosticPreview(k) + ": JSON value mismatch"}
 		}
 		if d.remaining == 0 {
 			omitted++

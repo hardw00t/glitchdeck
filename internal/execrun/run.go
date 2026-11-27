@@ -36,27 +36,31 @@ import (
 )
 
 type Options struct {
-	Command             []string
-	TapePath            string
-	Target              string
-	Listen              string
-	UI                  string
-	Timeout             time.Duration
-	Grace               time.Duration
-	TLS                 bool
-	CADir               string
-	NoProxy             string
-	UpstreamAllow       []string
-	TLSPassthrough      []string
-	UpstreamCA          string
-	InsecureUpstream    bool
-	ProxyAuth           bool
-	JSON                bool
-	AllowRemote         bool
-	AllowLoopbackEgress bool
-	AllowZeroTraffic    bool
-	Seed                *uint64
-	javaHome            bool
+	Command              []string
+	TapePath             string
+	Target               string
+	Listen               string
+	UI                   string
+	Timeout              time.Duration
+	Grace                time.Duration
+	TLS                  bool
+	CADir                string
+	NoProxy              string
+	UpstreamAllow        []string
+	TLSPassthrough       []string
+	UpstreamCA           string
+	InsecureUpstream     bool
+	ProxyAuth            bool
+	JSON                 bool
+	AllowRemote          bool
+	AllowLoopbackEgress  bool
+	AllowZeroTraffic     bool
+	Seed                 *uint64
+	Dir                  string
+	DetachStdio          bool
+	TailBytes            int
+	RequireUpstreamAllow bool
+	javaHome             bool
 }
 type Exec struct {
 	Cmd                         []string           `json:"cmd"`
@@ -66,6 +70,11 @@ type Exec struct {
 	TimedOut                    bool               `json:"timed_out"`
 	StdoutTail                  string             `json:"stdout_tail"`
 	StderrTail                  string             `json:"stderr_tail"`
+	StdoutBytes                 int64              `json:"stdout_bytes"`
+	StderrBytes                 int64              `json:"stderr_bytes"`
+	StdoutTruncated             bool               `json:"stdout_truncated,omitempty"`
+	StderrTruncated             bool               `json:"stderr_truncated,omitempty"`
+	Warnings                    []string           `json:"warnings,omitempty"`
 	PID                         int                `json:"pid,omitempty"`
 	LeakedPIDs                  []int              `json:"leaked_pids"`
 	TLSHandshakeFailures        []json.RawMessage  `json:"tls_handshake_failures,omitempty"`
@@ -143,6 +152,19 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	e := NewEnvelope("exec", o.TapePath, target)
 	e.Exec = &Exec{Cmd: o.Command}
+	warn := func(message string) {
+		fmt.Fprintln(os.Stderr, message)
+		if o.DetachStdio && len(e.Exec.Warnings) < 16 {
+			message = strings.ToValidUTF8(message, "�")
+			if len(message) > 512 {
+				message = message[:512]
+				for !utf8.ValidString(message) {
+					message = message[:len(message)-1]
+				}
+			}
+			e.Exec.Warnings = append(e.Exec.Warnings, message)
+		}
+	}
 	finish := func(code int, kind string, err error) Envelope {
 		e.ExitCode = code
 		e.OK = code == 0
@@ -214,14 +236,14 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	p.OnOutcome = frameErrors.Observe
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
-	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), TLSPassthrough: append(append([]string{}, t.TLSPassthrough...), o.TLSPassthrough...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress}
+	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), TLSPassthrough: append(append([]string{}, t.TLSPassthrough...), o.TLSPassthrough...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress, RequireUpstreamAllow: o.RequireUpstreamAllow}
 	for i, pattern := range opts.TLSPassthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {
 			return finish(2, "USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
 		}
 	}
 	if len(opts.TLSPassthrough) > 0 && !o.TLS {
-		fmt.Fprintln(os.Stderr, "tls-passthrough has no effect without --tls")
+		warn("tls-passthrough has no effect without --tls")
 	}
 	var scheduleStart time.Time
 	var configMu sync.Mutex
@@ -384,13 +406,20 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	go p.Serve(listener)
 	noProxy, dropped := mergeNoProxy(os.Getenv("NO_PROXY"), os.Getenv("no_proxy"), o.NoProxy, listenerAddr, parsed)
-	e.Exec.NoProxy, e.Exec.NoProxyDropped = reportNoProxy(noProxy), dropped
-	safeTarget := "(forward-only)"
-	if parsed != nil {
-		safeTarget = parsed.Scheme + "://" + parsed.Host
-	}
-	for _, entry := range dropped {
-		fmt.Fprintf(os.Stderr, "no_proxy: dropped %q from inherited NO_PROXY; it would bypass glitchdeck for target %s (pass --no-proxy %s to keep it)\n", entry, safeTarget, entry)
+	if o.DetachStdio {
+		e.Exec.NoProxy = listenerAddr
+		if len(dropped) != 0 {
+			warn(fmt.Sprintf("no_proxy: dropped %d inherited entries that could bypass glitchdeck", len(dropped)))
+		}
+	} else {
+		safeTarget := "(forward-only)"
+		if parsed != nil {
+			safeTarget = parsed.Scheme + "://" + parsed.Host
+		}
+		e.Exec.NoProxy, e.Exec.NoProxyDropped = reportNoProxy(noProxy), dropped
+		for _, entry := range dropped {
+			warn(fmt.Sprintf("no_proxy: dropped %q from inherited NO_PROXY; it would bypass glitchdeck for target %s (pass --no-proxy %s to keep it)", entry, safeTarget, entry))
+		}
 	}
 	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
 	if e.Exec.UIURL != "" {
@@ -400,9 +429,17 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	defer cancel()
 	cmd := exec.CommandContext(childCtx, o.Command[0], o.Command[1:]...)
 	cmd.Env = append(os.Environ(), env...)
-	cmd.Stdin = os.Stdin
-	var stdout, stderr tail
-	if o.JSON || o.ProxyAuth {
+	cmd.Dir = o.Dir
+	if !o.DetachStdio {
+		cmd.Stdin = os.Stdin
+	}
+	limit := o.TailBytes
+	if limit <= 0 {
+		limit = 4096
+	}
+	stdout := tail{limit: limit, boundUTF8: o.DetachStdio}
+	stderr := stdout
+	if o.JSON || o.ProxyAuth || o.DetachStdio {
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 	} else {
@@ -485,17 +522,18 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if helper.SpawnCode != 0 {
 		return finish(helper.SpawnCode, "EXEC_SPAWN_FAILED", errors.New(helper.SpawnError))
 	}
-	cancel()
 	if len(leaked) > 0 {
 		e.Exec.LeakedPIDs = leaked
 	}
 	e.Exec.StdoutTail, e.Exec.StderrTail = stdout.String(), stderr.String()
+	e.Exec.StdoutBytes, e.Exec.StderrBytes = stdout.total, stderr.total
+	e.Exec.StdoutTruncated, e.Exec.StderrTruncated = stdout.total > int64(limit), stderr.total > int64(limit)
 	if opts.ProxyAuth != "" {
 		e.Exec.StdoutTail = strings.ReplaceAll(e.Exec.StdoutTail, proxyURL, publicURL)
 		e.Exec.StderrTail = strings.ReplaceAll(e.Exec.StderrTail, proxyURL, publicURL)
 		e.Exec.StdoutTail = strings.ReplaceAll(e.Exec.StdoutTail, opts.ProxyAuth, "[redacted]")
 		e.Exec.StderrTail = strings.ReplaceAll(e.Exec.StderrTail, opts.ProxyAuth, "[redacted]")
-		if !o.JSON {
+		if !o.JSON && !o.DetachStdio {
 			fmt.Fprintln(os.Stdout, e.Exec.StdoutTail)
 			fmt.Fprintln(os.Stderr, e.Exec.StderrTail)
 		}
@@ -511,6 +549,12 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			httpTape.Assertions = append(httpTape.Assertions, a)
 			proxyAssertions = proxyAssertions || !a.Direct
 		}
+	}
+	assertCtx := ctx
+	var limits *assertionLimits
+	if o.DetachStdio {
+		assertCtx = childCtx
+		limits = &assertionLimits{remaining: 64 << 10}
 	}
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
 	defer cancelDrain()
@@ -528,7 +572,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			}
 		}
 		if waitErr == nil {
-			httpResults = assertions(ctx, httpTape, probeURL, target, probePassword, nil, opts.UpstreamCA)
+			httpResults = assertions(assertCtx, httpTape, probeURL, target, probePassword, nil, limits, opts.UpstreamCA)
 			waitErr = p.Wait(drainCtx)
 		}
 	}
@@ -541,7 +585,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))
 	}
-	if timedOut {
+	if timedOut || o.DetachStdio && errors.Is(childCtx.Err(), context.DeadlineExceeded) {
 		e.Exec.TimedOut = true
 		return finish(124, "TIMEOUT", context.DeadlineExceeded)
 	}
@@ -555,8 +599,15 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			protocolTape.Assertions = append(protocolTape.Assertions, a)
 		}
 	}
-	results := append(httpResults, assertions(ctx, protocolTape, "", target, "", evidence.history())...)
+	results := append(httpResults, assertions(assertCtx, protocolTape, "", target, "", evidence.history(), limits)...)
+	if o.DetachStdio && errors.Is(childCtx.Err(), context.DeadlineExceeded) {
+		e.Exec.TimedOut = true
+		return finish(124, "TIMEOUT", context.DeadlineExceeded)
+	}
 	e.SetResults(results)
+	if limits != nil && limits.omitted != 0 {
+		e.Diff = append(e.Diff, fmt.Sprintf("diagnostics omitted for %d assertions", limits.omitted))
+	}
 	failed := e.Summary.AssertionsFailed > 0
 	innerOK := childStats.InnerUsable > 0
 	tlsOnly := childStats.TLSRejected > 0 && !innerOK && childStats.PassthroughOK+childStats.BlindOK == 0
@@ -569,7 +620,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		return list
 	}
 	if childStats.TLSRejected > 0 && innerOK {
-		fmt.Fprintf(os.Stderr, "warning: tls_rejected: %d handshake(s) failed for hosts %s\n", childStats.TLSRejected, hostList("tls"))
+		warn(fmt.Sprintf("warning: tls_rejected: %d handshake(s) failed for hosts %s", childStats.TLSRejected, hostList("tls")))
 	}
 	if !o.AllowZeroTraffic {
 		if tlsOnly {
@@ -679,20 +730,47 @@ func startAssertionProxy(p *proxy.Proxy, proxyPassword string) (addr, password s
 	}, nil
 }
 
-type tail struct{ b []byte }
+type tail struct {
+	b         []byte
+	limit     int
+	boundUTF8 bool
+	total     int64
+}
 
 func (t *tail) Write(p []byte) (int, error) {
 	n := len(p)
-	t.b = append(t.b, p...)
-	if len(t.b) > 4096 {
-		t.b = append([]byte(nil), t.b[len(t.b)-4096:]...)
+	t.total += int64(n)
+	if t.limit <= 0 {
+		t.limit = 4096
 	}
+	if t.b == nil {
+		t.b = make([]byte, 0, 2*t.limit)
+	}
+	if len(p) >= t.limit {
+		t.b = append(t.b[:0], p[len(p)-t.limit:]...)
+		return n, nil
+	}
+	if len(t.b)+len(p) > 2*t.limit {
+		copy(t.b, t.b[len(t.b)-t.limit:])
+		t.b = t.b[:t.limit]
+	}
+	t.b = append(t.b, p...)
 	return n, nil
 }
+
 func (t *tail) String() string {
-	b := bytes.ToValidUTF8(t.b, []byte("�"))
-	for len(b) > 0 && !utf8.Valid(b) {
-		b = b[1:]
+	b := t.b
+	if len(b) > t.limit {
+		b = b[len(b)-t.limit:]
+	}
+	if !utf8.Valid(b) {
+		b = bytes.ToValidUTF8(b, []byte("�"))
+		if t.boundUTF8 && len(b) > t.limit {
+			b = b[len(b)-t.limit:]
+			for len(b) != 0 && !utf8.RuneStart(b[0]) {
+				b = b[1:]
+			}
+		}
 	}
 	return strings.TrimSpace(string(b))
 }

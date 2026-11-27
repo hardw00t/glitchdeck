@@ -29,7 +29,11 @@ func isolateProcess(cmd *exec.Cmd, grace time.Duration) (*os.File, *os.File, err
 	if cmd.Err != nil {
 		return nil, nil, nil
 	}
-	if info, err := os.Stat(cmd.Path); err == nil && !info.IsDir() && info.Mode().Perm()&0111 == 0 {
+	path := cmd.Path
+	if cmd.Dir != "" && !filepath.IsAbs(path) {
+		path = filepath.Join(cmd.Dir, path)
+	}
+	if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Mode().Perm()&0111 == 0 {
 		return nil, nil, nil
 	}
 	self, err := os.Executable()

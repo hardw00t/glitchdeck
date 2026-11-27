@@ -14,18 +14,53 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
 
-func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password string, events []telemetry.Event, roots ...*x509.CertPool) []tape.Result {
+type assertionLimits struct {
+	remaining int
+	omitted   int
+}
+
+func (l *assertionLimits) trim(r tape.Result) tape.Result {
+	for _, failure := range r.Failures {
+		l.remaining -= len(failure)
+		if l.remaining < 0 {
+			l.omitted++
+			r.Failures = []string{"assertion diagnostics omitted"}
+			break
+		}
+	}
+	return r
+}
+
+func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password string, events []telemetry.Event, limits *assertionLimits, roots ...*x509.CertPool) []tape.Result {
+	if len(t.Assertions) == 0 {
+		return nil
+	}
+	private := limits != nil
 	out := make([]tape.Result, 0, len(t.Assertions))
+	add := func(r tape.Result) {
+		if private {
+			r = limits.trim(r)
+		}
+		out = append(out, r)
+	}
 	client := http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	if len(roots) > 0 && roots[0] != nil {
+	if private || len(roots) > 0 && roots[0] != nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = &tls.Config{RootCAs: roots[0], MinVersion: tls.VersionTLS12}
+		if private {
+			transport.Proxy = nil
+		}
+		if len(roots) > 0 && roots[0] != nil {
+			transport.TLSClientConfig = &tls.Config{RootCAs: roots[0], MinVersion: tls.VersionTLS12}
+		}
 		client.Transport = transport
 		defer transport.CloseIdleConnections()
 	}
 	for _, a := range t.Assertions {
+		if private && ctx.Err() != nil {
+			break
+		}
 		if a.HTTPGet == "" {
-			out = append(out, observedAssertion(a, t, events))
+			add(observedAssertion(a, t, events))
 			continue
 		}
 		r := tape.Result{Name: a.Name, Failures: []string{}}
@@ -36,7 +71,7 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+a.HTTPGet, nil)
 		if err != nil {
 			r.Failures = append(r.Failures, "invalid assertion request URL")
-			out = append(out, r)
+			add(r)
 			continue
 		}
 		if password != "" && !a.Direct {
@@ -45,18 +80,27 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
+			if private {
+				r.Failures = append(r.Failures, "assertion request failed")
+				add(r)
+				continue
+			}
 			safeURL := *req.URL
 			safeURL.User = nil
 			safeURL.RawQuery = ""
 			safeURL.Fragment = ""
 			r.Failures = append(r.Failures, fmt.Sprintf("assertion request failed: %s", safeURL.String()))
-			out = append(out, r)
+			add(r)
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		resp.Body.Close()
 		if err != nil {
-			r.Failures = append(r.Failures, err.Error())
+			if private {
+				r.Failures = append(r.Failures, "could not read assertion response")
+			} else {
+				r.Failures = append(r.Failures, err.Error())
+			}
 		}
 		if a.ExpectStatus != 0 && resp.StatusCode != a.ExpectStatus {
 			r.Failures = append(r.Failures, fmt.Sprintf("status: expected %d, got %d", a.ExpectStatus, resp.StatusCode))
@@ -65,9 +109,13 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 			r.Failures = append(r.Failures, "latency exceeded")
 		}
 		if len(a.JSONEq) > 0 {
-			r.Failures = append(r.Failures, tape.CheckAssertionJSON(body, a.JSONEq, nil)...)
+			if private {
+				r.Failures = append(r.Failures, tape.CheckAssertionJSONRedacted(body, a.JSONEq)...)
+			} else {
+				r.Failures = append(r.Failures, tape.CheckAssertionJSON(body, a.JSONEq, nil)...)
+			}
 		}
-		out = append(out, r)
+		add(r)
 	}
 	return out
 }

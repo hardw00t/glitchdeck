@@ -77,9 +77,7 @@ func TestSessionLoopAndEOF(t *testing.T) {
 
 func TestStrictArgumentBounds(t *testing.T) {
 	for _, args := range []string{`{"limit":0}`, `{"type":"other"}`, `{"limit":101}`, `{"since_id":-1}`} {
-		var obj map[string]json.RawMessage
-		json.Unmarshal([]byte(args), &obj)
-		if validArgs("wire_events", obj) {
+		if validArgs("wire_events", json.RawMessage(args)) == nil {
 			t.Fatalf("accepted %s", args)
 		}
 	}
@@ -123,17 +121,13 @@ func TestExportPathGuard(t *testing.T) {
 }
 
 func TestTapeRunReportsAssertions(t *testing.T) {
-	input := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":\"clean.tape.yaml\"}}}\n" +
-		"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":\"checkout-dup-webhook.tape.yaml\"}}}\n"
-	var output strings.Builder
-	if err := NewServer(strings.NewReader(input), &output, Options{Workdir: "../../examples"}).Serve(); err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
-	if len(lines) != 2 {
-		t.Fatal(output.String())
-	}
-	for i, line := range lines {
+	for i, path := range []string{"clean.tape.yaml", "checkout-dup-webhook.tape.yaml"} {
+		input := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":%q}}}\n", path)
+		var output strings.Builder
+		if err := NewServer(strings.NewReader(input), &output, Options{Workdir: "../../examples"}).Serve(); err != nil {
+			t.Fatal(err)
+		}
+		line := output.String()
 		var reply struct {
 			Result struct {
 				IsError bool `json:"isError"`

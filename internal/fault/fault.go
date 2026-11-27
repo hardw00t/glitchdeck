@@ -110,14 +110,14 @@ func Validate(c Config) error {
 			switch mode {
 			case "sequential", "concurrent", "timeout_retry":
 			default:
-				return invalidParam(r.ID, "mode")
+				return invalidParam(r.ID, r.Fault.Type, "mode", "")
 			}
 			if result, ok := r.Fault.Params["client_result"]; ok {
 				if mode != "timeout_retry" {
 					return invalidRule(r.ID, "client_result", `param "client_result": requires mode timeout_retry`)
 				}
 				if result != "gateway_timeout" && result != "reset" {
-					return invalidParam(r.ID, "client_result")
+					return invalidParam(r.ID, r.Fault.Type, "client_result", "")
 				}
 			}
 			if mode == "concurrent" && Int(r.Fault.Params, "delay_ms", 0) > 0 {
@@ -125,7 +125,7 @@ func Validate(c Config) error {
 			}
 			if mode != "sequential" {
 				if count, ok := r.Fault.Params["count"]; ok && !(paramRange{min: 2, max: 20}).valid(count) {
-					return invalidParam(r.ID, "count")
+					return invalidRule(r.ID, "count", `invalid parameter "count": must be an integer between 2 and 20`)
 				}
 			}
 		case "rate-limit":
@@ -133,7 +133,7 @@ func Validate(c Config) error {
 			switch String(r.Fault.Params, "provider", "none") {
 			case "none", "openai", "anthropic", "gemini":
 			default:
-				return invalidParam(r.ID, "provider")
+				return invalidParam(r.ID, r.Fault.Type, "provider", "")
 			}
 		case "byte-trickle":
 			schema = trickleParams
@@ -159,7 +159,7 @@ func Validate(c Config) error {
 			switch String(r.Fault.Params, "frames", "all") {
 			case "all", "data", "control":
 			default:
-				return invalidParam(r.ID, "frames")
+				return invalidParam(r.ID, r.Fault.Type, "frames", "")
 			}
 		case "sse-glitch", "h2-glitch", "grpc-glitch":
 			if err := validateV2(r); err != nil {
@@ -172,7 +172,7 @@ func Validate(c Config) error {
 		for k, v := range r.Fault.Params {
 			spec, ok := schema[k]
 			if !ok || !spec.valid(v) {
-				return invalidParam(r.ID, k)
+				return invalidParam(r.ID, r.Fault.Type, k, "")
 			}
 		}
 	}

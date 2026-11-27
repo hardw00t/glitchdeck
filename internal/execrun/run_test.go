@@ -219,7 +219,7 @@ func TestHTTPAssertionRejectsMissingNullAndLargeNumberMismatch(t *testing.T) {
 		Name: "json", HTTPGet: "/", Direct: true,
 		JSONEq: map[string]any{"missing": nil, "number": json.Number("9007199254740992")},
 	}}}
-	result := assertions(context.Background(), tp, "", server.URL, "", nil)
+	result := assertions(context.Background(), tp, "", server.URL, "", nil, nil)
 	if len(result) != 1 || len(result[0].Failures) != 2 {
 		t.Fatalf("expected both mismatches: %+v", result)
 	}
@@ -288,7 +288,7 @@ func TestHTTPAssertionDoesNotFollowRedirect(t *testing.T) {
 	}))
 	defer server.Close()
 	tp := tape.Tape{Assertions: []tape.Assertion{{HTTPGet: "/", Direct: true, ExpectStatus: http.StatusFound}}}
-	result := assertions(context.Background(), tp, "", server.URL, "", nil)
+	result := assertions(context.Background(), tp, "", server.URL, "", nil, nil)
 	if followed || len(result) != 1 || len(result[0].Failures) != 0 {
 		t.Fatalf("redirect followed or assertion failed: %+v", result)
 	}

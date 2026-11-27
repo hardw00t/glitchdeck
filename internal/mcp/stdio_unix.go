@@ -13,6 +13,7 @@ func OwnedStdioOutput() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	syscall.CloseOnExec(fd)
 	if err = syscall.SetNonblock(fd, true); err != nil {
 		syscall.Close(fd)
 		return nil, err

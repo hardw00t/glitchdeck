@@ -45,7 +45,7 @@ func TestHandshakeAndList(t *testing.T) {
 			} `json:"tools"`
 		} `json:"result"`
 	}
-	if err := json.Unmarshal([]byte(lines[1]), &result); err != nil || len(result.Result.Tools) != 9 {
+	if err := json.Unmarshal([]byte(lines[1]), &result); err != nil || len(result.Result.Tools) != 10 {
 		t.Fatal(out.String())
 	}
 	for _, tool := range result.Result.Tools {
@@ -68,13 +68,17 @@ func TestRejectsUnknownToolAndParameters(t *testing.T) {
 	if err := NewServer(strings.NewReader(input), &out, Options{}).Serve(); err != nil {
 		t.Fatal(err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+	for i, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
 		var reply struct {
 			Error struct {
 				Code int `json:"code"`
+				Data struct {
+					Reason string `json:"reason"`
+				} `json:"data"`
 			} `json:"error"`
 		}
-		if err := json.Unmarshal([]byte(line), &reply); err != nil || reply.Error.Code != -32602 {
+		if err := json.Unmarshal([]byte(line), &reply); err != nil || reply.Error.Code != -32602 ||
+			reply.Error.Data.Reason != []string{"unknown_tool", "unknown_field"}[i] {
 			t.Fatalf("bad response %s", line)
 		}
 	}

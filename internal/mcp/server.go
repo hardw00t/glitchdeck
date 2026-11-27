@@ -2,13 +2,13 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/hardw00t/glitchdeck/internal/demo"
-	"github.com/hardw00t/glitchdeck/internal/execrun"
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -31,6 +32,8 @@ type Options struct {
 	Workdir             string
 	Version             string
 	CloseOutputOnCancel bool
+	AllowExec           bool
+	UpstreamAllow       []string
 }
 type Server struct {
 	in               io.Reader
@@ -45,6 +48,9 @@ type Server struct {
 	recording        *ui.Recording
 	isDemo           bool
 	ctx              context.Context
+	mu               sync.Mutex
+	job              *job
+	writeMu          sync.Mutex
 }
 
 func NewServer(in io.Reader, out io.Writer, opts Options) *Server {
@@ -100,21 +106,52 @@ func (s *Server) Serve() error {
 		}
 	}()
 	enc := json.NewEncoder(s.out)
+	write := func(response any) error {
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		return enc.Encode(response)
+	}
+	writeErrors := make(chan error, 1)
+	writeAsync := func(response any) {
+		if err := write(response); err != nil {
+			select {
+			case writeErrors <- err:
+			default:
+			}
+		}
+	}
+	defer s.shutdownJob()
 	for {
 		var l line
 		select {
 		case <-ctx.Done():
 			return nil
+		case err := <-writeErrors:
+			return err
 		case l = <-lines:
 		}
 		if l.data == nil {
+			if j := s.runningJob(); j != nil {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-j.done:
+				}
+			}
+			select {
+			case err := <-writeErrors:
+				return err
+			default:
+			}
 			return l.err
 		}
-		handle := func(data []byte) map[string]any {
+		handle := func(data []byte, batch bool) map[string]any {
 			var r request
 			var result any
 			var code int
 			message := ""
+			var params *paramError
+			dispatched := false
 			if !json.Valid(data) {
 				code = -32700
 				message = "Parse error"
@@ -122,6 +159,9 @@ func (s *Server) Serve() error {
 				code = -32600
 				message = "Invalid Request"
 			} else if strings.HasPrefix(r.Method, "notifications/") && len(r.ID) == 0 {
+				if r.Method == "notifications/cancelled" {
+					s.cancelJob(r.Params)
+				}
 				return nil
 			} else {
 				func() {
@@ -137,8 +177,7 @@ func (s *Server) Serve() error {
 							ProtocolVersion string `json:"protocolVersion"`
 						}
 						if len(r.Params) > 0 && (json.Unmarshal(r.Params, &p) != nil || string(r.Params) == "null") {
-							code = -32602
-							message = "Invalid params"
+							params = &paramError{Field: "params", Reason: "malformed"}
 							break
 						}
 						v := p.ProtocolVersion
@@ -151,8 +190,11 @@ func (s *Server) Serve() error {
 					case "tools/list":
 						catalog := tools()
 						for _, tool := range catalog {
-							if tool["name"] == "fault_set" {
+							switch tool["name"] {
+							case "fault_set":
 								tool["_meta"] = map[string]any{"faultCatalog": fault.Registry}
+							case "exec_run":
+								tool["_meta"] = map[string]any{"execEnabled": s.opts.AllowExec}
 							}
 						}
 						result = map[string]any{"tools": catalog}
@@ -162,62 +204,74 @@ func (s *Server) Serve() error {
 							Arguments json.RawMessage `json:"arguments"`
 							Meta      json.RawMessage `json:"_meta"`
 						}
-						dec := json.NewDecoder(strings.NewReader(string(r.Params)))
+						dec := json.NewDecoder(bytes.NewReader(r.Params))
 						dec.DisallowUnknownFields()
 						if dec.Decode(&p) != nil || p.Name == "" {
-							code = -32602
-							message = "Invalid params"
+							params = &paramError{Field: "params", Reason: "malformed"}
 							break
 						}
-						var obj map[string]json.RawMessage
 						if len(p.Arguments) == 0 {
 							p.Arguments = []byte("{}")
 						}
-						if json.Unmarshal(p.Arguments, &obj) != nil || obj == nil || !validArgs(p.Name, obj) {
-							code = -32602
-							message = "Invalid params"
+						params = validArgs(p.Name, p.Arguments)
+						if params != nil {
 							break
 						}
-						value, invalid := s.call(p.Name, p.Arguments)
-						if invalid {
-							code = -32602
-							message = "Invalid params"
-							if p.Name == "tape_validate" {
-								message = "Invalid params: supply exactly one of tape_path or tape_yaml"
+						var value map[string]any
+						switch p.Name {
+						case "exec_run", "tape_run":
+							var run jobRun
+							switch {
+							case batch && p.Name == "exec_run":
+								params = &paramError{Field: "arguments", Reason: "not_batchable"}
+							case p.Name == "exec_run" && !s.opts.AllowExec:
+								value = fail("EXEC_DISABLED", "exec_run is disabled; restart the server as `glitchdeck mcp --allow-exec` to let this client run commands")
+							default:
+								if id, busy := s.busyJob(); busy {
+									value = fail("BUSY", "request "+id+" is still running")
+								} else if p.Name == "exec_run" {
+									run, value, params = s.prepareExec(p.Arguments)
+								} else {
+									run, value, params = s.prepareTapeRun(p.Arguments)
+								}
 							}
+							if run != nil {
+								if batch {
+									value = run(ctx)
+								} else {
+									s.startJob(r.ID, p.Name, run, writeAsync)
+									dispatched = true
+									return
+								}
+							}
+						default:
+							value, params = s.call(p.Name, p.Arguments)
+						}
+						if params != nil {
+							params.Tool = p.Name
 							break
 						}
-						b, e := json.Marshal(value)
-						if e != nil {
-							code = -32603
-							message = "Internal error"
-							break
-						}
-						_, isErr := value["error"].(map[string]string)
-						if p.Name == "tape_validate" && value["ok"] == false {
-							isErr = true
-						}
-						result = map[string]any{"content": []any{map[string]string{"type": "text", "text": string(b)}}, "structuredContent": value, "isError": isErr}
+						result = toolResult(p.Name, value)
 					default:
 						code = -32601
 						message = "Method not found"
 					}
 				}()
 			}
-			if len(r.ID) == 0 && code != -32700 && code != -32600 {
+			if dispatched || len(r.ID) == 0 && code != -32700 && code != -32600 {
 				return nil
 			}
 			id := r.ID
 			if len(id) == 0 || !validID(id) {
 				id = []byte("null")
 			}
-			response := map[string]any{"jsonrpc": "2.0", "id": id}
-			if code != 0 {
-				response["error"] = map[string]any{"code": code, "message": message}
-			} else {
-				response["result"] = result
+			if params != nil && code == 0 {
+				return rpcError(id, -32602, params.message(), params)
 			}
-			return response
+			if code != 0 {
+				return rpcError(id, code, message, nil)
+			}
+			return map[string]any{"jsonrpc": "2.0", "id": id, "result": result}
 		}
 		var response any
 		trimmed := strings.TrimSpace(string(l.data))
@@ -229,7 +283,7 @@ func (s *Server) Serve() error {
 			} else {
 				replies := make([]map[string]any, 0, len(batch))
 				for _, item := range batch {
-					if reply := handle(item); reply != nil {
+					if reply := handle(item, true); reply != nil {
 						replies = append(replies, reply)
 					}
 				}
@@ -237,15 +291,39 @@ func (s *Server) Serve() error {
 					response = replies
 				}
 			}
-		} else if reply := handle(l.data); reply != nil {
+		} else if reply := handle(l.data, false); reply != nil {
 			response = reply
 		}
 		if response != nil {
-			if err := enc.Encode(response); err != nil {
+			if err := write(response); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func rpcError(id json.RawMessage, code int, message string, data *paramError) map[string]any {
+	e := map[string]any{"code": code, "message": message}
+	if data != nil {
+		e["data"] = data
+	}
+	return map[string]any{"jsonrpc": "2.0", "id": id, "error": e}
+}
+
+func toolResult(name string, value map[string]any) map[string]any {
+	b, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	_, isErr := value["error"].(map[string]string)
+	if name == "tape_validate" && value["ok"] == false {
+		isErr = true
+	}
+	return map[string]any{"content": []any{map[string]string{"type": "text", "text": string(b)}}, "structuredContent": value, "isError": isErr}
+}
+
+func toolResponse(id json.RawMessage, name string, value map[string]any) map[string]any {
+	return map[string]any{"jsonrpc": "2.0", "id": id, "result": toolResult(name, value)}
 }
 func validID(id json.RawMessage) bool {
 	if len(id) == 0 {
@@ -298,7 +376,7 @@ func (s *Server) stop() {
 	}
 	s.isDemo = false
 }
-func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
+func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 	switch name {
 	case "proxy_start":
 		var a struct {
@@ -308,18 +386,21 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			TapePath string  `json:"tape_path"`
 			Record   bool    `json:"record"`
 		}
-		if json.Unmarshal(raw, &a) != nil || a.Target == "" {
-			return nil, true
+		if json.Unmarshal(raw, &a) != nil {
+			return nil, malformedArgs()
+		}
+		if a.Target == "" {
+			return nil, &paramError{Field: "arguments.target", Reason: "invalid_value"}
 		}
 		if s.p != nil {
-			return fail("PROXY_ALREADY_RUNNING", s.proxyURL), false
+			return fail("PROXY_ALREADY_RUNNING", s.proxyURL), nil
 		}
 		if a.Listen == "" {
 			a.Listen = "127.0.0.1:0"
 		}
 		host, _, err := net.SplitHostPort(a.Listen)
 		if err != nil || (host != "localhost" && (net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback())) {
-			return fail("INVALID_TARGET", "listener must be loopback"), false
+			return fail("INVALID_TARGET", "listener must be loopback"), nil
 		}
 		cfg := fault.Config{Seed: 1}
 		if a.Seed != nil {
@@ -328,7 +409,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		if a.TapePath != "" {
 			t, e := s.readTape(a.TapePath)
 			if e != nil {
-				return fail("INVALID_TAPE", e.Error()), false
+				return fail("INVALID_TAPE", e.Error()), nil
 			}
 			cfg = fault.Config{Seed: t.Seed, Rules: t.Rules}
 		}
@@ -337,7 +418,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		if s.isDemo {
 			l, e := net.Listen("tcp", "127.0.0.1:0")
 			if e != nil {
-				return fail("INVALID_TARGET", e.Error()), false
+				return fail("INVALID_TARGET", e.Error()), nil
 			}
 			s.appListener = l
 			s.app = &http.Server{Handler: demo.New(), Protocols: demo.Protocols()}
@@ -347,12 +428,12 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		u, e := proxy.ParseTarget(target)
 		if e != nil {
 			s.stop()
-			return fail("INVALID_TARGET", e.Error()), false
+			return fail("INVALID_TARGET", e.Error()), nil
 		}
 		l, e := net.Listen("tcp", a.Listen)
 		if e != nil {
 			s.stop()
-			return fail("INVALID_TARGET", e.Error()), false
+			return fail("INVALID_TARGET", e.Error()), nil
 		}
 		s.listener = l
 		s.bus = telemetry.New()
@@ -365,7 +446,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			s.recording.Start(s.p)
 		}
 		go s.p.Serve(l)
-		return map[string]any{"running": true, "proxy_url": s.proxyURL, "target_url": target, "demo": s.isDemo, "seed": cfg.Seed, "seq": 0, "rules_count": len(cfg.Rules), "recording": a.Record}, false
+		return map[string]any{"running": true, "proxy_url": s.proxyURL, "target_url": target, "demo": s.isDemo, "seed": cfg.Seed, "seq": 0, "rules_count": len(cfg.Rules), "recording": a.Record}, nil
 	case "proxy_stop":
 		was := s.p != nil
 		seq := uint64(0)
@@ -380,18 +461,18 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			}
 		}
 		s.stop()
-		return map[string]any{"was_running": was, "seq_count": seq, "events_captured": events, "recorded_steps": steps}, false
+		return map[string]any{"was_running": was, "seq_count": seq, "events_captured": events, "recorded_steps": steps}, nil
 	case "fault_set":
 		var a struct {
 			Mode  string       `json:"mode"`
 			Seed  *uint64      `json:"seed"`
 			Rules []fault.Rule `json:"rules"`
 		}
-		if json.Unmarshal(raw, &a) != nil || len(a.Rules) == 0 || (a.Mode != "" && a.Mode != "upsert" && a.Mode != "replace") {
-			return nil, true
+		if json.Unmarshal(raw, &a) != nil {
+			return nil, malformedArgs()
 		}
 		if s.p == nil {
-			return fail("PROXY_NOT_RUNNING", "start a proxy first"), false
+			return fail("PROXY_NOT_RUNNING", "start a proxy first"), nil
 		}
 		cfg := s.p.Config()
 		if a.Seed != nil {
@@ -415,26 +496,26 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			}
 		}
 		if len(cfg.Rules) > 64 {
-			return fail("INVALID_RULE", "at most 64 rules are allowed"), false
+			return fail("INVALID_RULE", "at most 64 rules are allowed"), nil
 		}
 		if e := fault.Validate(cfg); e != nil {
-			return fail("INVALID_RULE", e.Error()), false
+			return fail("INVALID_RULE", e.Error()), nil
 		}
 		seq := s.p.SetConfigAt(cfg)
 		if s.recording != nil {
 			s.recording.ConfigChanged(seq, cfg)
 		}
-		return faultSummary(cfg, seq), false
+		return faultSummary(cfg, seq), nil
 	case "fault_clear":
 		var a struct {
 			RuleIDs  []string `json:"rule_ids"`
 			ResetBus bool     `json:"reset_bus"`
 		}
 		if json.Unmarshal(raw, &a) != nil {
-			return nil, true
+			return nil, malformedArgs()
 		}
 		if s.p == nil {
-			return fail("PROXY_NOT_RUNNING", "start a proxy first"), false
+			return fail("PROXY_NOT_RUNNING", "start a proxy first"), nil
 		}
 		cfg := s.p.Config()
 		kept := cfg.Rules[:0]
@@ -457,7 +538,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		if s.recording != nil {
 			s.recording.ConfigChanged(seq, cfg)
 		}
-		return faultSummary(cfg, seq), false
+		return faultSummary(cfg, seq), nil
 	case "wire_events":
 		var a struct {
 			SinceID     uint64 `json:"since_id"`
@@ -465,11 +546,11 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			Type        string `json:"type"`
 			FaultedOnly bool   `json:"faulted_only"`
 		}
-		if json.Unmarshal(raw, &a) != nil || a.Limit < 0 || a.Limit > 100 {
-			return nil, true
+		if json.Unmarshal(raw, &a) != nil {
+			return nil, malformedArgs()
 		}
 		if s.p == nil {
-			return fail("PROXY_NOT_RUNNING", "start a proxy first"), false
+			return fail("PROXY_NOT_RUNNING", "start a proxy first"), nil
 		}
 		if a.Limit == 0 {
 			a.Limit = 25
@@ -543,14 +624,17 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			events = append(events, item)
 			next = event.ID
 		}
-		return map[string]any{"events": events, "count": len(events), "next_since_id": next, "truncated": truncated}, false
+		return map[string]any{"events": events, "count": len(events), "next_since_id": next, "truncated": truncated}, nil
 	case "tape_validate":
 		var a struct {
 			Path *string `json:"tape_path"`
 			YAML *string `json:"tape_yaml"`
 		}
-		if json.Unmarshal(raw, &a) != nil || (a.Path == nil) == (a.YAML == nil) {
-			return nil, true
+		if json.Unmarshal(raw, &a) != nil {
+			return nil, malformedArgs()
+		}
+		if (a.Path == nil) == (a.YAML == nil) {
+			return nil, tapeChoiceError()
 		}
 		var t tape.Tape
 		var err error
@@ -560,105 +644,31 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			t, err = tape.Decode(strings.NewReader(*a.YAML))
 		}
 		if err != nil {
-			return map[string]any{"ok": false, "error": err.Error()}, false
+			return map[string]any{"ok": false, "error": err.Error()}, nil
 		}
-		return map[string]any{"ok": true, "version": t.Version, "name": t.Name, "rules": len(t.Rules)}, false
-	case "tape_run":
-		var a struct {
-			TapePath  string `json:"tape_path"`
-			TapeYAML  string `json:"tape_yaml"`
-			Target    string `json:"target"`
-			TimeoutMS int    `json:"timeout_ms"`
-		}
-		if json.Unmarshal(raw, &a) != nil || (a.TapePath == "") == (a.TapeYAML == "") || len(a.TapeYAML) > 1<<20 {
-			return nil, true
-		}
-		var t tape.Tape
-		var e error
-		if a.TapePath != "" {
-			t, e = s.readTape(a.TapePath)
-		} else {
-			t, e = tape.Decode(strings.NewReader(a.TapeYAML))
-		}
-		if e != nil {
-			return fail("INVALID_TAPE", e.Error()), false
-		}
-		if len(t.UpstreamAllow) > 0 {
-			return fail("INVALID_TAPE", "MCP tapes cannot expand the loopback egress policy"), false
-		}
-		if a.TimeoutMS == 0 {
-			a.TimeoutMS = 30000
-		}
-		ctx, cancel := context.WithTimeout(s.ctx, time.Duration(a.TimeoutMS)*time.Millisecond)
-		defer cancel()
-		start := time.Now()
-		results, report, e := tape.RunWithReport(ctx, t, a.Target)
-		envelope := execrun.Envelope{FaultsTriggered: []any{}}
-		envelope.SetAppliedFaults(report.AppliedFaults)
-		if ctx.Err() != nil || e != nil {
-			code, err := "INVALID_TAPE", e
-			if ctx.Err() != nil {
-				code, err = "TIMEOUT", ctx.Err()
-			}
-			result := fail(code, err.Error())
-			if len(envelope.FaultsTriggered) != 0 {
-				result["faults_triggered"] = envelope.FaultsTriggered
-			}
-			if len(report.FrameErrors) != 0 {
-				result["frame_errors"] = report.FrameErrors
-			}
-			if report.FrameErrorsOmitted != 0 {
-				result["frame_errors_omitted"] = report.FrameErrorsOmitted
-			}
-			return result, false
-		}
-		assertions := []any{}
-		failed := 0
-		for _, r := range results {
-			ok := len(r.Failures) == 0
-			if !ok {
-				failed++
-			}
-			failures := r.Failures
-			if failures == nil {
-				failures = []string{}
-			}
-			assertions = append(assertions, map[string]any{"name": r.Name, "passed": ok, "failures": failures})
-		}
-		code := 0
-		if failed > 0 {
-			code = 1
-		}
-		target := t.Target
-		if a.Target != "" {
-			target = a.Target
-		}
-		name := a.TapePath
-		if name == "" {
-			name = t.Name
-		}
-		result := map[string]any{"schema_version": 2, "command": "test", "ok": code == 0, "exit_code": code, "tape": name, "target": target, "duration_ms": time.Since(start).Milliseconds(), "summary": map[string]any{"assertions_total": len(results), "assertions_failed": failed, "assertions_passed": len(results) - failed, "requests_total": report.RequestsTotal, "faults_triggered": envelope.Summary.FaultsTriggered}, "faults_triggered": envelope.FaultsTriggered, "assertions": assertions, "error": nil}
-		if len(report.FrameErrors) != 0 {
-			result["frame_errors"] = report.FrameErrors
-		}
-		if report.FrameErrorsOmitted != 0 {
-			result["frame_errors_omitted"] = report.FrameErrorsOmitted
-		}
-		return result, false
+		return map[string]any{"ok": true, "version": t.Version, "name": t.Name, "rules": len(t.Rules)}, nil
 	case "tape_export":
 		var a struct {
 			Name    string `json:"name"`
 			OutPath string `json:"out_path"`
+			Format  string `json:"format"`
 		}
-		if json.Unmarshal(raw, &a) != nil || a.Name == "" {
-			return nil, true
+		if json.Unmarshal(raw, &a) != nil {
+			return nil, malformedArgs()
 		}
 		if s.p == nil || s.recording == nil {
-			return fail("PROXY_NOT_RUNNING", "start recording first"), false
+			return fail("PROXY_NOT_RUNNING", "start recording first"), nil
 		}
 		t, e := s.recording.Export(a.Name)
 		if e != nil {
-			return fail("INVALID_TAPE", e.Error()), false
+			return fail("INVALID_TAPE", e.Error()), nil
+		}
+		if a.Format == "v1" {
+			if t.Version == 2 {
+				return fail("VERSION_CONFLICT", `recording uses v2-only features (tls_mitm, stream, url/proto); export with format "v2"`), nil
+			}
+		} else {
+			t.Version = 2
 		}
 		if s.isDemo {
 			t.Target = "demo"
@@ -673,13 +683,17 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		if e != nil {
 			if e == errExportSize {
 				if a.OutPath == "" {
-					return fail("INVALID_PATH", "use out_path for large tapes"), false
+					return fail("INVALID_PATH", "use out_path for large tapes"), nil
 				}
-				return fail("INVALID_TAPE", "tape exceeds 1 MiB"), false
+				return fail("INVALID_TAPE", "tape exceeds 1 MiB"), nil
 			}
-			return fail("INVALID_TAPE", e.Error()), false
+			return fail("INVALID_TAPE", e.Error()), nil
 		}
-		res := map[string]any{"name": a.Name, "steps": len(t.Script), "rules": len(t.Rules), "incomplete": t.Incomplete}
+		_, decodeErr := tape.Decode(strings.NewReader(b))
+		if a.Format != "v1" && decodeErr != nil && !t.Incomplete {
+			return fail("INVALID_TAPE", "recording did not encode a valid tape"), nil
+		}
+		res := map[string]any{"name": a.Name, "steps": len(t.Script), "rules": len(t.Rules), "incomplete": t.Incomplete, "version": t.Version, "replayable": !t.Incomplete && decodeErr == nil}
 		if t.Truncated {
 			res["truncated"], res["dropped_entries"] = true, t.DroppedEntries
 		}
@@ -691,17 +705,17 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		} else {
 			path, e := s.outputPath(a.OutPath)
 			if e != nil {
-				return fail("INVALID_PATH", e.Error()), false
+				return fail("INVALID_PATH", e.Error()), nil
 			}
 			if e = s.writeTape(path, []byte(b)); e != nil {
-				return fail("INVALID_PATH", e.Error()), false
+				return fail("INVALID_PATH", e.Error()), nil
 			}
 			res["out_path"] = path
 		}
 		if t.Truncated {
 			log.Printf("tape export truncated: dropped_entries=%d", t.DroppedEntries)
 		}
-		return res, false
+		return res, nil
 	case "demo_trigger":
 		var a struct {
 			Action  string `json:"action"`
@@ -709,11 +723,11 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			Amount  *int   `json:"amount_cents"`
 			Frames  int    `json:"frames"`
 		}
-		if json.Unmarshal(raw, &a) != nil || a.Action == "" || a.Frames < 0 || a.Frames > 50 {
-			return nil, true
+		if json.Unmarshal(raw, &a) != nil {
+			return nil, malformedArgs()
 		}
 		if s.p == nil || !s.isDemo {
-			return fail("DEMO_NOT_ACTIVE", "start demo proxy first"), false
+			return fail("DEMO_NOT_ACTIVE", "start demo proxy first"), nil
 		}
 		if a.OrderID == "" {
 			a.OrderID = "ord-1"
@@ -747,7 +761,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 				method = "POST"
 			case "state":
 			default:
-				return nil, true
+				return nil, &paramError{Field: "arguments.action", Reason: "invalid_value"}
 			}
 			if method == "POST" {
 				b, _ := json.Marshal(map[string]any{"order_id": a.OrderID, "amount_cents": amount})
@@ -772,7 +786,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 			ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 			defer cancel()
 			if err := s.p.Wait(ctx); err != nil {
-				return fail("TIMEOUT", err.Error()), false
+				return fail("TIMEOUT", err.Error()), nil
 			}
 		}
 		client := http.Client{Timeout: 5 * time.Second}
@@ -780,18 +794,18 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 		stateResp, e := client.Do(stateReq)
 		if e != nil {
 			if ne, ok := e.(net.Error); ok && ne.Timeout() {
-				return fail("TIMEOUT", e.Error()), false
+				return fail("TIMEOUT", e.Error()), nil
 			}
-			return fail("DEMO_ERROR", e.Error()), false
+			return fail("DEMO_ERROR", e.Error()), nil
 		}
 		defer stateResp.Body.Close()
 		var state any
 		if e := json.NewDecoder(stateResp.Body).Decode(&state); e != nil {
-			return fail("DEMO_ERROR", e.Error()), false
+			return fail("DEMO_ERROR", e.Error()), nil
 		}
-		return map[string]any{"action": a.Action, "status": status, "error": errorText, "state": state}, false
+		return map[string]any{"action": a.Action, "status": status, "error": errorText, "state": state}, nil
 	default:
-		return nil, true
+		return nil, &paramError{Field: "name", Reason: "unknown_tool"}
 	}
 }
 
@@ -888,6 +902,14 @@ func (s *Server) path(p string) string {
 }
 
 func (s *Server) readTape(path string) (tape.Tape, error) {
+	data, err := s.readTapeBytes(path)
+	if err != nil {
+		return tape.Tape{}, err
+	}
+	return tape.Decode(bytes.NewReader(data))
+}
+
+func (s *Server) readTapeBytes(path string) ([]byte, error) {
 	base := s.opts.Workdir
 	if base == "" {
 		base = "."
@@ -895,41 +917,41 @@ func (s *Server) readTape(path string) (tape.Tape, error) {
 	if filepath.IsAbs(path) {
 		abs, err := filepath.Abs(base)
 		if err != nil {
-			return tape.Tape{}, err
+			return nil, err
 		}
 		path, err = filepath.Rel(abs, path)
 		if err != nil {
-			return tape.Tape{}, err
+			return nil, err
 		}
 	}
 	if !filepath.IsLocal(path) {
-		return tape.Tape{}, fmt.Errorf("tape path is empty or escapes workdir")
+		return nil, errors.New("tape path is empty or escapes workdir")
 	}
 	root, err := os.OpenRoot(base)
 	if err != nil {
-		return tape.Tape{}, err
+		return nil, err
 	}
 	defer root.Close()
 	f, err := root.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return tape.Tape{}, err
+		return nil, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return tape.Tape{}, err
+		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
-		return tape.Tape{}, fmt.Errorf("tape must be a regular file of at most 1 MiB")
+		return nil, errors.New("tape must be a regular file of at most 1 MiB")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, 1<<20+1))
 	if err != nil {
-		return tape.Tape{}, err
+		return nil, err
 	}
 	if len(data) > 1<<20 {
-		return tape.Tape{}, fmt.Errorf("tape exceeds 1 MiB")
+		return nil, errors.New("tape exceeds 1 MiB")
 	}
-	return tape.Decode(strings.NewReader(string(data)))
+	return data, nil
 }
 
 func (s *Server) writeTape(path string, data []byte) error {
