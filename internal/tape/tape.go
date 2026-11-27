@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/demo"
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/sse"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 	"github.com/hardw00t/glitchdeck/internal/wsframe"
@@ -217,6 +219,15 @@ func validate(t Tape) error {
 	if err := fault.Validate(fault.Config{Seed: t.Seed, Rules: t.Rules}); err != nil {
 		return err
 	}
+	var terminals []string
+	for _, rule := range t.Rules {
+		terminals = append(terminals, fault.Strings(rule.Fault.Params, "done_events")...)
+	}
+	for _, change := range t.ConfigChanges {
+		for _, rule := range change.Rules {
+			terminals = append(terminals, fault.Strings(rule.Fault.Params, "done_events")...)
+		}
+	}
 	if len(t.Expect.Faults) != 0 {
 		ids := make(map[string]struct{}, len(t.Rules))
 		for _, rule := range t.Rules {
@@ -340,6 +351,9 @@ func validate(t Tape) error {
 			return fmt.Errorf("assertion %q has a negative expected status", a.Name)
 		}
 		if x := a.ExpectSSE; x != nil {
+			if x.Terminal != "" && !sse.IsTerminalKind(x.Terminal) && !slices.Contains(terminals, x.Terminal) {
+				return fmt.Errorf("assertion %q: invalid terminal %q", a.Name, x.Terminal)
+			}
 			if x.MinEvents != nil && *x.MinEvents < 0 || x.MaxEvents != nil && *x.MaxEvents < 0 ||
 				x.MaxGapMS != nil && *x.MaxGapMS < 0 {
 				return fmt.Errorf("assertion %q: min_events, max_events and max_gap_ms cannot be negative", a.Name)
@@ -710,7 +724,34 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			if err := validateStepProtocol(s.Stream.URL, s.Stream.Proto); err != nil {
 				return nil, fmt.Errorf("step %s: %w", s.Name, err)
 			}
-			sseResults[s.Name] = runStream(ctx, serverURL, *s.Stream, roots)
+			method := s.Stream.Method
+			if method == "" {
+				method = http.MethodGet
+			}
+			upstream := u
+			if s.Stream.URL != "" {
+				upstream, _ = url.Parse(s.Stream.URL)
+			}
+			path := s.Stream.Path
+			if s.Stream.URL != "" && upstream != nil {
+				path = upstream.Path
+			}
+			if parsed, err := url.Parse(path); err == nil {
+				path = parsed.Path
+			}
+			proto := "h1"
+			if s.Stream.Proto == "h2" || s.Stream.Proto == "h2c" {
+				proto = "h2"
+			}
+			query := fault.Query{Method: method, Path: path, Proto: proto, Seq: p.Seq() + 1, ContentType: s.Stream.Headers["Content-Type"]}
+			if upstream != nil {
+				query.Host, query.Scheme = upstream.Host, upstream.Scheme
+			}
+			var extra []string
+			if rule := fault.MatchRequest(p.Config(), query); rule != nil && rule.Fault.Type == "sse-glitch" {
+				extra = fault.Strings(rule.Fault.Params, "done_events")
+			}
+			sseResults[s.Name] = runStreamWithTerminals(ctx, serverURL, *s.Stream, extra, roots)
 		case s.GRPC != nil:
 			status, e := runGRPC(ctx, serverURL, *s.GRPC, roots)
 			if e != nil {

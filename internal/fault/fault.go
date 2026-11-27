@@ -57,6 +57,21 @@ func String(p map[string]any, k, def string) string {
 	}
 	return def
 }
+func Strings(p map[string]any, k string) []string {
+	switch values := p[k].(type) {
+	case []string:
+		return values
+	case []any:
+		out := make([]string, 0, len(values))
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	}
+	return nil
+}
 func Bool(p map[string]any, k string, def bool) bool {
 	if v, ok := p[k].(bool); ok {
 		return v
@@ -93,6 +108,11 @@ func Validate(c Config) error {
 			schema = replayParams
 		case "rate-limit":
 			schema = limitParams
+			switch String(r.Fault.Params, "provider", "none") {
+			case "none", "openai", "anthropic", "gemini":
+			default:
+				return invalidParam(r.ID, "provider")
+			}
 		case "byte-trickle":
 			schema = trickleParams
 		case "latency-wave":
@@ -169,7 +189,7 @@ const maxValue = 1 << 30
 var (
 	rstParams     = map[string]paramRange{"after_bytes": {max: maxValue}, "before_headers": {kind: 'b'}}
 	replayParams  = map[string]paramRange{"count": {min: 1, max: 100}, "delay_ms": {max: maxValue}, "replay_header": {kind: 'b'}}
-	limitParams   = map[string]paramRange{"status": {min: 200, max: 599}, "retry_after_sec": {max: maxValue}, "body": {kind: 's'}}
+	limitParams   = map[string]paramRange{"status": {min: 200, max: 599}, "retry_after_sec": {max: maxValue}, "body": {kind: 's'}, "provider": {kind: 's'}, "retry_after_ms": {max: 600000}, "reset_sec": {min: 1, max: 86400}, "burst": {min: 1, max: 1000000}}
 	trickleParams = map[string]paramRange{"bytes_per_sec": {min: 1, max: maxValue}, "chunk_bytes": {min: 1, max: 64 << 10}, "stall_after_bytes": {max: maxValue}, "stall_ms": {max: maxValue}}
 	latencyParams = map[string]paramRange{"shape": {kind: 's'}, "base_ms": {max: maxValue / 2}, "amp_ms": {max: maxValue / 2}, "period_seq": {min: 1, max: maxValue}, "every": {min: 1, max: maxValue}}
 	wsParams      = map[string]paramRange{"dir": {kind: 's'}, "action": {kind: 's'}, "delay_ms": {max: maxValue}, "after_frames": {max: maxValue}, "every": {min: 1, max: maxValue}, "truncate_bytes": {max: maxValue}}

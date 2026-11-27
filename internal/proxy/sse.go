@@ -66,8 +66,12 @@ type sseResult struct {
 	err       error
 }
 
-func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Reader, rule *fault.Rule, seed, seq, gen uint64, start time.Time, run string) (res sseResult) {
+func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Reader, rule *fault.Rule, seed, seq, gen uint64, start time.Time, run string, encodings ...string) (res sseResult) {
 	res.end = "eof"
+	encoding := ""
+	if len(encodings) != 0 {
+		encoding = encodings[0]
+	}
 	kind, action := "", "none"
 	faultID := ""
 	var params map[string]any
@@ -87,11 +91,25 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		if !res.applied {
 			res.applied = true
 			p.countRule(gen, rule, "applied", "")
+			res.skip = ""
 		}
 	}
 	captured := 0
 	delivered, maxGap, lastDelivered := 0, int64(0), int64(0)
 	deliveredValid, deliveredDone := true, false
+	terminal := "none"
+	provider := ""
+	if action == "inject_error" {
+		provider = fault.String(params, "provider", "auto")
+	}
+	fragments := 0
+	var droppedTool toolKey
+	doneEvents := fault.Strings(params, "done_events")
+	_, decoded := body.(*sseDecoder)
+	opaque := !decoded && encoding != "" && encoding != "identity"
+	if action == "corrupt_tool_args" {
+		res.skip = "no_tool_args"
+	}
 	stream := streamFrom(ctx)
 	rc := http.NewResponseController(w)
 	defer rc.SetWriteDeadline(time.Time{})
@@ -109,7 +127,9 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 			"end": res.end, "events": res.events, "duration_ms": time.Since(start).Milliseconds(),
 			"event": "", "id": nil, "data_bytes": 0, "raw_bytes": 0, "is_done": res.end == "done",
 			"delivered_events": delivered, "delivered_valid_json": deliveredValid, "delivered_done": deliveredDone, "delivered_max_gap_ms": maxGap,
-			"applied": res.applied, "fault_id": faultID,
+			"terminal": terminal, "encoding": encoding, "reason": res.skip,
+			"inspected": !opaque,
+			"applied":   res.applied, "fault_id": faultID,
 			"fault": kind, "action": "none", "stall_ms": 0, "preview": "",
 		})
 	}()
@@ -127,16 +147,37 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		}
 		return true
 	}
+	sink := sseWriterFunc(func(data []byte) (int, error) {
+		if !write(data) {
+			return 0, res.err
+		}
+		return len(data), nil
+	})
 	passThrough := kind == ""
+	if opaque {
+		_, err := io.Copy(sink, body)
+		if err != nil && res.end != "client_cancel" {
+			res.end, res.err = "upstream_error", err
+		}
+		return res
+	}
 	if passThrough {
-		body = io.TeeReader(body, sseWriterFunc(func(data []byte) (int, error) {
-			if !write(data) {
-				return 0, res.err
-			}
-			return len(data), nil
-		}))
+		body = io.TeeReader(body, sink)
 	}
 	r := sse.NewReader(body, 0)
+	if decoded {
+		r.LimitFrameLines(64 << 10)
+	}
+	decodeFailure := func(err error) bool {
+		if !decoded || err == io.EOF {
+			return false
+		}
+		res.end, res.err, res.skip = "upstream_error", err, "decode_error"
+		if errors.Is(err, sse.ErrLineTooLong) {
+			res.skip = "line_too_long"
+		}
+		return true
+	}
 	after := fault.Int(params, "after_events", 1)
 	every := fault.Int(params, "every", 0)
 	eventType := fault.String(params, "event_type", "")
@@ -153,6 +194,64 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		}
 		return true
 	}
+	inject := func() {
+		if provider == "auto" {
+			// Inspect only the remainder of the three-frame detection window.
+			for seen := res.events; seen < 3; {
+				f, err := r.Next()
+				if err != nil {
+					if ctx.Err() != nil {
+						res.end, res.err = "client_cancel", ctx.Err()
+						return
+					}
+					if decodeFailure(err) {
+						return
+					}
+					break
+				}
+				if !f.Dispatch {
+					continue
+				}
+				seen++
+				if detected := detectSSEProvider(f); detected != "" {
+					provider = detected
+					break
+				}
+			}
+			if provider == "auto" {
+				provider = "openai"
+			}
+		}
+		raw := injectSSE(params, provider, delivered)
+		if !write(raw) {
+			return
+		}
+		markApplied()
+		delivered++
+		now := time.Since(start).Milliseconds()
+		maxGap = max(maxGap, now-lastDelivered)
+		if provider == "raw" {
+			frame := sse.Frame{Event: fault.String(params, "event", "error"), Data: rawSSEData(params)}
+			if terminal == "none" {
+				if kind, ok := frame.Terminal(doneEvents); ok {
+					terminal, deliveredDone = kind, kind != "error"
+				}
+			}
+			if frame.IsJSON() && !json.Valid([]byte(frame.Data)) {
+				deliveredValid = false
+			}
+		} else if terminal == "none" {
+			terminal = "error"
+		}
+		p.publish(gen, "sse_event", map[string]any{"seq": seq, "stream_id": stream, "run_id": run, "kind": "event", "event_index": res.events + 1, "event": "error", "action": action, "fault": kind, "fault_id": faultID, "applied": true, "provider": provider})
+		if fault.String(params, "close", "clean") == "rst" {
+			res.end = "rst"
+		}
+	}
+	if action == "inject_error" && after == 0 {
+		inject()
+		return res
+	}
 	if action == "stall" && after == 0 && !stall() {
 		return res
 	}
@@ -160,6 +259,9 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 	for {
 		f, err := r.Next()
 		if err != nil {
+			if ctx.Err() == nil && decodeFailure(err) {
+				return res
+			}
 			if tail := r.Tail(); !passThrough && len(tail) != 0 && !write(tail) {
 				return res
 			}
@@ -183,7 +285,16 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		if eventName == "" {
 			eventName = "message"
 		}
+		if f.Dispatch && provider == "auto" && res.events < 3 {
+			if detected := detectSSEProvider(f); detected != "" {
+				provider = detected
+			}
+		}
+		var terminalKind string
+		var isTerminal, jsonFrame bool
 		if f.Dispatch {
+			terminalKind, isTerminal = f.Terminal(doneEvents)
+			jsonFrame = f.IsJSON()
 			res.events++
 		}
 		current := "none"
@@ -191,8 +302,13 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 			matching++
 			switch action {
 			case "drop", "corrupt_json":
-				if !f.IsDone() && selected(params, seed, rule.ID, seq, matching) {
-					current = action
+				if selected(params, seed, rule.ID, seq, matching) {
+					switch {
+					case action == "corrupt_json" && !jsonFrame:
+						res.skip = "not_json"
+					case terminalKind != "done_marker":
+						current = action
+					}
 				}
 			case "truncate":
 				if res.events > after {
@@ -201,12 +317,54 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 			case "eof_early":
 				before := fault.String(params, "before_event", "")
 				_, explicit := params["after_events"]
-				if before == eventName || before == "" && (explicit && res.events > after || !explicit && f.IsDone()) {
+				if before == eventName || before == "" && (explicit && res.events > after || !explicit && isTerminal) {
 					current = action
 				}
 			case "stall":
 				if matching == after || matching > after && every > 0 && (matching-after)%every == 0 {
 					current = action
+				}
+			case "corrupt_tool_args":
+				parts, obj := toolFragments(f)
+				changed, drop := false, false
+				for _, part := range parts {
+					if part.key == droppedTool {
+						part.obj[part.field] = ""
+						changed = true
+						continue
+					}
+					fragments++
+					if !res.applied && fragments == fault.Int(params, "after_fragments", 1) {
+						current = action
+						value := part.obj[part.field].(string)
+						switch fault.String(params, "mode", "truncate") {
+						case "drop":
+							drop = true
+						case "invalid":
+							part.obj[part.field] = `{"glitchdeck":` + value + `"`
+							changed = true
+						default:
+							half := utf8.RuneCountInString(value) / 2
+							for offset := range value {
+								if half == 0 {
+									part.obj[part.field] = value[:offset]
+									break
+								}
+								half--
+							}
+							droppedTool = part.key
+							changed = true
+						}
+					}
+				}
+				if changed {
+					if b, err := json.Marshal(obj); err == nil {
+						f.Data = string(b)
+						f.Raw = sse.Encode(f)
+					}
+				}
+				if drop {
+					f.Raw = nil
 				}
 			}
 		}
@@ -217,22 +375,26 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 			if v, ok := sse.CorruptJSON(f.Data, fault.String(params, "mode", "cut"), rnd); ok {
 				f.Data = v
 				raw = sse.Encode(f)
+				terminalKind, _ = f.Terminal(doneEvents)
 			} else {
 				current = "none"
 			}
 		case "truncate":
 			raw = raw[:min(len(raw), fault.Int(params, "cut_bytes", len(raw)/2))]
 		}
-		if !passThrough && current != "drop" && current != "eof_early" && !write(raw) {
+		if !passThrough && current != "drop" && current != "eof_early" && len(raw) != 0 && !write(raw) {
 			return res
 		}
-		if f.Dispatch && current != "drop" && current != "eof_early" && current != "truncate" {
+		if f.Dispatch && current != "drop" && current != "eof_early" && current != "truncate" && len(raw) != 0 {
 			delivered++
 			now := time.Since(start).Milliseconds()
 			maxGap = max(maxGap, now-lastDelivered)
 			lastDelivered = now
-			deliveredDone = deliveredDone || f.IsDone()
-			if !f.IsDone() && f.Data != "" && !json.Valid([]byte(f.Data)) {
+			if terminal == "none" && terminalKind != "" {
+				terminal = terminalKind
+				deliveredDone = terminalKind != "error"
+			}
+			if jsonFrame && !json.Valid([]byte(f.Data)) {
 				deliveredValid = false
 			}
 		}
@@ -261,7 +423,7 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 				"event_index": res.events, "ts_ms": time.Now().UnixMilli(), "t_rel_ms": time.Since(start).Milliseconds(),
 				"event": eventName, "id": f.ID, "data_bytes": len(f.Data), "raw_bytes": len(f.Raw), "is_done": f.IsDone(),
 				"applied": current != "none", "fault_id": faultID,
-				"fault": kind, "action": current, "stall_ms": delay, "preview": preview,
+				"fault": kind, "action": current, "stall_ms": delay, "preview": preview, "provider": provider,
 			})
 		}
 		switch current {
@@ -271,12 +433,25 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 		case "eof_early":
 			res.end = current
 			return res
+		case "corrupt_tool_args":
+			switch fault.String(params, "then", "continue") {
+			case "eof":
+				res.end = "eof_early"
+				return res
+			case "rst":
+				res.end = "rst"
+				return res
+			}
 		case "stall":
 			if !stall() {
 				return res
 			}
 		}
-		if f.IsDone() || f.Event == "message_stop" {
+		if action == "inject_error" && !res.applied && delivered >= after {
+			inject()
+			return res
+		}
+		if terminalKind == "done_marker" || f.Event == "message_stop" {
 			res.end = "done"
 		}
 	}
@@ -316,10 +491,10 @@ func sseNeedsHijack(rule *fault.Rule) bool {
 		return false
 	}
 	a := fault.String(rule.Fault.Params, "action", "stall")
-	return a == "truncate" || (a == "eof_early" || a == "early_eof") && !fault.Bool(rule.Fault.Params, "http_clean", true)
+	return a == "truncate" || (a == "eof_early" || a == "early_eof") && !fault.Bool(rule.Fault.Params, "http_clean", true) || a == "inject_error" && fault.String(rule.Fault.Params, "close", "clean") == "rst" || a == "corrupt_tool_args" && fault.String(rule.Fault.Params, "then", "continue") == "rst"
 }
 
-func (p *Proxy) relayHijackedSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, rule *fault.Rule, seed, seq, gen uint64, start time.Time, run string) sseResult {
+func (p *Proxy) relayHijackedSSE(ctx context.Context, w http.ResponseWriter, resp *http.Response, rule *fault.Rule, seed, seq, gen uint64, start time.Time, run, encoding string) sseResult {
 	conn, b, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		return sseResult{end: "upstream_error", err: err}
@@ -352,7 +527,11 @@ func (p *Proxy) relayHijackedSSE(ctx context.Context, w http.ResponseWriter, res
 		return sseResult{end: "client_cancel", err: err}
 	}
 	out := &hijackedSSEWriter{out: b.Writer, conn: conn, chunked: chunked}
-	result := p.relaySSE(ctx, out, resp.Body, rule, seed, seq, gen, start, run)
+	result := p.relaySSE(ctx, out, resp.Body, rule, seed, seq, gen, start, run, encoding)
+	if _, decoded := resp.Body.(*sseDecoder); decoded && result.end == "upstream_error" {
+		rst(conn)
+		return result
+	}
 	if result.end == "rst" && fault.Bool(rule.Fault.Params, "rst", true) {
 		rst(conn)
 	} else if chunked && result.end != "eof_early" && result.err == nil {

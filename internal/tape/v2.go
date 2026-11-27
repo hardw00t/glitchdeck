@@ -49,6 +49,7 @@ type FaultExpect struct {
 }
 type SSEExpect struct {
 	End       string `yaml:"end,omitempty" json:"end,omitempty"`
+	Terminal  string `yaml:"terminal,omitempty" json:"terminal,omitempty"`
 	Done      *bool  `yaml:"done,omitempty" json:"done,omitempty"`
 	MinEvents *int   `yaml:"min_events,omitempty" json:"min_events,omitempty"`
 	MaxEvents *int   `yaml:"max_events,omitempty" json:"max_events,omitempty"`
@@ -57,6 +58,8 @@ type SSEExpect struct {
 }
 type streamEvidence struct {
 	End       string
+	Terminal  string
+	Status    int
 	Done      bool
 	Events    int
 	ValidJSON bool
@@ -64,7 +67,11 @@ type streamEvidence struct {
 }
 
 func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPool) streamEvidence {
-	result := streamEvidence{End: "eof", ValidJSON: true}
+	return runStreamWithTerminals(ctx, base, s, nil, root...)
+}
+
+func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []string, root ...*x509.CertPool) streamEvidence {
+	result := streamEvidence{End: "eof", Terminal: "none", ValidJSON: true}
 	if s.MaxMS <= 0 {
 		s.MaxMS = 30000
 	}
@@ -137,6 +144,7 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 		}
 	}
 	defer resp.Body.Close()
+	result.Status = resp.StatusCode
 	if (s.Proto == "h2" || s.Proto == "h2c") && resp.ProtoMajor != 2 {
 		result.End = "error"
 		return result
@@ -180,7 +188,7 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 			if x.err != nil {
 				if x.err != io.EOF {
 					result.End = "rst"
-				} else if result.Events > 0 {
+				} else if result.Events > 0 && result.Terminal != "error" {
 					result.End = "eof_early"
 				}
 				return result
@@ -201,18 +209,21 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 				result.MaxGapMS = gap
 			}
 			last = time.Now()
-			if x.frame.IsDone() {
-				result.Done = true
-				result.End = "done"
-				return result
-			}
-			if x.frame.Event == "message_stop" {
-				result.Done = true
-				result.End = "eof"
-				return result
-			}
-			if x.frame.Data != "" && !json.Valid([]byte(x.frame.Data)) {
+			if x.frame.IsJSON() && !json.Valid([]byte(x.frame.Data)) {
 				result.ValidJSON = false
+			}
+			if kind, ok := x.frame.Terminal(extra); ok && result.Terminal == "none" {
+				result.Terminal = kind
+				result.Done = kind != "error"
+				switch kind {
+				case "error":
+					continue // Observe whether the provider error ends with EOF or a reset.
+				case "done_marker":
+					result.End = "done"
+				default:
+					result.End = "eof"
+				}
+				return result
 			}
 		}
 	}
@@ -359,6 +370,9 @@ func runGRPC(ctx context.Context, base string, g GRPC, root ...*x509.CertPool) (
 }
 func checkStream(a Assertion, e streamEvidence) []string {
 	out := []string{}
+	if a.ExpectStatus != 0 && a.ExpectStatus != e.Status {
+		out = append(out, fmt.Sprintf("status: expected %d, got %d", a.ExpectStatus, e.Status))
+	}
 	x := a.ExpectSSE
 	if x == nil {
 		return out
@@ -368,6 +382,9 @@ func checkStream(a Assertion, e streamEvidence) []string {
 	}
 	if x.End != "" && x.End != e.End {
 		add("end", x.End, e.End)
+	}
+	if x.Terminal != "" && x.Terminal != e.Terminal {
+		add("terminal", x.Terminal, e.Terminal)
 	}
 	if x.Done != nil && *x.Done != e.Done {
 		add("done", *x.Done, e.Done)

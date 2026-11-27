@@ -30,12 +30,68 @@ type Frame struct {
 
 func (f Frame) IsDone() bool { return strings.TrimSpace(f.Data) == "[DONE]" }
 
+func IsTerminalKind(kind string) bool {
+	switch kind {
+	case "done_marker", "message_stop", "response.completed", "response.incomplete", "response.failed", "error", "finish_reason", "none":
+		return true
+	}
+	return false
+}
+
+func (f Frame) IsJSON() bool {
+	data := strings.TrimSpace(f.Data)
+	return data != "[DONE]" && len(data) > 0 && (data[0] == '{' || data[0] == '[')
+}
+
+func (f Frame) Terminal(extra []string) (string, bool) {
+	if f.IsDone() {
+		return "done_marker", true
+	}
+	switch f.Event {
+	case "message_stop", "response.completed", "response.incomplete", "response.failed", "error":
+		return f.Event, true
+	}
+	for _, event := range extra {
+		if f.Event == event {
+			return event, true
+		}
+	}
+	data := strings.TrimSpace(f.Data)
+	if len(data) == 0 || len(data) > 64<<10 || data[0] != '{' {
+		return "", false
+	}
+	var body struct {
+		Type       string          `json:"type"`
+		Error      json.RawMessage `json:"error"`
+		Candidates []struct {
+			FinishReason string `json:"finishReason"`
+		} `json:"candidates"`
+	}
+	if json.Unmarshal([]byte(data), &body) != nil {
+		return "", false
+	}
+	switch body.Type {
+	case "message_stop", "response.completed", "response.incomplete", "response.failed":
+		return body.Type, true
+	}
+	if len(body.Error) > 0 && body.Error[0] == '{' {
+		return "error", true
+	}
+	for _, candidate := range body.Candidates {
+		if candidate.FinishReason != "" {
+			return "finish_reason", true
+		}
+	}
+	return "", false
+}
+
 type Reader struct {
-	r       *bufio.Reader
-	max     int
-	tail    []byte
-	first   bool
-	afterCR bool
+	r        *bufio.Reader
+	max      int
+	maxLines int
+	tail     []byte
+	first    bool
+	afterCR  bool
 }
 
 func NewReader(r io.Reader, maxLine int) *Reader {
@@ -44,6 +100,9 @@ func NewReader(r io.Reader, maxLine int) *Reader {
 	}
 	return &Reader{r: bufio.NewReaderSize(r, 64<<10), max: maxLine, first: true}
 }
+
+// LimitFrameLines bounds metadata in decoded frames containing many short lines.
+func (r *Reader) LimitFrameLines(maxLines int) { r.maxLines = maxLines }
 
 func (r *Reader) Tail() []byte               { return r.tail }
 func (r *Reader) Read(p []byte) (int, error) { return r.r.Read(p) }
@@ -98,6 +157,10 @@ func (r *Reader) Next() (Frame, error) {
 		if text == "" {
 			f.Data = strings.Join(data, "\n")
 			return f, nil
+		}
+		if r.maxLines > 0 && len(f.Lines) >= r.maxLines {
+			r.tail = f.Raw
+			return Frame{}, ErrLineTooLong
 		}
 		line := Line{}
 		if value, comment := strings.CutPrefix(text, ":"); comment {

@@ -361,13 +361,24 @@ func TestExecAppliesSequenceConfigChange(t *testing.T) {
 func TestObservedSSEUsesDeliveredSummary(t *testing.T) {
 	bus := telemetry.New()
 	bus.Publish("sse_event", map[string]any{"seq": 1, "kind": "event", "preview": "{", "data_bytes": 100})
-	bus.Publish("sse_event", map[string]any{"seq": 1, "kind": "end", "end": "eof", "events": 2, "delivered_events": 1, "delivered_valid_json": true, "delivered_done": false, "delivered_max_gap_ms": 0})
-	bus.Publish("http_req", map[string]any{"seq": 1, "path": "/stream", "method": "GET"})
+	bus.Publish("sse_event", map[string]any{"seq": 1, "kind": "end", "end": "eof", "events": 2, "delivered_events": 1, "delivered_valid_json": true, "delivered_done": false, "delivered_max_gap_ms": 0, "terminal": "error"})
+	bus.Publish("http_req", map[string]any{"seq": 1, "path": "/stream", "method": "GET", "status": 200})
 	one, yes := 1, true
 	tp := tape.Tape{Script: []tape.Step{{Name: "stream", Stream: &tape.Stream{Path: "/stream"}}}}
-	a := tape.Assertion{StreamStep: "stream", ExpectSSE: &tape.SSEExpect{MinEvents: &one, MaxEvents: &one, ValidJSON: &yes}}
+	a := tape.Assertion{StreamStep: "stream", ExpectStatus: 200, ExpectSSE: &tape.SSEExpect{MinEvents: &one, MaxEvents: &one, ValidJSON: &yes, Terminal: "error"}}
 	if r := observedAssertion(a, tp, bus.History(10)); len(r.Failures) != 0 {
 		t.Fatal(r.Failures)
+	}
+}
+
+func TestObservedSSEDoesNotAssertOnOpaquePassThrough(t *testing.T) {
+	bus := telemetry.New()
+	bus.Publish("http_req", map[string]any{"seq": 1, "path": "/stream", "method": "GET", "status": 200})
+	bus.Publish("sse_event", map[string]any{"seq": 1, "kind": "end", "terminal": "none", "encoding": "gzip", "inspected": false})
+	tp := tape.Tape{Script: []tape.Step{{Name: "stream", Stream: &tape.Stream{Path: "/stream"}}}}
+	a := tape.Assertion{StreamStep: "stream", ExpectSSE: &tape.SSEExpect{Terminal: "none"}}
+	if got := observedAssertion(a, tp, bus.History(10)); len(got.Failures) != 1 || !strings.Contains(got.Failures[0], "not inspected") {
+		t.Fatalf("expected an inconclusive assertion, got %+v", got)
 	}
 }
 

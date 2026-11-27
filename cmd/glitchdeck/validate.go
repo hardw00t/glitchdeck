@@ -11,6 +11,7 @@ import (
 	"slices"
 
 	"github.com/hardw00t/glitchdeck/internal/cli"
+	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 )
 
@@ -58,6 +59,20 @@ func validateCommand(args []string) int {
 			if err != nil {
 				ok = false
 				result.Error = err.Error()
+			}
+			if err == nil {
+				warn := func(rules []fault.Rule) {
+					for _, rule := range rules {
+						status := fault.Int(rule.Fault.Params, "status", 429)
+						if rule.Fault.Type == "rate-limit" && fault.String(rule.Fault.Params, "provider", "none") == "anthropic" && status != 429 && status != 529 && status != 503 {
+							fmt.Fprintf(os.Stderr, "warning: rule %s: unusual Anthropic rate-limit status %d\n", rule.ID, status)
+						}
+					}
+				}
+				warn(t.Rules)
+				for _, change := range t.ConfigChanges {
+					warn(change.Rules)
+				}
 			}
 			if *asJSON {
 				results = append(results, result)

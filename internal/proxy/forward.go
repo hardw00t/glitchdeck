@@ -41,6 +41,14 @@ type RuleStats struct {
 	SkipReasons               map[string]uint64
 }
 
+func (s *RuleStats) skip(reason string) {
+	s.Skipped++
+	if s.SkipReasons == nil {
+		s.SkipReasons = make(map[string]uint64)
+	}
+	s.SkipReasons[reason]++
+}
+
 type AppliedFault struct {
 	RuleID, Type string
 	Count        uint64
@@ -97,11 +105,11 @@ func cloneReasons(in map[string]uint64) map[string]uint64 {
 	return out
 }
 
-func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) {
+func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if gen != p.generation {
-		return
+		return 0
 	}
 	id := rule.ID
 	v := p.stats[id]
@@ -115,13 +123,10 @@ func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) {
 		p.applied[AppliedFault{RuleID: rule.ID, Type: rule.Fault.Type}]++
 		v.Applied++
 	case "skipped":
-		v.Skipped++
-		if v.SkipReasons == nil {
-			v.SkipReasons = make(map[string]uint64)
-		}
-		v.SkipReasons[reason]++
+		v.skip(reason)
 	}
 	p.stats[id] = v
+	return v.Matched
 }
 
 func (p *Proxy) authorize(w http.ResponseWriter, r *http.Request, absolute bool) bool {

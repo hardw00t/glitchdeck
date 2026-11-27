@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,5 +174,49 @@ func TestValidateStdinMixedWithFile(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 0 || !got.OK || len(got.Results) != 2 ||
 		got.Results[0] != want[0] || got.Results[1] != want[1] {
 		t.Fatalf("exit %d, stdout %q, decode error %v", code, out, err)
+	}
+}
+
+func TestValidateV220Parameters(t *testing.T) {
+	for _, fault := range []string{
+		`{type: sse-glitch, params: {action: inject_error, provider: raw}}`,
+		`{type: sse-glitch, params: {action: inject_error, provider: openai, data: x}}`,
+		`{type: sse-glitch, params: {action: drop, every: 1, after_fragments: 1}}`,
+		`{type: sse-glitch, params: {action: corrupt_json, every: 1, mode: truncate}}`,
+		`{type: sse-glitch, params: {action: corrupt_tool_args, mode: cut}}`,
+		`{type: rate-limit, params: {burst: 0}}`,
+		`{type: rate-limit, params: {retry_after_ms: 1.5}}`,
+		`{type: rate-limit, params: {provider: azure}}`,
+	} {
+		path := filepath.Join(t.TempDir(), "bad.yaml")
+		doc := "version: 2\ntarget: demo\nrules:\n  - id: r\n    fault: " + fault + "\n"
+		if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := launchOutput(t, "validate", path); code != 2 {
+			t.Errorf("accepted %s", fault)
+		}
+	}
+}
+
+func TestValidateAnthropicStatusWarning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "warning.yaml")
+	doc := "version: 2\ntarget: demo\nrules: [{id: r, fault: {type: rate-limit, params: {provider: anthropic, status: 418}}}]\n"
+	if err := os.WriteFile(path, []byte(doc), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	old := os.Stderr
+	defer func() { os.Stderr = old }()
+	os.Stderr = writer
+	code, _ := launchOutput(t, "validate", path)
+	writer.Close()
+	message, err := io.ReadAll(reader)
+	if err != nil || code != 0 || !strings.Contains(string(message), "warning") || !strings.Contains(string(message), "418") {
+		t.Fatalf("code=%d stderr=%q error=%v", code, message, err)
 	}
 }

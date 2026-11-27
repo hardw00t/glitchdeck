@@ -11,6 +11,7 @@ import (
 
 	"github.com/hardw00t/glitchdeck/internal/demo"
 	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
 )
 
 func TestV1RejectsV2KeysInConfigurationChanges(t *testing.T) {
@@ -112,6 +113,76 @@ func TestStreamParserAndReport(t *testing.T) {
 	_, stats, err := RunWithReport(context.Background(), Tape{Version: 2, Target: "demo", Rules: []fault.Rule{{ID: "limit", Enabled: true, Fault: fault.Fault{Type: "rate-limit", Params: map[string]any{"status": 429}}}}, Script: []Step{{HTTP: &HTTP{Path: "/api/state"}}}}, "")
 	if err != nil || stats.Rules["limit"].Applied != 1 || stats.RequestsTotal != 1 {
 		t.Fatalf("stats %v, error %v", stats, err)
+	}
+}
+
+func TestStreamTerminalEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		body, terminal, end string
+		done, valid         bool
+	}{
+		{"data: hello\n\nevent: end\ndata: done\n\n", "end", "eof", true, true},
+		{"data: {broken\n\n", "none", "eof_early", false, false},
+		{"event: error\ndata: {\"error\":{}}\n\n", "error", "eof", false, true},
+		{"event: message_stop\ndata: {}\n\n", "message_stop", "eof", true, true},
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, tc.body) }))
+		e := runStreamWithTerminals(context.Background(), server.URL, Stream{Path: "/"}, []string{"end"})
+		server.Close()
+		if e.Terminal != tc.terminal || e.End != tc.end || e.Done != tc.done || e.ValidJSON != tc.valid {
+			t.Errorf("%q: %+v", tc.body, e)
+		}
+		if failures := checkStream(Assertion{ExpectStatus: 200, ExpectSSE: &SSEExpect{Terminal: tc.terminal}}, e); len(failures) != 0 {
+			t.Error(failures)
+		}
+	}
+}
+
+func TestInjectedErrorTapeEvidenceDistinguishesEOFAndReset(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"delta\":\"first\"}\n\ndata: [DONE]\n\n")
+	}))
+	defer up.Close()
+	target, err := proxy.ParseTarget(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ close, end string }{{"clean", "eof"}, {"rst", "rst"}} {
+		t.Run(tc.close, func(t *testing.T) {
+			cfg := fault.Config{Rules: []fault.Rule{{ID: "error", Enabled: true, Fault: fault.Fault{
+				Type: "sse-glitch", Params: map[string]any{"action": "inject_error", "provider": "openai", "close": tc.close},
+			}}}}
+			p := proxy.New(target, cfg, nil)
+			defer p.Close()
+			server := httptest.NewServer(p)
+			defer server.Close()
+			got := runStream(context.Background(), server.URL, Stream{Path: "/"})
+			if got.End != tc.end || got.Terminal != "error" || got.Done || got.Events != 2 {
+				t.Fatalf("stream: %+v", got)
+			}
+		})
+	}
+}
+
+func TestTerminalRuleScopeAndValidation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "event: end\ndata: text\n\ndata: [DONE]\n\n")
+	}))
+	defer server.Close()
+	tp := Tape{Version: 2, Target: server.URL, Rules: []fault.Rule{
+		{ID: "unrelated", Enabled: true, Match: fault.Match{PathPrefix: "/other"}, Fault: fault.Fault{Type: "sse-glitch", Params: map[string]any{"action": "eof_early", "done_events": []string{"end"}}}},
+	}, Script: []Step{{Name: "stream", Stream: &Stream{Path: "/stream"}}}, Assertions: []Assertion{{Name: "complete", StreamStep: "stream", ExpectSSE: &SSEExpect{Terminal: "done_marker"}}}}
+	results, err := Run(context.Background(), tp, "")
+	if err != nil || len(results) != 1 || len(results[0].Failures) != 0 {
+		t.Fatalf("results=%v error=%v", results, err)
+	}
+	doc := "version: 2\ntarget: demo\nrules: [{id: r, fault: {type: sse-glitch, params: {done_events: [end]}}}]\nscript: [{name: s, stream: {path: /}}]\nassertions: [{stream_step: s, expect_sse: {terminal: end}}]\n"
+	if _, err := Decode(strings.NewReader(doc)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decode(strings.NewReader(strings.Replace(doc, "terminal: end", "terminal: other", 1))); err == nil {
+		t.Fatal("unknown terminal accepted")
 	}
 }
 

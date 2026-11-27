@@ -8,10 +8,12 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/grpcwire"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/sse"
@@ -101,6 +103,13 @@ func (c *control) readDemoStream(ctx context.Context, id string, in streamInput)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Glitchdeck-Run", id)
 	c.authenticateProxy(req)
+	var extra []string
+	if target, err := url.Parse(c.DemoURL); err == nil {
+		query := fault.Query{Method: req.Method, Path: path, Host: target.Host, Scheme: target.Scheme, Proto: "h1", ContentType: "application/json", Seq: c.p.Seq() + 1}
+		if rule := fault.MatchRequest(c.p.Config(), query); rule != nil && rule.Fault.Type == "sse-glitch" {
+			extra = fault.Strings(rule.Fault.Params, "done_events")
+		}
+	}
 	// Unlike the other demo operations this client has no per-read idle timeout.
 	client := *c.client
 	client.Timeout = 0
@@ -142,8 +151,11 @@ func (c *control) readDemoStream(ctx context.Context, id string, in streamInput)
 			continue
 		}
 		lastFrame = time.Now()
-		if frame.IsDone() {
+		if kind, ok := frame.Terminal(extra); ok {
 			out.Outcome, out.Text = "complete", text.String()
+			if kind == "error" {
+				out.Outcome, out.ClientError = "error", frame.Data
+			}
 			return
 		}
 		var chunk struct {
@@ -159,10 +171,6 @@ func (c *control) readDemoStream(ctx context.Context, id string, in streamInput)
 		}
 		if err := json.Unmarshal([]byte(frame.Data), &chunk); err != nil {
 			out.Outcome, out.ClientError = "parse_error", err.Error()
-			return
-		}
-		if frame.Event == "message_stop" || chunk.Type == "message_stop" {
-			out.Outcome, out.Text = "complete", text.String()
 			return
 		}
 		token := chunk.Delta.Text

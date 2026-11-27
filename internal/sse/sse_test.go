@@ -64,6 +64,35 @@ func TestCorruptJSONIsInvalidAndPreservesFraming(t *testing.T) {
 	}
 }
 
+func TestTerminalAndJSON(t *testing.T) {
+	for _, tc := range []struct{ event, data, want string }{
+		{"", " [DONE] ", "done_marker"}, {"message_stop", "", "message_stop"},
+		{"", `{"type":"message_stop"}`, "message_stop"},
+		{"response.completed", "", "response.completed"}, {"", `{"type":"response.incomplete"}`, "response.incomplete"},
+		{"response.failed", "", "response.failed"}, {"error", "", "error"},
+		{"", `{"error":{"message":"bad"}}`, "error"},
+		{"", `{"candidates":[{"finishReason":"STOP"}]}`, "finish_reason"},
+		{"end", "", "end"}, {"response.output_text.delta", "hello", ""},
+		{"", `{"candidates":[{"finishReason":""}]}`, ""},
+		{"", `{"type":"message_stop","padding":"` + strings.Repeat("x", 70<<10) + `"}`, ""},
+	} {
+		kind, ok := (Frame{Event: tc.event, Data: tc.data}).Terminal([]string{"end"})
+		if kind != tc.want || ok != (tc.want != "") {
+			t.Errorf("%q %q: got %q %v", tc.event, tc.data[:min(len(tc.data), 80)], kind, ok)
+		}
+	}
+	for _, tc := range []struct {
+		data string
+		want bool
+	}{
+		{"hello", false}, {" [DONE] ", false}, {" {broken", true}, {"[1]", true}, {"", false},
+	} {
+		if got := (Frame{Data: tc.data}).IsJSON(); got != tc.want {
+			t.Errorf("IsJSON(%q) = %v", tc.data, got)
+		}
+	}
+}
+
 func FuzzReader(f *testing.F) {
 	f.Add([]byte("\ufeffdata: é\r\n\r\n: comment\r\rpartial"))
 	f.Add([]byte("data\n\n"))

@@ -232,6 +232,7 @@ func observedAssertion(a tape.Assertion, t tape.Tape, events []telemetry.Event) 
 		Path        string `json:"path"`
 		Method      string `json:"method"`
 		Host        string `json:"host"`
+		Status      int    `json:"status"`
 		ReplayIndex int    `json:"replay_index"`
 	}
 	var requests []request
@@ -248,14 +249,17 @@ func observedAssertion(a tape.Assertion, t tape.Tape, events []telemetry.Event) 
 	}
 	sort.Slice(requests, func(i, j int) bool { return requests[i].Seq < requests[j].Seq })
 	var seq uint64
+	var httpStatus int
 	for _, v := range requests {
 		if wantedSeq != 0 {
 			if v.Seq == wantedSeq {
 				seq = v.Seq
+				httpStatus = v.Status
 				break
 			}
 		} else if occurrence == 0 {
 			seq = v.Seq
+			httpStatus = v.Status
 			break
 		} else {
 			occurrence--
@@ -266,18 +270,22 @@ func observedAssertion(a tape.Assertion, t tape.Tape, events []telemetry.Event) 
 		return r
 	}
 	var end string
+	terminal := "none"
 	var count int
 	var done bool
 	var last, maxGap int64
 	valid := true
 	known := true
 	found := false
+	var opaque bool
 	var status *int
 	for _, event := range events {
 		var v struct {
 			Seq                uint64 `json:"seq"`
 			Kind               string `json:"kind"`
 			End                string `json:"end"`
+			Terminal           string `json:"terminal"`
+			Inspected          *bool  `json:"inspected"`
 			Events             int    `json:"events"`
 			Done               bool   `json:"is_done"`
 			Preview            string `json:"preview"`
@@ -301,7 +309,11 @@ func observedAssertion(a tape.Assertion, t tape.Tape, events []telemetry.Event) 
 		}
 		found = true
 		if v.Kind == "end" {
+			opaque = v.Inspected != nil && !*v.Inspected
 			end = v.End
+			if v.Terminal != "" {
+				terminal = v.Terminal
+			}
 			count = v.Events
 			done = v.Done
 			if v.DeliveredEvents != nil && v.DeliveredValidJSON != nil && v.DeliveredDone != nil && v.DeliveredMaxGapMS != nil {
@@ -327,7 +339,7 @@ func observedAssertion(a tape.Assertion, t tape.Tape, events []telemetry.Event) 
 			}
 		}
 	}
-	if !found {
+	if !found && (a.ExpectSSE != nil || a.ExpectGRPCStatus != nil) {
 		r.Failures = append(r.Failures, "no protocol observation for step")
 		return r
 	}
@@ -341,9 +353,19 @@ func observedAssertion(a tape.Assertion, t tape.Tape, events []telemetry.Event) 
 			add("grpc_status", *a.ExpectGRPCStatus, *status)
 		}
 	}
+	if a.ExpectStatus != 0 && a.ExpectStatus != httpStatus {
+		add("status", a.ExpectStatus, httpStatus)
+	}
 	if x := a.ExpectSSE; x != nil {
+		if opaque {
+			r.Failures = append(r.Failures, "SSE frames not inspected for compressed pass-through")
+			return r
+		}
 		if x.End != "" && x.End != end {
 			add("end", x.End, end)
+		}
+		if x.Terminal != "" && x.Terminal != terminal {
+			add("terminal", x.Terminal, terminal)
 		}
 		if x.Done != nil && *x.Done != done {
 			add("done", *x.Done, done)

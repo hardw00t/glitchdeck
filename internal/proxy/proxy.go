@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -77,6 +78,7 @@ type Proxy struct {
 	front              *front
 	stats              map[string]RuleStats
 	applied            map[AppliedFault]uint64
+	sseEncodingWarned  map[string]bool
 	OnBlindTunnel      func(uint64)
 	OnSSE              func(uint64)
 	OnRequest          func(Record)
@@ -168,6 +170,7 @@ func (p *Proxy) ResetWith(fn func()) {
 	p.requests.Store(0)
 	clear(p.stats)
 	clear(p.applied)
+	clear(p.sseEncodingWarned)
 	p.mu.Unlock()
 	if fn != nil {
 		fn()
@@ -228,6 +231,34 @@ func (p *Proxy) Drain(ctx context.Context) error {
 }
 
 type reverseTargetKey struct{}
+
+func (p *Proxy) skipUnsupportedSSE(gen uint64, rule *fault.Rule, encoding string) string {
+	reason := "encoding_unsupported:" + encoding
+	p.mu.Lock()
+	if gen != p.generation {
+		p.mu.Unlock()
+		return reason
+	}
+	stats := p.stats[rule.ID]
+	// Upstream-controlled encodings cannot grow a rule's stats indefinitely.
+	if len(stats.SkipReasons) >= 16 && stats.SkipReasons[reason] == 0 {
+		reason = "encoding_unsupported:other"
+	}
+	stats.skip(reason)
+	p.stats[rule.ID] = stats
+	first := !p.sseEncodingWarned[rule.ID]
+	if first {
+		if p.sseEncodingWarned == nil {
+			p.sseEncodingWarned = make(map[string]bool)
+		}
+		p.sseEncodingWarned[rule.ID] = true
+	}
+	p.mu.Unlock()
+	if first {
+		fmt.Fprintf(os.Stderr, "rule %s: SSE fault skipped, upstream Content-Encoding %s is not decodable (stdlib supports gzip/deflate)\n", rule.ID, encoding)
+	}
+	return reason
+}
 
 func (p *Proxy) publish(gen uint64, kind string, v any) {
 	p.mu.Lock()
@@ -379,9 +410,33 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.options.OnAdmission != nil {
 		p.options.OnAdmission(seq, r.Method, r.URL.RequestURI(), host)
 	}
+	ws := r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
+	proto, recordProto := "h1", ""
+	if r.ProtoMajor == 2 {
+		proto, recordProto = "h2", "h2c"
+		if r.TLS != nil {
+			recordProto = "h2"
+		}
+	}
+	ctype := r.Header.Get("Content-Type")
+	match := fault.Query{Method: r.Method, Path: r.URL.Path, Host: host, Scheme: scheme, Proto: proto, ContentType: ctype, Seq: seq, WS: ws}
+	rule := fault.MatchRequest(cfg, match)
+	var kind, action, skip, h2Error string
+	var params map[string]any
+	if rule != nil {
+		kind, params = rule.Fault.Type, rule.Fault.Params
+		if !ws {
+			matched := p.countRule(gen, rule, "matched", "")
+			if kind == "rate-limit" {
+				if burst := fault.Int(params, "burst", 0); burst > 0 && matched > uint64(burst) {
+					skip = "burst_exhausted"
+					p.countRule(gen, rule, "skipped", skip)
+				}
+			}
+		}
+	}
 	p.admission.Unlock()
 	p.gate.Lock()
-	ws := r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
 	if ws {
 		p.activeWS++
 	}
@@ -403,28 +458,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	incoming := r
 	r = r.WithContext(ctx)
-	proto := "h1"
-	recordProto := ""
-	if r.ProtoMajor == 2 {
-		proto, recordProto = "h2", "h2c"
-		if r.TLS != nil {
-			recordProto = "h2"
-		}
-	}
 	meta := MetaFrom(ctx)
 	streamID := streamFrom(ctx)
-	ctype := r.Header.Get("Content-Type")
 	isGRPC := r.ProtoMajor == 2 && fault.NativeGRPC(ctype)
-	match := fault.Query{Method: r.Method, Path: r.URL.Path, Host: host, Scheme: scheme, Proto: proto, ContentType: ctype, Seq: seq, WS: ws}
-	rule := fault.MatchRequest(cfg, match)
-	var kind, action, skip, h2Error string
-	var params map[string]any
-	if rule != nil {
-		kind, params = rule.Fault.Type, rule.Fault.Params
-		if !ws {
-			p.countRule(gen, rule, "matched", "")
-		}
-	}
 	applied := false
 	ruleID := ""
 	if rule != nil {
@@ -618,7 +654,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveWS(w, r, gen, match)
 		return
 	}
-	if kind == "rate-limit" {
+	if kind == "rate-limit" && skip == "" {
 		var recorded []byte
 		missing, truncated := hasBody, false
 		if capture && !isGRPC {
@@ -632,11 +668,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		record(recorded, missing, truncated)
 		status = fault.Int(params, "status", 429)
-		w.Header().Set("Retry-After", strconv.Itoa(fault.Int(params, "retry_after_sec", 5)))
-		w.Header().Set("X-Glitchdeck-Fault", kind)
+		responseBody := rateLimitResponse(w.Header(), params, status, seq, start)
 		upstreamHeaders = w.Header()
 		w.WriteHeader(status)
-		count, _ := io.WriteString(w, fault.String(params, "body", ""))
+		count, _ := io.WriteString(w, responseBody)
 		n = int64(count)
 		markApplied()
 		return
@@ -732,9 +767,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp.Header.Del(TransportErrorHeader)
 	status, upstreamHeaders = resp.StatusCode, resp.Header
 	media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	encoding := resp.Header.Get("Content-Encoding")
+	encoding := strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ", ")))
+	if len(encoding) > 128 {
+		encoding = "other"
+	}
 	recordMu.Lock()
-	isSSE = media == "text/event-stream" && (encoding == "" || strings.EqualFold(encoding, "identity"))
+	isSSE = media == "text/event-stream"
 	classified = true
 	notifySSE()
 	recordMu.Unlock()
@@ -766,14 +804,29 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if !isSSE {
 			skip = "not_sse"
-			if media == "text/event-stream" {
-				skip = "encoded"
-			}
 			p.countRule(gen, rule, "skipped", skip)
+		} else if encoding != "" && encoding != "identity" {
+			switch encoding {
+			case "gzip", "x-gzip", "deflate":
+				// Keep upstream flushes visible to clients; io.ReadAll would buffer the stream.
+				decoder := &sseDecoder{source: resp.Body, encoding: encoding}
+				defer decoder.Close()
+				resp.Body = decoder
+				resp.Header.Del("Content-Encoding")
+				resp.Header.Del("Content-Length")
+				decoded := encoding
+				if decoded == "x-gzip" {
+					decoded = "gzip"
+				}
+				resp.Header.Set("X-Glitchdeck-Decoded", decoded)
+			default:
+				skip = p.skipUnsupportedSSE(gen, rule, encoding)
+				rule = nil
+			}
 		}
 	}
 	if isSSE && r.ProtoMajor == 1 && sseNeedsHijack(rule) {
-		result := p.relayHijackedSSE(ctx, w, resp, rule, cfg.Seed, seq, gen, start, runID)
+		result := p.relayHijackedSSE(ctx, w, resp, rule, cfg.Seed, seq, gen, start, runID, encoding)
 		n, sseEvents, end, skip = result.bytes, result.events, requestSSEEnd(result.end), result.skip
 		applied = applied || result.applied
 		if result.err != nil && result.end != "client_cancel" {
@@ -783,7 +836,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	streaming := resp.ContentLength < 0 || isSSE || plan.Applied != nil || isGRPC
 	stripHop(resp.Header)
-	if isSSE && kind == "sse-glitch" || kind == "grpc-glitch" {
+	if isSSE && rule != nil && kind == "sse-glitch" || kind == "grpc-glitch" {
 		resp.Header.Del("Content-Length")
 	}
 	copyHeaders(w.Header(), resp.Header)
@@ -809,8 +862,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if isSSE && kind != "byte-trickle" && plan.Applied == nil {
-		result := p.relaySSE(ctx, w, resp.Body, rule, cfg.Seed, seq, gen, start, runID)
-		n, sseEvents, end, skip = result.bytes, result.events, requestSSEEnd(result.end), result.skip
+		result := p.relaySSE(ctx, w, resp.Body, rule, cfg.Seed, seq, gen, start, runID, encoding)
+		n, sseEvents, end = result.bytes, result.events, requestSSEEnd(result.end)
+		if result.skip != "" {
+			skip = result.skip
+		}
 		applied = applied || result.applied
 		if r.ProtoMajor == 2 && (result.end == "rst" || result.end == "eof_early" && !fault.Bool(params, "http_clean", true)) {
 			code := uint32(0)
@@ -827,7 +883,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if result.err != nil && result.end != "client_cancel" {
 			p.outcome(gen, Outcome{Seq: seq, Err: result.err})
 			if result.end == "upstream_error" {
-				panic(http.ErrAbortHandler)
+				if _, decoded := resp.Body.(*sseDecoder); !decoded {
+					panic(http.ErrAbortHandler)
+				}
+				if r.ProtoMajor == 2 {
+					if !resetProtocolStream(ctx, 2) {
+						_ = rc.SetWriteDeadline(time.Now())
+					}
+				} else if conn, _, err := rc.Hijack(); err == nil {
+					// Close without writing the final chunk: decoding failed, not clean EOF.
+					_ = conn.Close()
+				}
 			}
 		}
 		return

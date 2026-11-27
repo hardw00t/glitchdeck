@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -15,7 +17,7 @@ func TestExecHelp(t *testing.T) {
 }
 
 func TestExecZeroTrafficFlag(t *testing.T) {
-	path := "../../examples/tapes/your-app-openai-sse-cut.tape.yaml"
+	path := execTapeWithoutExpectations(t)
 	for _, tc := range []struct {
 		flags []string
 		want  int
@@ -30,4 +32,13 @@ func TestExecZeroTrafficFlag(t *testing.T) {
 			t.Fatalf("exit %d, output %s", code, out)
 		}
 	}
+}
+
+func execTapeWithoutExpectations(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "exec.tape.yaml")
+	if err := os.WriteFile(path, []byte("version: 2\ntarget: http://127.0.0.1:1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
