@@ -1,6 +1,7 @@
 package demo
 
 import (
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -25,14 +26,17 @@ func (s *service) stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var v struct {
-		Tokens  int  `json:"tokens"`
-		TokenMS *int `json:"token_ms"`
-		Stream  bool `json:"stream"`
+		Tokens  int             `json:"tokens"`
+		TokenMS *int            `json:"token_ms"`
+		Stream  bool            `json:"stream"`
+		Tools   json.RawMessage `json:"tools"`
+		Gzip    json.RawMessage `json:"gzip"`
 	}
 	if e := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&v); e != nil && e != io.EOF {
 		http.Error(w, "invalid request", 400)
 		return
 	}
+	tools := string(v.Tools) == "true"
 	if v.Tokens == 0 {
 		v.Tokens = 24
 	}
@@ -50,14 +54,29 @@ func (s *service) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	var out io.Writer = w
+	var compressed *gzip.Writer
+	if string(v.Gzip) == "true" {
+		w.Header().Set("Content-Encoding", "gzip")
+		compressed = gzip.NewWriter(w)
+		defer compressed.Close()
+		out = compressed
+	}
 	id := streamID.Add(1)
 	anthropic := r.URL.Path == "/v1/messages"
+	responses := r.URL.Path == "/v1/responses"
+	gemini := strings.HasPrefix(r.URL.Path, "/v1beta/models/")
 	emit := func(event string, data any) bool {
 		b, _ := json.Marshal(data)
 		if event != "" {
-			fmt.Fprintf(w, "event: %s\n", event)
+			fmt.Fprintf(out, "event: %s\n", event)
 		}
-		fmt.Fprintf(w, "data: %s\n\n", b)
+		fmt.Fprintf(out, "data: %s\n\n", b)
+		if compressed != nil {
+			if err := compressed.Flush(); err != nil {
+				return false
+			}
+		}
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -73,7 +92,13 @@ func (s *service) stream(w http.ResponseWriter, r *http.Request) {
 			return true
 		}
 	}
-	if anthropic {
+	if responses {
+		if !emit("response.created", map[string]any{"type": "response.created"}) {
+			return
+		}
+	} else if gemini {
+		// Gemini begins directly with candidate chunks.
+	} else if anthropic {
 		if !emit("message_start", map[string]any{"type": "message_start"}) {
 			return
 		}
@@ -88,7 +113,41 @@ func (s *service) stream(w http.ResponseWriter, r *http.Request) {
 	words := strings.Fields("The quick brown fox jumps over the lazy dog while systems recover from transient failures with care and patience")
 	for i := 0; i < v.Tokens; i++ {
 		word := words[i%len(words)] + " "
-		if anthropic {
+		fragment := ""
+		if tools && !gemini {
+			fragment = word
+			if i == 0 {
+				fragment = `{"word":"` + fragment
+			}
+			if i == v.Tokens-1 {
+				fragment += `"}`
+			}
+		}
+		if tools && responses {
+			if !emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "item_id": "call_demo", "delta": fragment}) {
+				return
+			}
+		} else if tools && anthropic {
+			if !emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "input_json_delta", "partial_json": fragment}}) {
+				return
+			}
+		} else if tools && !gemini {
+			if !emit("", map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{"tool_calls": []any{map[string]any{"index": 0, "function": map[string]any{"arguments": fragment}}}}}}}) {
+				return
+			}
+		} else if tools && gemini {
+			if !emit("", map[string]any{"candidates": []any{map[string]any{"content": map[string]any{"parts": []any{map[string]any{"functionCall": map[string]any{"name": "demo", "args": map[string]any{"word": word}}}}}}}}) {
+				return
+			}
+		} else if responses {
+			if !emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "delta": word}) {
+				return
+			}
+		} else if gemini {
+			if !emit("", map[string]any{"candidates": []any{map[string]any{"content": map[string]any{"parts": []any{map[string]any{"text": word}}}}}}) {
+				return
+			}
+		} else if anthropic {
 			if !emit("content_block_delta", map[string]any{"type": "content_block_delta", "delta": map[string]any{"text": word}}) {
 				return
 			}
@@ -98,13 +157,20 @@ func (s *service) stream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if anthropic {
+	if responses {
+		emit("response.completed", map[string]any{"type": "response.completed"})
+	} else if gemini {
+		emit("", map[string]any{"candidates": []any{map[string]any{"finishReason": "STOP"}}})
+	} else if anthropic {
 		emit("content_block_stop", map[string]any{"type": "content_block_stop"})
 		emit("message_delta", map[string]any{"type": "message_delta"})
 		emit("message_stop", map[string]any{"type": "message_stop"})
 	} else {
 		emit("", map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}}})
-		fmt.Fprint(w, "data: [DONE]\n\n")
+		fmt.Fprint(out, "data: [DONE]\n\n")
+		if compressed != nil {
+			compressed.Flush()
+		}
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}

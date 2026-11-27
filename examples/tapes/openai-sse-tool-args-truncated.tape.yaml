@@ -1,0 +1,14 @@
+version: 2
+name: openai-sse-tool-args-truncated
+target: demo
+rules:
+  - id: corrupt
+    enabled: true
+    match: {method: POST, path_prefix: /v1/chat/completions}
+    fault: {type: sse-glitch, params: {action: corrupt_tool_args, mode: truncate}}
+script:
+  - {name: chat, stream: {method: POST, path: /v1/chat/completions, body: '{"tokens":8,"token_ms":1,"tools":true}'}}
+expect:
+  faults: [{rule: corrupt, min_applied: 1}]
+assertions:
+  - {name: valid-frames, stream_step: chat, expect_sse: {valid_json: true}}

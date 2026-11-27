@@ -74,7 +74,10 @@ func TestOwnAppOpenAISSE(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\ndata: [DONE]\n\n")
+		for _, word := range []string{"first", "second", "third", "fourth"} {
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", word)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	defer upstream.Close()
 	code, out := launchOutput(t, "exec", "--tape", "../../examples/tapes/your-app-openai-sse-cut.tape.yaml", "--target", upstream.URL, "--json", "--", "sh", "-c", `
@@ -88,7 +91,11 @@ func TestOwnAppOpenAISSE(t *testing.T) {
 			Type   string `json:"type"`
 		} `json:"faults_triggered"`
 	}
-	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 0 || !got.OK || got.ExitCode != 0 || got.Exec == nil || got.Exec.ExitCode != 0 || got.Summary.FaultsTriggered != 1 || len(got.Faults) != 1 || got.Faults[0].RuleID != "openai-stream-cut" || got.Faults[0].Type != "sse-glitch" || !strings.Contains(got.Exec.StdoutTail, `"content":"first"`) || strings.Contains(got.Exec.StdoutTail, "[DONE]") {
+	if err := json.Unmarshal([]byte(out), &got); err != nil || code != 0 || !got.OK || got.ExitCode != 0 || got.Exec == nil || got.Exec.ExitCode != 0 || got.Summary.FaultsTriggered != 1 || len(got.Faults) != 1 || got.Faults[0].RuleID != "openai-stream-cut" || got.Faults[0].Type != "sse-glitch" {
 		t.Fatalf("exit %d, stdout %q, decode error %v", code, out, err)
+	}
+	body := got.Exec.StdoutTail
+	if strings.Count(body, "data: ") != 3 || !strings.Contains(body, `"content":"third"`) || strings.Contains(body, "fourth") || strings.Contains(body, "[DONE]") {
+		t.Fatalf("unexpected child stream %q", body)
 	}
 }

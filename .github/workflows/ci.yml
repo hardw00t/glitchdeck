@@ -36,6 +36,8 @@ jobs:
           clean=$?
           set -e
           [[ "$fault" -eq 1 && "$clean" -eq 0 ]]
+          "$RUNNER_TEMP/glitchdeck" test examples/tapes/openai-sse-silent-truncation.tape.yaml
+          "$RUNNER_TEMP/glitchdeck" test examples/tapes/openai-sse-gzip-corrupt.tape.yaml
       - name: Cross-build and package all targets
         run: scripts/package.sh 0.0.0-ci "$RUNNER_TEMP/glitchdeck-dist"
   action:

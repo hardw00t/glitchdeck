@@ -1,0 +1,14 @@
+version: 2
+name: openai-sse-silent-truncation
+target: demo
+rules:
+  - id: cut
+    enabled: true
+    match: {method: POST, path_prefix: /v1/chat/completions}
+    fault: {type: sse-glitch, params: {action: eof_early, after_events: 3, http_clean: true}}
+script:
+  - {name: chat, stream: {method: POST, path: /v1/chat/completions, body: '{"tokens":8,"token_ms":1}'}}
+expect:
+  faults: [{rule: cut, min_applied: 1}]
+assertions:
+  - {name: truncated, stream_step: chat, expect_sse: {end: eof_early, done: false, terminal: none, max_events: 3}}

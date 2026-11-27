@@ -1,0 +1,14 @@
+version: 2
+name: openai-responses-eof-before-completed
+target: demo
+rules:
+  - id: cut
+    enabled: true
+    match: {method: POST, path_prefix: /v1/responses}
+    fault: {type: sse-glitch, params: {action: eof_early, http_clean: true}}
+script:
+  - {name: chat, stream: {method: POST, path: /v1/responses, body: '{"tokens":8,"token_ms":1}'}}
+expect:
+  faults: [{rule: cut, min_applied: 1}]
+assertions:
+  - {name: truncated, stream_step: chat, expect_sse: {terminal: none}}

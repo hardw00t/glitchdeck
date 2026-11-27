@@ -1,4 +1,4 @@
-# Run with glitchdeck exec and an OpenAI-compatible streaming client.
+# A clean cut after 3 events can return a silent short answer; assert finish_reason.
 version: 2
 name: your-app-openai-sse-cut
 target: http://127.0.0.1:3000
@@ -6,4 +6,6 @@ rules:
   - id: openai-stream-cut
     enabled: true
     match: {method: POST, path_prefix: /v1/chat/completions}
-    fault: {type: sse-glitch, params: {action: eof_early, http_clean: true}}
+    fault: {type: sse-glitch, params: {action: eof_early, after_events: 3, http_clean: true}}
+expect:
+  faults: [{rule: openai-stream-cut, min_applied: 1}]

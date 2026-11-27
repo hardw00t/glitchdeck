@@ -42,6 +42,8 @@ func New() http.Handler {
 	mux.HandleFunc("/api/chat/stream", s.stream)
 	mux.HandleFunc("/v1/chat/completions", s.stream)
 	mux.HandleFunc("/v1/messages", s.stream)
+	mux.HandleFunc("/v1/responses", s.stream)
+	mux.HandleFunc("/v1beta/models/", s.stream)
 	mux.HandleFunc("/api/stream-result", s.streamResult)
 	mux.HandleFunc("/glitchdeck.demo.v1.Quotes/Get", s.quote)
 	s.mux = mux

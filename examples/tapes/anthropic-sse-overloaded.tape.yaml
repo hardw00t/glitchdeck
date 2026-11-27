@@ -1,0 +1,14 @@
+version: 2
+name: anthropic-sse-overloaded
+target: demo
+rules:
+  - id: error
+    enabled: true
+    match: {method: POST, path_prefix: /v1/messages}
+    fault: {type: sse-glitch, params: {action: inject_error, provider: anthropic, error_type: overloaded_error}}
+script:
+  - {name: chat, stream: {method: POST, path: /v1/messages, body: '{"tokens":8,"token_ms":1}'}}
+expect:
+  faults: [{rule: error, min_applied: 1}]
+assertions:
+  - {name: error, stream_step: chat, expect_sse: {terminal: error}}

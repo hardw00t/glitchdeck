@@ -105,7 +105,18 @@ glitchdeck exec --tape examples/tapes/your-app-anthropic-sse-cut.tape.yaml --jso
   curl -q -fsSN --max-time 5 -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" -d '\''{"model":"local","max_tokens":32,"messages":[{"role":"user","content":"Hi"}],"stream":true}'\'' "$ANTHROPIC_BASE_URL/v1/messages"'
 ```
 
-The tapes close before `[DONE]` or `message_stop`; a clean HTTP close can still make curl exit 0. For Python or Node SDKs, replace curl with your app command and use the exported base URL (or configure the SDK explicitly). Use a model and credentials accepted by your service.
+These tapes close cleanly after three events. **Your SDK may not raise:** in [loopback SDK tests](docs/v2.2.0.md), OpenAI returned `"tok0 tok1 tok2"` with `error: null`, and Anthropic returned `stop_reason: null`. Assert a successful `finish_reason` or `stop_reason` in your application; a clean HTTP close can make curl exit 0. The tape's `min_applied: 1` expectation fails if the fault did not fire. A non-zero `exec` can have other causes and is not proof it fired. For Python or Node SDKs, replace curl with your app command and use the exported base URL (or configure the SDK explicitly). Use a model and credentials accepted by your service.
+
+| Stream fault or parameter | Use |
+| --- | --- |
+| `eof_early`, `after_events` | Cut cleanly after a chosen number of events |
+| `inject_error`, `provider` | Inject a provider-shaped midstream error |
+| `corrupt_tool_args`, `mode` | Break streamed tool arguments while retaining valid outer JSON |
+| `corrupt_tool_args`, `then` | Continue, close cleanly, or reset after corruption |
+| `done_events` | Add custom terminal event names |
+| `rate-limit`, `provider`, `burst` | Return provider-shaped limits for the first matching requests |
+
+Tool argument corruption re-marshals JSON, so object key order may change; compare normalized JSON. Gemini `functionCall.args` is an object, not streamed argument strings, and is not corrupted (`no_tool_args`). Matched gzip and deflate SSE streams are decoded and sent as identity; unsupported encodings such as br pass through unchanged and skip the SSE fault.
 
 ### Duplicate Stripe webhook
 
@@ -182,11 +193,11 @@ args = ["mcp"]
 | --- | --- |
 | `tcp-rst` | Reset the TCP connection before headers or after a byte budget |
 | `dup-webhook` | Replay a request after a configured delay |
-| `rate-limit` | Return an HTTP status and `Retry-After` without calling upstream |
+| `rate-limit` | Return a status and `Retry-After`; `provider`, `retry_after_ms`, `reset_sec`, and `burst` add provider envelopes and retry-storm behavior |
 | `byte-trickle` | Pace response chunks and optionally stall once |
 | `latency-wave` | Add seeded sine, spike, or jitter delay |
 | `ws-glitch` | Drop, delay, corrupt, truncate, or abnormally close frames |
-| `sse-glitch` | Stall, drop events, truncate, corrupt JSON, or close before a terminator |
+| `sse-glitch` | Stall, drop, truncate, corrupt JSON or tool arguments (`corrupt_tool_args`), inject provider errors (`inject_error`), or close before a terminator; `done_events` adds custom terminal names |
 | `h2-glitch` | Send RST_STREAM or GOAWAY with a selected error code |
 | `grpc-glitch` | Return an injected gRPC status before or after response messages |
 

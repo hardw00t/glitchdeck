@@ -9,6 +9,10 @@ Validate tapes without running them with `glitchdeck validate faults.tape.yaml`.
 
 Exec fails with exit 1 if no requests reach the proxy, or if enabled fault rules trigger no faults without an explicit zero-allowing fault expectation. `--allow-zero-traffic` disables both checks; other assertions and child-exit expectations still apply. Check proxy bypass and CA trust when traffic is missing.
 
+For LLM streams, start with `examples/tapes/your-app-openai-sse-cut.tape.yaml` or its Anthropic counterpart.
+Assert the application's `finish_reason` or `stop_reason`, not just that the SDK returned without an exception.
+`expect.faults` with `min_applied: 1` fails if the fault did not fire; a non-zero `exec` alone is not proof it fired.
+
 For piped tapes and CI reports, use `glitchdeck validate -` and `glitchdeck report --junit report.json`.
 
 Inspect failed assertions and fault counts, fix the application, then rerun the same tape. Keep the tape in the repository as a regression test; the composite action supports exec mode with its `command` input. Exit 0 means pass; 1 means a mismatch; 2 means invalid input; 3 means runtime failure; 124 means timeout; 125–127 mean child startup failure.

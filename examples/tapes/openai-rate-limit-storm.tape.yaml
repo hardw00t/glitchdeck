@@ -1,0 +1,18 @@
+version: 2
+name: openai-rate-limit-storm
+target: demo
+rules:
+  - id: storm
+    enabled: true
+    match: {method: POST, path_prefix: /v1/chat/completions}
+    fault: {type: rate-limit, params: {provider: openai, burst: 2, retry_after_ms: 200}}
+script:
+  - {name: first, stream: {method: POST, path: /v1/chat/completions, body: '{"tokens":2,"token_ms":1}'}}
+  - {name: retry, stream: {method: POST, path: /v1/chat/completions, body: '{"tokens":2,"token_ms":1}'}}
+  - {name: success, stream: {method: POST, path: /v1/chat/completions, body: '{"tokens":2,"token_ms":1}'}}
+expect:
+  faults: [{rule: storm, min_applied: 1, max_applied: 2}]
+assertions:
+  - {name: first-limited, stream_step: first, expect_status: 429}
+  - {name: retry-limited, stream_step: retry, expect_status: 429}
+  - {name: recovered, stream_step: success, expect_status: 200, expect_sse: {terminal: done_marker}}
