@@ -57,40 +57,48 @@ type Record struct {
 	BodyCaptureStarted bool
 }
 type Proxy struct {
-	target             *url.URL
-	cfg                atomic.Pointer[fault.Config]
-	seq                atomic.Uint64
-	requests           atomic.Uint64
-	bus                *telemetry.Bus
-	transports         [4]*http.Transport
-	gate               sync.Mutex
-	admission          sync.Mutex
-	generation         uint64
-	activeWS           int
-	activeTunnels      int
-	mu                 sync.Mutex
-	ctx                context.Context
-	cancel             context.CancelFunc
-	pending            int
-	done               chan struct{}
-	closed             bool
-	draining           bool
-	options            Options
-	server             *http.Server
-	front              *front
-	stats              map[string]RuleStats
-	applied            map[AppliedFault]uint64
-	sseEncodingWarned  map[string]bool
-	burstUsed          map[string]int
-	sseAdmission       map[string]chan []string
-	OnBlindTunnel      func(uint64)
-	OnSSE              func(uint64)
-	OnRequest          func(Record)
-	ShouldCaptureBody  func(uint64) bool
-	OnClientFrame      func(uint64, []byte)
-	OnServerFrame      func(uint64, string, byte)
-	OnUnsupportedFrame func(uint64)
-	OnOutcome          func(Outcome)
+	target              *url.URL
+	cfg                 atomic.Pointer[fault.Config]
+	seq                 atomic.Uint64
+	requests            atomic.Uint64
+	connects            atomic.Int64
+	interceptedOK       atomic.Int64
+	tlsRejected         atomic.Int64
+	passthroughOK       atomic.Int64
+	blindOK             atomic.Int64
+	connectEgressDenied atomic.Int64
+	innerEgressDenied   atomic.Int64
+	dialFailed          atomic.Int64
+	bus                 *telemetry.Bus
+	transports          [4]*http.Transport
+	gate                sync.Mutex
+	admission           sync.Mutex
+	generation          uint64
+	activeWS            int
+	activeTunnels       int
+	mu                  sync.Mutex
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	pending             int
+	done                chan struct{}
+	closed              bool
+	draining            bool
+	options             Options
+	server              *http.Server
+	front               *front
+	stats               map[string]RuleStats
+	applied             map[AppliedFault]uint64
+	sseEncodingWarned   map[string]bool
+	burstUsed           map[string]int
+	sseAdmission        map[string]chan []string
+	OnBlindTunnel       func(uint64)
+	OnSSE               func(uint64)
+	OnRequest           func(Record)
+	ShouldCaptureBody   func(uint64) bool
+	OnClientFrame       func(uint64, []byte)
+	OnServerFrame       func(uint64, string, byte)
+	OnUnsupportedFrame  func(uint64)
+	OnOutcome           func(Outcome)
 }
 
 func ParseTarget(s string) (*url.URL, error) {
@@ -166,6 +174,28 @@ func (p *Proxy) SetConfigAt(c fault.Config) uint64 {
 }
 func (p *Proxy) Seq() uint64           { return p.seq.Load() }
 func (p *Proxy) RequestsTotal() uint64 { return p.requests.Load() }
+
+type TrafficStats struct {
+	RequestsTotal     int64 `json:"-"`
+	Connects          int64 `json:"connects"`
+	InnerRequests     int64 `json:"inner_requests"`
+	InterceptedOK     int64 `json:"intercepted_ok"`
+	TLSRejected       int64 `json:"tls_rejected"`
+	PassthroughOK     int64 `json:"passthrough_ok"`
+	BlindOK           int64 `json:"blind_ok"`
+	EgressDenied      int64 `json:"egress_denied"`
+	InnerEgressDenied int64 `json:"-"`
+	DialFailed        int64 `json:"dial_failed"`
+}
+
+func (p *Proxy) TrafficStats() TrafficStats {
+	connects, requests := p.connects.Load(), int64(p.requests.Load())
+	innerDenied := p.innerEgressDenied.Load()
+	return TrafficStats{RequestsTotal: requests, Connects: connects, InnerRequests: requests - connects,
+		InterceptedOK: p.interceptedOK.Load(), TLSRejected: p.tlsRejected.Load(),
+		PassthroughOK: p.passthroughOK.Load(), BlindOK: p.blindOK.Load(),
+		EgressDenied: p.connectEgressDenied.Load() + innerDenied, InnerEgressDenied: innerDenied, DialFailed: p.dialFailed.Load()}
+}
 func (p *Proxy) SetSeq(n uint64)       { p.gate.Lock(); p.seq.Store(n); p.gate.Unlock() }
 func (p *Proxy) ActiveWebSockets() int { p.gate.Lock(); defer p.gate.Unlock(); return p.activeWS }
 func (p *Proxy) CaptureBoundary(fn func(uint64, int)) {
@@ -224,6 +254,14 @@ func (p *Proxy) ResetWith(fn func()) {
 	}
 	p.seq.Store(0)
 	p.requests.Store(0)
+	p.connects.Store(0)
+	p.interceptedOK.Store(0)
+	p.tlsRejected.Store(0)
+	p.passthroughOK.Store(0)
+	p.blindOK.Store(0)
+	p.connectEgressDenied.Store(0)
+	p.innerEgressDenied.Store(0)
+	p.dialFailed.Store(0)
 	clear(p.stats)
 	clear(p.applied)
 	clear(p.sseEncodingWarned)
@@ -432,14 +470,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	scheme, host := r.URL.Scheme, r.URL.Host
 	if r.URL.IsAbs() {
 		if r.URL.User != nil || (scheme != "http" && scheme != "https") || !p.allowed(r.URL.Hostname(), upstreamPort(scheme, r.URL.Port())) {
+			p.innerEgressDenied.Add(1)
 			http.Error(w, "egress denied", http.StatusForbidden)
 			if seq, gen := p.tunnelSequence(); seq != 0 {
-				p.tunnelEvent(r, start, seq, gen, 403, "", "egress_denied", 0, 0)
+				p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", 0, 0)
 			}
 			return
 		}
 	} else if p.target != nil {
 		if p.options.RequireUpstreamAllow && !p.allowed(p.target.Hostname(), upstreamPort(p.target.Scheme, p.target.Port())) {
+			p.innerEgressDenied.Add(1)
 			http.Error(w, "egress denied", http.StatusForbidden)
 			return
 		}

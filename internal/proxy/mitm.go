@@ -35,11 +35,20 @@ func (p *Proxy) tunnelSequence() (uint64, uint64) {
 }
 
 func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
+	p.connects.Add(1)
 	start := time.Now()
 	host, port, err := net.SplitHostPort(r.Host)
 	n, portErr := strconv.ParseUint(port, 10, 16)
 	valid := r.ProtoMajor == 1 && err == nil && portErr == nil && n != 0 && p.allowed(host, port)
-	intercept := valid && p.options.CA != nil
+	pattern, passthrough := "", false
+	if valid && p.options.CA != nil {
+		pattern, passthrough = p.passthrough(host, port)
+	}
+	intercept := valid && p.options.CA != nil && !passthrough
+	tunnel := "blind"
+	if passthrough {
+		tunnel = "passthrough"
+	}
 	ctx, seq, gen := p.admitTunnel(!intercept, valid && !intercept)
 	if valid && !intercept && seq != 0 {
 		defer func() {
@@ -54,8 +63,9 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		p.callback(gen, func() { p.OnBlindTunnel(seq) })
 	}
 	if !valid {
+		p.connectEgressDenied.Add(1)
 		http.Error(w, "egress denied", http.StatusForbidden)
-		p.tunnelEvent(r, start, seq, gen, 403, "", "egress_denied", 0, 0)
+		p.tunnelEvent(r, start, seq, gen, 403, "", "", "egress_denied", 0, 0)
 		return
 	}
 	if ctx.Err() != nil {
@@ -78,8 +88,9 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		stop()
 		cancel()
 		if err != nil {
+			p.dialFailed.Add(1)
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
-			p.tunnelEvent(r, start, seq, gen, 502, "blind", "dial_failed", 0, 0)
+			p.tunnelEvent(r, start, seq, gen, 502, tunnel, pattern, "dial_failed", 0, 0)
 			return
 		}
 		defer upstream.Close()
@@ -103,9 +114,11 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	}
 	if intercept {
 		if secured, spec, ok := f.intercept(c, rw.Reader, r.Host, host, p.options.MITMALPN, func(name string, err error) {
+			p.tlsRejected.Add(1)
 			fmt.Fprintf(os.Stderr, "tls_handshake_failed: host=%q sni=%q: %q\n", r.Host, name, err)
 			p.publish(gen, "tls_handshake_failed", map[string]any{"host": r.Host, "sni": name, "error": err.Error(), "ts_ms": start.UnixMilli()})
 		}); ok {
+			p.interceptedOK.Add(1)
 			handedOver = true
 			f.route(secured, spec)
 		}
@@ -133,7 +146,12 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		closeWrite(c)
 	}
 	sent := <-toUp
-	p.tunnelEvent(r, start, seq, gen, 200, "blind", "", sent, fromUp)
+	if passthrough {
+		p.passthroughOK.Add(1)
+	} else {
+		p.blindOK.Add(1)
+	}
+	p.tunnelEvent(r, start, seq, gen, 200, tunnel, pattern, "", sent, fromUp)
 }
 
 func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn string, failed func(string, error)) (net.Conn, ConnMeta, bool) {
@@ -201,13 +219,17 @@ func closeWrite(c net.Conn) {
 	}
 }
 
-func (p *Proxy) tunnelEvent(r *http.Request, t time.Time, seq, gen uint64, status int, tunnel, failure string, in, out int64) {
+func (p *Proxy) tunnelEvent(r *http.Request, t time.Time, seq, gen uint64, status int, tunnel, pattern, failure string, in, out int64) {
 	if seq == 0 {
 		return
 	}
-	p.publish(gen, "http_req", map[string]any{
+	event := map[string]any{
 		"seq": seq, "ts_ms": t.UnixMilli(), "method": r.Method, "path": r.Host, "host": r.Host, "proto": r.Proto,
 		"status": status, "tunnel": tunnel, "req_bytes": in, "resp_bytes": out, "latency_ms": time.Since(t).Milliseconds(),
 		"fault": "", "error": failure, "replay_index": 0,
-	})
+	}
+	if pattern != "" {
+		event["passthrough"] = pattern
+	}
+	p.publish(gen, "http_req", event)
 }

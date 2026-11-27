@@ -198,8 +198,15 @@ func TestDialRejectsDNSResolvedLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	defer upstream.Close()
+	_, upstreamPort, _ := net.SplitHostPort(upstream.Listener.Addr().String())
+	ca, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
 	p := New(nil, fault.Config{}, nil)
-	p.SetOptions(Options{UpstreamAllow: []string{"synthetic.test"}})
+	p.SetOptions(Options{CA: ca, UpstreamAllow: []string{"synthetic.test"}, TLSPassthrough: []string{"synthetic.test"}})
 	go p.Serve(l)
 	defer p.Close()
 	deadline := time.Now().Add(time.Second)
@@ -215,9 +222,26 @@ func TestDialRejectsDNSResolvedLoopback(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	_, err = p.dial(context.Background(), "tcp", "synthetic.test:1")
+	authority := net.JoinHostPort("synthetic.test", upstreamPort)
+	_, err = p.dial(context.Background(), "tcp", authority)
 	if err == nil || !strings.Contains(err.Error(), "egress denied") {
 		t.Fatalf("dial error = %v", err)
+	}
+	_, proxyPort, _ := net.SplitHostPort(l.Addr().String())
+	c, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", proxyPort), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(time.Second))
+	fmt.Fprintf(c, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, authority)
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("passthrough CONNECT status = %d, want 502", resp.StatusCode)
 	}
 }
 

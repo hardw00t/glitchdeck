@@ -4,9 +4,13 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -115,6 +119,45 @@ func TestStreamParserAndReport(t *testing.T) {
 	_, stats, err := RunWithReport(context.Background(), Tape{Version: 2, Target: "demo", Rules: []fault.Rule{{ID: "limit", Enabled: true, Fault: fault.Fault{Type: "rate-limit", Params: map[string]any{"status": 429}}}}, Script: []Step{{HTTP: &HTTP{Path: "/api/state"}}}}, "")
 	if err != nil || stats.Rules["limit"].Applied != 1 || stats.RequestsTotal != 1 {
 		t.Fatalf("stats %v, error %v", stats, err)
+	}
+}
+
+func TestPassthroughUsesSystemRoots(t *testing.T) {
+	if target := os.Getenv("GLITCHDECK_TEST_PASSTHROUGH_TARGET"); target != "" {
+		tp := Tape{Version: 2, Target: target, TLSMITM: true, UpstreamAllow: []string{"127.0.0.1"}, TLSPassthrough: []string{"127.0.0.1"}, Script: []Step{{HTTP: &HTTP{URL: target + "/"}}}}
+		if _, _, err := RunWithTLS(context.Background(), tp, "", "", false); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	root := filepath.Join(t.TempDir(), "root.pem")
+	if err := os.WriteFile(root, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPassthroughUsesSystemRoots$")
+	cmd.Env = append(os.Environ(), "GLITCHDECK_TEST_PASSTHROUGH_TARGET="+server.URL, "SSL_CERT_FILE="+root, "SSL_CERT_DIR="+t.TempDir())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("passthrough client: %v\n%s", err, output)
+	}
+}
+
+func TestPassthroughTapeRoundTrip(t *testing.T) {
+	doc := "version: 2\ntarget: demo\ntls_passthrough: [' example.com ', '*.example.com', '[::1]:8443']\n"
+	tp, err := Decode(strings.NewReader(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded strings.Builder
+	if err := Encode(&encoded, tp); err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := Decode(strings.NewReader(encoded.String()))
+	if err != nil || len(roundTrip.TLSPassthrough) != 3 || roundTrip.TLSPassthrough[2] != "[::1]:8443" {
+		t.Fatalf("round trip: %+v, %v", roundTrip.TLSPassthrough, err)
 	}
 }
 

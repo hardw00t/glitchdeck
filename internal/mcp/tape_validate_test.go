@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -41,6 +42,8 @@ func TestTapeValidateStdio(t *testing.T) {
 		{name: "invalid schema", args: map[string]string{"tape_yaml": badSchema}, errText: "unknown_field"},
 		{name: "invalid target", args: map[string]string{"tape_yaml": badTarget}, errText: "HTTP or HTTPS"},
 		{name: "unknown expected rule", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: missing, max_applied: 0}]}\n"}, errText: "missing"},
+		{name: "bad passthrough", args: map[string]string{"tape_yaml": "version: 2\ntls_passthrough: ['api.*.com']\n"}, errText: `tls_passthrough[0]: wildcard must be leading "*." label: "api.*.com"`},
+		{name: "v1 passthrough", args: map[string]string{"tape_yaml": "version: 1\ntls_passthrough: []\n"}, errText: "new keys require version: 2"},
 		{name: "inverted bounds", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: limit, min_applied: 1, max_applied: 0}]}\n"}, errText: "min_applied"},
 		{name: "fractional bound", args: map[string]string{"tape_yaml": v2 + "expect: {faults: [{rule: limit, max_applied: 1.5}]}\n"}, errText: "max_applied"},
 		{name: "raw missing data", args: map[string]string{"tape_yaml": "version: 2\ntarget: demo\nrules: [{id: r, fault: {type: sse-glitch, params: {action: inject_error, provider: raw}}}]\n"}, errText: "data"},
@@ -123,6 +126,33 @@ func TestTapeValidateStdio(t *testing.T) {
 				}
 			} else if message, _ := got["error"].(string); len(got) != 2 || got["ok"] != false || !strings.Contains(message, tc.errText) {
 				t.Fatal(output.String())
+			}
+		})
+	}
+}
+
+func TestTapeValidateRejectsPassthroughPatterns(t *testing.T) {
+	patterns := []string{"", "*", "any", "*.", "*.com", "api.*.com", "a*.example.com", "https://example.com", "example.com/path", "example.com?x", "user@example.com", "192.0.2.0/24", "example.com:0", "example.com:65536", strings.Repeat("a", 64) + ".test", strings.Repeat("a.", 126) + "aa", "[not-ip]:443"}
+	for _, pattern := range patterns {
+		t.Run(pattern, func(t *testing.T) {
+			doc := "version: 2\ntls_passthrough: [" + strconv.Quote(pattern) + "]\n"
+			args, err := json.Marshal(map[string]string{"tape_yaml": doc})
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tape_validate","arguments":%s}}`+"\n", args)
+			var output strings.Builder
+			if err := NewServer(strings.NewReader(input), &output, Options{Workdir: t.TempDir()}).Serve(); err != nil {
+				t.Fatal(err)
+			}
+			var reply struct {
+				Result struct {
+					IsError    bool           `json:"isError"`
+					Structured map[string]any `json:"structuredContent"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal([]byte(output.String()), &reply); err != nil || !reply.Result.IsError || !strings.Contains(fmt.Sprint(reply.Result.Structured["error"]), "tls_passthrough[0]") {
+				t.Fatalf("response %s: %v", output.String(), err)
 			}
 		})
 	}

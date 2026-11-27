@@ -16,7 +16,7 @@ func v1Keys(doc *yaml.Node) error {
 		return false
 	}
 	root := doc.Content[0]
-	if has(root, "tls_mitm", "upstream_allow", "expect") {
+	if has(root, "tls_mitm", "upstream_allow", "tls_passthrough", "expect") {
 		return fmt.Errorf("new keys require version: 2")
 	}
 	ruleSets := []*yaml.Node{yamlField(root, "rules")}

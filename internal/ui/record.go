@@ -162,7 +162,7 @@ func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config, usedBu
 		}
 		r.streams = make(map[uint64]*recorded)
 		if activeStreams != 0 {
-			r.markIncomplete("WebSocket or blind CONNECT tunnel already open when recording started")
+			r.markIncomplete("WebSocket, blind or passthrough CONNECT tunnel already open when recording started")
 		}
 		if len(usedBurst) != 0 && usedBurst[0] {
 			r.markIncomplete("rate-limit burst was partially or fully consumed before recording started")

@@ -54,6 +54,7 @@ type Tape struct {
 	Assertions       []Assertion    `yaml:"assertions" json:"assertions"`
 	TLSMITM          bool           `yaml:"tls_mitm,omitempty" json:"tls_mitm,omitempty"`
 	UpstreamAllow    []string       `yaml:"upstream_allow,omitempty" json:"upstream_allow,omitempty"`
+	TLSPassthrough   []string       `yaml:"tls_passthrough,omitempty" json:"tls_passthrough,omitempty"`
 	Expect           Expect         `yaml:"expect,omitempty" json:"expect,omitempty"`
 }
 type ConfigChange struct {
@@ -162,7 +163,7 @@ func validate(t Tape) error {
 		return fmt.Errorf("unsupported tape version %d", t.Version)
 	}
 	if t.Version == 1 {
-		if t.TLSMITM || len(t.UpstreamAllow) != 0 || t.Expect.ChildExit != nil || len(t.Expect.Faults) != 0 {
+		if t.TLSMITM || len(t.UpstreamAllow) != 0 || len(t.TLSPassthrough) != 0 || t.Expect.ChildExit != nil || len(t.Expect.Faults) != 0 {
 			return fmt.Errorf("new keys require version: 2")
 		}
 		if v2RuleSet(t.Rules) {
@@ -209,6 +210,11 @@ func validate(t Tape) error {
 			if strings.EqualFold(strings.TrimSpace(item), "any") {
 				return fmt.Errorf("upstream_allow cannot contain any")
 			}
+		}
+	}
+	for i, pattern := range t.TLSPassthrough {
+		if err := proxy.ValidatePassthrough(pattern); err != nil {
+			return fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern))
 		}
 	}
 	if t.Incomplete {
@@ -442,6 +448,11 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			return nil, err
 		}
 		roots = x509.NewCertPool()
+		if len(t.TLSPassthrough) != 0 {
+			if systemRoots, err := x509.SystemCertPool(); err == nil && systemRoots != nil {
+				roots = systemRoots
+			}
+		}
 		roots.AddCert(ca.Cert)
 	}
 	var app *httptest.Server
@@ -490,7 +501,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		report.RequestsTotal = p.RequestsTotal()
 		report.AppliedFaults = p.AppliedFaults()
 	}()
-	p.SetOptions(proxy.Options{CA: ca, UpstreamCA: upstreamRoots, UpstreamAllow: t.UpstreamAllow, Demo: isDemo, RequireUpstreamAllow: true})
+	p.SetOptions(proxy.Options{CA: ca, UpstreamCA: upstreamRoots, UpstreamAllow: t.UpstreamAllow, TLSPassthrough: t.TLSPassthrough, Demo: isDemo, RequireUpstreamAllow: true})
 	var outcomeMu sync.Mutex
 	type wsEvidence struct {
 		drop    time.Time

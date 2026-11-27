@@ -24,6 +24,7 @@ type Options struct {
 	CA                   *tlsmitm.CA
 	Demo                 bool
 	UpstreamAllow        []string
+	TLSPassthrough       []string
 	UpstreamCA           *x509.CertPool
 	InsecureUpstream     bool
 	MITMALPN             string
@@ -72,6 +73,7 @@ func (p *Proxy) SetOptions(o Options) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	o.UpstreamAllow = slices.Clone(o.UpstreamAllow)
+	o.TLSPassthrough = slices.Clone(o.TLSPassthrough)
 	p.options = o
 	closeIdleTransports(p.transports)
 	p.transports = [4]*http.Transport{}
