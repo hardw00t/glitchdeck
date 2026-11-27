@@ -1,0 +1,10 @@
+version: 2
+name: your-app-stripe-concurrent-race
+target: http://127.0.0.1:3000
+rules:
+  - id: race
+    enabled: true
+    match: {method: POST, path_prefix: /webhooks/stripe, seq: [1]}
+    fault: {type: dup-webhook, params: {mode: concurrent, count: 5, replay_header: true}}
+expect:
+  faults: [{rule: race, min_applied: 1}]

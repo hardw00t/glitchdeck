@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -330,6 +331,7 @@ func reportCommand(args []string) int {
 		}
 		return 0
 	}
+	details := reportDetails(e)
 	if *github {
 		failures := e.Diff
 		if failure, ok := e.Error.(map[string]any); ok {
@@ -349,13 +351,16 @@ func reportCommand(args []string) int {
 		if e.OK {
 			fmt.Println("::notice::Glitchdeck expectations passed")
 		}
+		for _, line := range details {
+			fmt.Printf("::notice::%s\n", escape.Replace(line))
+		}
 		if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
 			out, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, err)
 				return 3
 			}
-			_, err = io.WriteString(out, githubSummary(e, failures))
+			_, err = io.WriteString(out, githubSummary(e, failures, details))
 			closeErr := out.Close()
 			if err != nil || closeErr != nil {
 				fmt.Fprintln(os.Stderr, errors.Join(err, closeErr))
@@ -366,9 +371,66 @@ func reportCommand(args []string) int {
 		for _, line := range e.Diff {
 			fmt.Println(line)
 		}
+		for _, line := range details {
+			fmt.Println(line)
+		}
 		fmt.Printf("Exit code: %d\n", e.ExitCode)
 	}
 	return 0
+}
+
+func reportDetails(e execrun.Envelope) []string {
+	var lines []string
+	for _, entry := range e.FaultsTriggered {
+		fault, _ := entry.(map[string]any)
+		r, ok := fault["replays"].(map[string]any)
+		if !ok {
+			continue
+		}
+		rule, _ := fault["rule_id"].(string)
+		if byMode, ok := r["by_mode"].(map[string]any); ok {
+			for _, mode := range slices.Sorted(maps.Keys(byMode)) {
+				if stats, ok := byMode[mode].(map[string]any); ok {
+					lines = append(lines, replayReportLine(rule, stats))
+				}
+			}
+		} else {
+			lines = append(lines, replayReportLine(rule, r))
+		}
+	}
+	for _, frame := range e.FrameErrors {
+		lines = append(lines, fmt.Sprintf("ws_frame %s dir=%s seq=%d declared_bytes=%d limit_bytes=%d: %s",
+			frame.Code, frame.Dir, frame.Seq, frame.Declared, frame.Limit, frame.Detail))
+	}
+	if e.FrameErrorsOmitted != 0 {
+		lines = append(lines, fmt.Sprintf("ws_frame errors omitted: %d", e.FrameErrorsOmitted))
+	}
+	return lines
+}
+
+func replayReportLine(rule string, r map[string]any) string {
+	var line strings.Builder
+	fmt.Fprintf(&line, "dup-webhook %s mode=%s sent=%.0f", rule, r["mode"], r["sent"])
+	status, _ := r["status"].(map[string]any)
+	for _, k := range slices.Sorted(maps.Keys(status)) {
+		fmt.Fprintf(&line, " %s×%.0f", k, status[k])
+	}
+	if skew, ok := r["max_skew_ms"].(float64); ok {
+		fmt.Fprintf(&line, " skew=%.0fms", skew)
+	}
+	if committed, ok := r["committed_status"].(float64); ok {
+		fmt.Fprintf(&line, " committed_status=%.0f", committed)
+	}
+	if outcome, ok := r["original_outcome"].(string); ok {
+		fmt.Fprintf(&line, " original_outcome=%s", outcome)
+	}
+	outcomes, _ := r["outcomes"].(map[string]any)
+	sep := " outcomes="
+	for _, k := range slices.Sorted(maps.Keys(outcomes)) {
+		fmt.Fprintf(&line, "%s%s×%.0f", sep, k, outcomes[k])
+		sep = ","
+	}
+	return line.String()
 }
 
 func writeJUnitReport(w io.Writer, e execrun.Envelope) error {
@@ -381,6 +443,7 @@ func writeJUnitReport(w io.Writer, e execrun.Envelope) error {
 		Classname string   `xml:"classname,attr"`
 		Failure   *problem `xml:"failure,omitempty"`
 		Error     *problem `xml:"error,omitempty"`
+		Output    string   `xml:"system-out,omitempty"`
 	}
 	doc := struct {
 		XMLName xml.Name `xml:"testsuites"`
@@ -443,6 +506,9 @@ func writeJUnitReport(w io.Writer, e execrun.Envelope) error {
 	} else if e.OK && len(e.Assertions) == 0 {
 		add(testcase{Name: "expectations"})
 	}
+	if details := reportDetails(e); len(details) != 0 {
+		suite.Cases[0].Output = strings.Join(details, "\n")
+	}
 	suite.Tests = len(suite.Cases)
 
 	if _, err := io.WriteString(w, xml.Header); err != nil {
@@ -452,7 +518,7 @@ func writeJUnitReport(w io.Writer, e execrun.Envelope) error {
 	return xml.NewEncoder(w).Encode(doc)
 }
 
-func githubSummary(e execrun.Envelope, failures []string) string {
+func githubSummary(e execrun.Envelope, failures, details []string) string {
 	var summary strings.Builder
 	summary.WriteString("## Glitchdeck\n\n| Exit code |")
 	childHeading, childSeparator, childValue := "", "", ""
@@ -483,6 +549,12 @@ func githubSummary(e execrun.Envelope, failures []string) string {
 			if ok {
 				fmt.Fprintf(&summary, "- %s (%s): %.0f\n", escape.Replace(rule), escape.Replace(kind), count)
 			}
+		}
+	}
+	if len(details) > 0 {
+		summary.WriteString("\n**Fault details**\n\n")
+		for _, line := range details {
+			fmt.Fprintf(&summary, "- %s\n", escape.Replace(line))
 		}
 	}
 	if len(failures) > 0 {

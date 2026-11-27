@@ -106,6 +106,25 @@ func Validate(c Config) error {
 			schema = rstParams
 		case "dup-webhook":
 			schema = replayParams
+			mode := String(r.Fault.Params, "mode", "sequential")
+			switch mode {
+			case "sequential", "concurrent", "timeout_retry":
+			default:
+				return invalidParam(r.ID, "mode")
+			}
+			if result, ok := r.Fault.Params["client_result"]; ok {
+				if result != "gateway_timeout" && result != "reset" || mode != "timeout_retry" {
+					return invalidParam(r.ID, "client_result")
+				}
+			}
+			if mode == "concurrent" && Int(r.Fault.Params, "delay_ms", 0) > 0 {
+				return invalidRule(r.ID, "delay_ms", `param "delay_ms": not allowed with mode concurrent`)
+			}
+			if mode != "sequential" {
+				if count, ok := r.Fault.Params["count"]; ok && !(paramRange{min: 2, max: 20}).valid(count) {
+					return invalidParam(r.ID, "count")
+				}
+			}
 		case "rate-limit":
 			schema = limitParams
 			switch String(r.Fault.Params, "provider", "none") {
@@ -133,6 +152,11 @@ func Validate(c Config) error {
 			case "drop", "delay", "corrupt", "truncate", "close_1006":
 			default:
 				return invalidRule(r.ID, "action", "invalid WebSocket action")
+			}
+			switch String(r.Fault.Params, "frames", "all") {
+			case "all", "data", "control":
+			default:
+				return invalidParam(r.ID, "frames")
 			}
 		case "sse-glitch", "h2-glitch", "grpc-glitch":
 			if err := validateV2(r); err != nil {
@@ -188,11 +212,11 @@ const maxValue = 1 << 30
 
 var (
 	rstParams     = map[string]paramRange{"after_bytes": {max: maxValue}, "before_headers": {kind: 'b'}}
-	replayParams  = map[string]paramRange{"count": {min: 1, max: 100}, "delay_ms": {max: maxValue}, "replay_header": {kind: 'b'}}
+	replayParams  = map[string]paramRange{"count": {min: 1, max: 100}, "delay_ms": {max: maxValue}, "replay_header": {kind: 'b'}, "mode": {kind: 's'}, "replay_timeout_ms": {min: 1, max: 60000}, "client_result": {kind: 's'}}
 	limitParams   = map[string]paramRange{"status": {min: 200, max: 599}, "retry_after_sec": {max: maxValue}, "body": {kind: 's'}, "provider": {kind: 's'}, "retry_after_ms": {max: 600000}, "reset_sec": {min: 1, max: 86400}, "burst": {min: 1, max: 1000000}}
 	trickleParams = map[string]paramRange{"bytes_per_sec": {min: 1, max: maxValue}, "chunk_bytes": {min: 1, max: 64 << 10}, "stall_after_bytes": {max: maxValue}, "stall_ms": {max: maxValue}}
 	latencyParams = map[string]paramRange{"shape": {kind: 's'}, "base_ms": {max: maxValue / 2}, "amp_ms": {max: maxValue / 2}, "period_seq": {min: 1, max: maxValue}, "every": {min: 1, max: maxValue}}
-	wsParams      = map[string]paramRange{"dir": {kind: 's'}, "action": {kind: 's'}, "delay_ms": {max: maxValue}, "after_frames": {max: maxValue}, "every": {min: 1, max: maxValue}, "truncate_bytes": {max: maxValue}}
+	wsParams      = map[string]paramRange{"dir": {kind: 's'}, "action": {kind: 's'}, "delay_ms": {max: maxValue}, "after_frames": {max: maxValue}, "every": {min: 1, max: maxValue}, "truncate_bytes": {max: maxValue}, "frames": {kind: 's'}}
 )
 
 type Query struct {

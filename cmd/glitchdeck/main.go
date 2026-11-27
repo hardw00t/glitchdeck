@@ -122,10 +122,15 @@ func testTape(args []string) int {
 		filename = files[0]
 	}
 	version := 0
+	var runReport tape.RunReport
 	fail := func(machine string, err error) int {
 		e := execrun.NewEnvelope("test", filename, *target)
 		e.ExitCode = 2
 		e.Error = map[string]string{"code": machine, "message": err.Error()}
+		e.FrameErrors = runReport.FrameErrors
+		e.FrameErrorsOmitted = runReport.FrameErrorsOmitted
+		e.SetAppliedFaults(runReport.AppliedFaults)
+		e.Summary.RequestsTotal = runReport.RequestsTotal
 		if *report != "" {
 			if err := execrun.WriteReport(*report, e); err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -160,7 +165,8 @@ func testTape(args []string) int {
 	started := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	results, runReport, err := tape.RunWithTLS(ctx, t, *target, *caDir, *tlsEnabled)
+	var results []tape.Result
+	results, runReport, err = tape.RunWithTLS(ctx, t, *target, *caDir, *tlsEnabled)
 	if err != nil {
 		return fail("INTERNAL", err)
 	}
@@ -184,6 +190,8 @@ func testTape(args []string) int {
 	envelope.SetResults(results)
 	envelope.Summary.RequestsTotal = runReport.RequestsTotal
 	envelope.SetAppliedFaults(runReport.AppliedFaults)
+	envelope.FrameErrors = runReport.FrameErrors
+	envelope.FrameErrorsOmitted = runReport.FrameErrorsOmitted
 	if *report != "" {
 		if e := execrun.WriteReport(*report, envelope); e != nil {
 			return fail("TAPE_IO", e)

@@ -272,6 +272,9 @@ func (s *service) ticker(w http.ResponseWriter, r *http.Request) {
 			seq, orders := s.ticks, len(s.orders)
 			s.mu.Unlock()
 			payload, _ := json.Marshal(map[string]any{"seq": seq, "price": 10000 + seq, "orders": orders})
+			if r.URL.Query().Get("heartbeat") == "1" && !write(wsframe.Frame{Fin: true, Opcode: 9}) {
+				return
+			}
 			if !write(wsframe.Frame{Fin: true, Opcode: 1, Payload: payload}) {
 				return
 			}

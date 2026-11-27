@@ -124,6 +124,20 @@ func init() {
 		}
 		Registry[name] = spec
 	}
+	for _, metadata := range []struct {
+		typ, param string
+		values     []string
+		def        string
+	}{
+		{"dup-webhook", "mode", []string{"sequential", "concurrent", "timeout_retry"}, "sequential"},
+		{"dup-webhook", "client_result", []string{"gateway_timeout", "reset"}, "gateway_timeout"},
+		{"ws-glitch", "frames", []string{"all", "data", "control"}, "all"},
+	} {
+		params := Registry[metadata.typ].Params
+		spec := params[metadata.param]
+		spec.Enum, spec.Default = metadata.values, metadata.def
+		params[metadata.param] = spec
+	}
 }
 
 func validateV2(r Rule) error {

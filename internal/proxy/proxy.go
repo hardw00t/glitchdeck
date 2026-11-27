@@ -83,6 +83,7 @@ type Proxy struct {
 	ctx                 context.Context
 	cancel              context.CancelFunc
 	pending             int
+	active              int
 	done                chan struct{}
 	closed              bool
 	draining            bool
@@ -90,7 +91,8 @@ type Proxy struct {
 	server              *http.Server
 	front               *front
 	stats               map[string]RuleStats
-	applied             map[AppliedFault]uint64
+	applied             map[appliedKey]uint64
+	replayWarned        map[string]bool
 	sseEncodingWarned   map[string]bool
 	burstUsed           map[string]int
 	sseAdmission        map[string]chan []string
@@ -277,6 +279,7 @@ func (p *Proxy) ResetWith(fn func()) {
 	clear(p.stats)
 	clear(p.applied)
 	clear(p.sseEncodingWarned)
+	clear(p.replayWarned)
 	clear(p.burstUsed)
 	p.mu.Unlock()
 	if p.options.OnReset != nil {
@@ -299,19 +302,29 @@ func (p *Proxy) Close() {
 	}
 }
 func (p *Proxy) beginPendingLocked() {
-	if p.pending == 0 {
+	if p.active == 0 {
 		p.done = make(chan struct{})
 	}
-	p.pending++
+	p.active++
 }
 
 func (p *Proxy) finishPending() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.pending--
-	if p.pending == 0 {
+	p.active--
+	if p.active == 0 {
 		close(p.done)
 	}
+}
+
+func (p *Proxy) finishReplay() {
+	p.mu.Lock()
+	p.pending--
+	p.active--
+	if p.active == 0 {
+		close(p.done)
+	}
+	p.mu.Unlock()
 }
 
 func (p *Proxy) Wait(ctx context.Context) error {
@@ -630,7 +643,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ruleID = rule.ID
 	}
 	markApplied := func() {
-		markUsable()
+		if kind != "dup-webhook" {
+			markUsable()
+		}
 		applied = true
 		p.countRule(gen, rule, "applied", "")
 	}
@@ -853,6 +868,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.IsAbs() && !meta.MITM && !p.options.RequireUpstreamAllow {
 		ctx = context.WithValue(ctx, reverseTargetKey{}, true)
 	}
+	mode := fault.String(params, "mode", "sequential")
+	if kind == "dup-webhook" && mode == "timeout_retry" {
+		detached, stopDetached := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(fault.Int(params, "replay_timeout_ms", 5000))*time.Millisecond)
+		defer stopDetached()
+		stopSession := context.AfterFunc(session, stopDetached)
+		defer stopSession()
+		ctx = detached
+	}
 	q := p.upstream(r, body, ctx)
 	if q == nil {
 		if !buffered && hasBody {
@@ -913,11 +936,66 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = http.NewResponseController(w).EnableFullDuplex()
 	}
 	transport := p.transportFor(ctx, r.ProtoMajor == 2 && q.URL.Scheme == "http")
+	var releaseReplay func(bool)
+	var replayClock *replayTiming
+	if kind == "dup-webhook" && buffered && mode == "concurrent" {
+		releaseReplay, replayClock = p.concurrentReplays(r, body, seq, gen, rule, params)
+		if releaseReplay != nil {
+			defer releaseReplay(false)
+		}
+	}
 	if meta.Tap != nil && streamID != 0 && !meta.Tap.AdmitUpstream(streamID) {
 		meta.Tap.Reset(streamID, 7)
 		panic(http.ErrAbortHandler)
 	}
+	if releaseReplay != nil {
+		markApplied()
+		replayClock.start()
+		releaseReplay(true)
+	}
 	resp, err := transport.RoundTrip(q)
+	if kind == "dup-webhook" && buffered && mode == "timeout_retry" {
+		originalOutcome := ""
+		committedStatus := 0
+		if err != nil {
+			originalOutcome = replayError(err)
+		} else {
+			committedStatus = resp.StatusCode
+			_, drainErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+			if drainErr != nil {
+				originalOutcome = replayError(drainErr)
+			}
+			_ = resp.Body.Close()
+			markUsable()
+		}
+		if originalOutcome != "" && originalOutcome != "timeout" {
+			originalOutcome = "transport_error"
+		}
+		p.recordOriginal(gen, rule.ID, mode, committedStatus, originalOutcome)
+		defer p.replays(r, body, seq, gen, rule, params, originalOutcome, committedStatus)
+		markApplied()
+		if fault.String(params, "client_result", "gateway_timeout") == "reset" {
+			end = "rst"
+			if r.ProtoMajor == 2 {
+				p.outcome(gen, Outcome{Seq: seq, Reset: true})
+				if meta.Tap != nil && streamID != 0 {
+					meta.Tap.Reset(streamID, 2)
+				}
+				panic(http.ErrAbortHandler)
+			}
+			resetWriter(w, func() { p.outcome(gen, Outcome{Seq: seq, Reset: true}) })
+			return
+		}
+		status = http.StatusGatewayTimeout
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		const timeoutBody = "glitchdeck: simulated sender timeout after upstream commit"
+		w.Header().Set("Content-Length", strconv.Itoa(len(timeoutBody)))
+		w.WriteHeader(status)
+		count, _ := io.WriteString(w, timeoutBody)
+		n = int64(count)
+		_ = http.NewResponseController(w).Flush()
+		return
+	}
 	if err != nil {
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		status, end = 502, "upstream_error"
@@ -952,7 +1030,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch kind {
 	case "dup-webhook":
-		if buffered && p.replays(r, body, seq, gen, rule, params, transport) {
+		if buffered && mode == "sequential" && p.replays(r, body, seq, gen, rule, params, "", 0) {
 			markApplied()
 		}
 	case "tcp-rst":
@@ -1332,59 +1410,4 @@ func resetResponse(w http.ResponseWriter, resp *http.Response, method string, n 
 	}
 	result(copyErr)
 	return count
-}
-func (p *Proxy) replays(r *http.Request, body []byte, seq, gen uint64, rule *fault.Rule, params map[string]any, transport *http.Transport) bool {
-	count := fault.Int(params, "count", 2)
-	delay := fault.Int(params, "delay_ms", 150)
-	p.mu.Lock()
-	if p.closed || p.ctx.Err() != nil || gen != p.generation {
-		p.mu.Unlock()
-		return false
-	}
-	ctx := p.ctx
-	started := false
-	var replayErr error
-	for i := 1; i < count; i++ {
-		if p.pending >= 64 {
-			replayErr = errors.New("webhook replay capacity exceeded")
-			break
-		}
-		q := p.upstream(r, body, ctx)
-		if q == nil || !p.allowed(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port())) {
-			replayErr = errors.New("webhook replay egress denied")
-			break
-		}
-		p.beginPendingLocked()
-		started = true
-		if fault.Bool(params, "replay_header", false) {
-			q.Header.Set("X-Glitchdeck-Replay", strconv.Itoa(i))
-		}
-		go func(index int) {
-			defer p.finishPending()
-			if !wait(ctx, time.Duration(index)*time.Duration(delay)*time.Millisecond) {
-				return
-			}
-			replayCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-			start := time.Now()
-			resp, err := transport.RoundTrip(q.WithContext(replayCtx))
-			status := 0
-			var n int64
-			if err == nil {
-				status = resp.StatusCode
-				n, err = io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-			}
-			if err != nil && ctx.Err() == nil {
-				p.outcome(gen, Outcome{Seq: seq, Err: err})
-			}
-			p.publish(gen, "http_req", map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "rule_id": rule.ID, "applied": true, "replay_index": index})
-		}(i)
-	}
-	p.mu.Unlock()
-	if replayErr != nil {
-		p.outcome(gen, Outcome{Seq: seq, Err: replayErr})
-		p.publish(gen, "http_req", map[string]any{"seq": seq, "fault": "dup-webhook", "rule_id": rule.ID, "applied": false, "error": replayErr.Error()})
-	}
-	return started
 }

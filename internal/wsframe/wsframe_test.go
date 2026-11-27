@@ -2,6 +2,7 @@ package wsframe
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -24,6 +25,29 @@ func TestRejectInvalidFrame(t *testing.T) {
 	for _, wire := range [][]byte{{0xc1, 0}, {0x89, 126, 0, 126}, {0x81, 0x80, 0, 0, 0, 0}} {
 		if _, err := Read(bytes.NewReader(wire), false); err == nil {
 			t.Fatalf("accepted %x", wire)
+		}
+	}
+}
+func TestReadIncompleteFrame(t *testing.T) {
+	for _, tc := range []struct {
+		wire   []byte
+		masked bool
+		want   error
+	}{
+		{nil, false, io.EOF},
+		{[]byte{0x81}, false, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 126}, false, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 126, 0}, false, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 127}, false, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 127, 0, 0, 0}, false, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 0x80}, true, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 0x80, 1, 2}, true, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 1}, false, io.ErrUnexpectedEOF},
+		{[]byte{0x81, 2, 'a'}, false, io.ErrUnexpectedEOF},
+	} {
+		_, err := Read(bytes.NewReader(tc.wire), tc.masked)
+		if err != tc.want {
+			t.Errorf("wire %x: got %v, want %v", tc.wire, err, tc.want)
 		}
 	}
 }

@@ -1,0 +1,15 @@
+version: 2
+name: ws-heartbeat-immune-close
+target: demo
+rules:
+  - id: close-3rd-data
+    enabled: true
+    match: {path_prefix: /ws/ticker}
+    fault: {type: ws-glitch, params: {dir: s2c, action: close_1006, frames: data, after_frames: 3}}
+script:
+  - name: ticker-with-heartbeat
+    ws: {path: "/ws/ticker?heartbeat=1", frames: 2, timeout_ms: 3000}
+assertions:
+  - name: received-both-messages
+    http_get: /api/state
+    json_eq: {ws_broken: false}

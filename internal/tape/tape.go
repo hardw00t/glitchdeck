@@ -421,9 +421,11 @@ func Run(ctx context.Context, t Tape, targetOverride string) ([]Result, error) {
 }
 
 type RunReport struct {
-	RequestsTotal uint64
-	Rules         map[string]proxy.RuleStats
-	AppliedFaults []proxy.AppliedFault
+	RequestsTotal      uint64
+	Rules              map[string]proxy.RuleStats
+	AppliedFaults      []proxy.AppliedFault
+	FrameErrors        []proxy.FrameErrorEntry
+	FrameErrorsOmitted uint64
 }
 
 func RunWithReport(ctx context.Context, t Tape, targetOverride string) ([]Result, RunReport, error) {
@@ -512,10 +514,14 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		return nil, err
 	}
 	p := proxy.New(u, fault.Config{Seed: t.Seed, Rules: t.Rules}, telemetry.New())
+	var frameErrors proxy.FrameErrorLog
 	defer func() {
+		p.Close()
+		_ = p.Wait(context.Background())
 		report.Rules = p.Stats()
 		report.RequestsTotal = p.RequestsTotal()
 		report.AppliedFaults = p.AppliedFaults()
+		report.FrameErrors, report.FrameErrorsOmitted = frameErrors.Snapshot()
 	}()
 	p.SetOptions(proxy.Options{CA: ca, UpstreamCA: upstreamRoots, UpstreamAllow: t.UpstreamAllow, TLSPassthrough: t.TLSPassthrough, Demo: isDemo, RequireUpstreamAllow: true})
 	var outcomeMu sync.Mutex
@@ -532,6 +538,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 	}
 	outcomes := map[uint64]*outcome{}
 	p.OnOutcome = func(o proxy.Outcome) {
+		frameErrors.Observe(o)
 		outcomeMu.Lock()
 		defer outcomeMu.Unlock()
 		prev := outcomes[o.Seq]
@@ -588,7 +595,6 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		return outcome{}
 	}
 	p.SetSeq(t.StartSeq)
-	defer p.Close()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err

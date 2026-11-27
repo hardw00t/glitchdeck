@@ -6,18 +6,64 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/wsframe"
 )
+
+type FrameError struct {
+	Code      string
+	Detail    string
+	Declared  uint64
+	Direction string
+}
+
+func (e *FrameError) Error() string { return e.Detail }
+
+var errWSRead = errors.New("websocket read failed")
+var errWSReadTimeout = errors.New("websocket read failed")
+
+type wsWriter struct {
+	mu     sync.Mutex
+	conn   net.Conn
+	masked bool
+	closed bool
+}
+
+func (w *wsWriter) write(f wsframe.Frame) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return net.ErrClosed
+	}
+	err := wsframe.Write(w.conn, f, w.masked)
+	if f.Opcode == 8 {
+		var protocol *wsframe.ErrProtocol
+		if !errors.As(err, &protocol) {
+			w.closed = true
+		}
+	}
+	return err
+}
+
+func (w *wsWriter) truncate(b []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.closed {
+		_, _ = w.conn.Write(b)
+	}
+}
 
 func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, match fault.Query) {
 	seq := match.Seq
@@ -146,8 +192,12 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	stop()
 	done := make(chan struct{})
 	var once sync.Once
-	closeBoth := func(action string) {
+	var terminal sync.Mutex
+	var failing atomic.Bool
+	var closingState atomic.Bool
+	closeNow := func(action string) {
 		once.Do(func() {
+			cancel()
 			if action != "" {
 				p.outcome(gen, Outcome{Seq: seq, WSAction: action})
 				rst(client)
@@ -156,9 +206,16 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 				client.Close()
 				up.Close()
 			}
-			cancel()
 			close(done)
 		})
+	}
+	closeBoth := func(action string) {
+		terminal.Lock()
+		defer terminal.Unlock()
+		if failing.Load() {
+			return
+		}
+		closeNow(action)
 	}
 	go func() {
 		select {
@@ -171,25 +228,64 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	var closing sync.Once
 	beginClose := func() {
 		closing.Do(func() {
+			closingState.Store(true)
 			_ = client.SetDeadline(time.Now().Add(time.Second))
 			_ = up.SetDeadline(time.Now().Add(time.Second))
 			timer := time.AfterFunc(time.Second, func() { closeBoth("") })
 			context.AfterFunc(ctx, func() { timer.Stop() })
 		})
 	}
+	clientWriter := &wsWriter{conn: client}
+	upWriter := &wsWriter{conn: up, masked: true}
+	var failed sync.Once
+	fail := func(dir, code string, err error) {
+		if closingState.Load() && err == errWSReadTimeout {
+			return
+		}
+		failing.Store(true)
+		terminal.Lock()
+		defer terminal.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		failed.Do(func() {
+			deadline := time.Now().Add(time.Second)
+			_ = client.SetWriteDeadline(deadline)
+			_ = up.SetWriteDeadline(deadline)
+			frameErr := &FrameError{Code: code, Detail: err.Error(), Direction: dir}
+			closeCode, reason := uint16(1002), "glitchdeck: protocol error"
+			var large *wsframe.ErrFrameTooLarge
+			if errors.As(err, &large) {
+				frameErr.Code, frameErr.Declared = "frame_too_large", large.Declared
+				closeCode, reason = 1009, "glitchdeck: frame exceeds 4 MiB proxy limit"
+			}
+			p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "dir": dir, "error": frameErr.Code, "detail": frameErr.Detail, "declared_bytes": frameErr.Declared, "limit_bytes": wsframe.MaxPayload})
+			p.outcome(gen, Outcome{Seq: seq, Err: frameErr})
+			payload := make([]byte, 2, 2+len(reason))
+			binary.BigEndian.PutUint16(payload, closeCode)
+			payload = append(payload, reason...)
+			frame := wsframe.Frame{Fin: true, Opcode: 8, Payload: payload}
+			var closes sync.WaitGroup
+			closes.Add(2)
+			go func() { defer closes.Done(); _ = clientWriter.write(frame) }()
+			go func() { defer closes.Done(); _ = upWriter.write(frame) }()
+			closes.Wait()
+			closeNow("")
+		})
+	}
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		p.pump(ctx, buf.Reader, up, true, "c2s", gen, match, closeBoth, beginClose)
+		p.pump(ctx, buf.Reader, upWriter, true, "c2s", gen, match, closeBoth, beginClose, fail)
 	}()
 	go func() {
 		defer wg.Done()
-		p.pump(ctx, reader, client, false, "s2c", gen, match, closeBoth, beginClose)
+		p.pump(ctx, reader, clientWriter, false, "s2c", gen, match, closeBoth, beginClose, fail)
 	}()
 	wg.Wait()
 	closeBoth("")
 }
-func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bool, dir string, gen uint64, match fault.Query, closeBoth func(string), beginClose func()) {
+func (p *Proxy) pump(ctx context.Context, src io.Reader, dst *wsWriter, masked bool, dir string, gen uint64, match fault.Query, closeBoth func(string), beginClose func(), fail func(string, string, error)) {
 	seq := match.Seq
 	normalClose := false
 	defer func() {
@@ -197,12 +293,25 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			closeBoth("")
 		}
 	}()
-	var frameSeq uint64
+	var frameSeq, dataSeq, controlSeq uint64
 	var messageSeq uint64
 	fragmented := false
 	for {
 		f, err := wsframe.Read(src, masked)
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				var protocol *wsframe.ErrProtocol
+				var large *wsframe.ErrFrameTooLarge
+				if !errors.As(err, &protocol) && !errors.As(err, &large) {
+					var timeout net.Error
+					if errors.As(err, &timeout) && timeout.Timeout() {
+						err = errWSReadTimeout
+					} else {
+						err = errWSRead
+					}
+				}
+				fail(dir, "protocol_error", err)
+			}
 			return
 		}
 		if (f.Opcode == 2 || f.Opcode == 0 || !f.Fin) && p.OnUnsupportedFrame != nil {
@@ -210,6 +319,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 		}
 		if f.Opcode == 0 {
 			if !fragmented {
+				fail(dir, "protocol_error", &wsframe.ErrProtocol{Reason: "unexpected continuation frame"})
 				return
 			}
 			if f.Fin {
@@ -217,11 +327,20 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			}
 		} else if f.Opcode == 1 || f.Opcode == 2 {
 			if fragmented {
+				fail(dir, "protocol_error", &wsframe.ErrProtocol{Reason: "unexpected data frame"})
 				return
 			}
 			fragmented = !f.Fin
 		}
 		frameSeq++
+		data := f.Opcode == 0 || f.Opcode == 1 || f.Opcode == 2
+		class := "control"
+		if data {
+			class = "data"
+			dataSeq++
+		} else {
+			controlSeq++
+		}
 		if dir == "c2s" && f.Opcode == 1 && f.Fin && p.OnClientFrame != nil {
 			p.callback(gen, func() { p.OnClientFrame(seq, f.Payload) })
 		}
@@ -232,12 +351,20 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 		if rule != nil {
 			params = rule.Fault.Params
 			direction := fault.String(params, "dir", "both")
+			selected := fault.String(params, "frames", "all")
+			selectedSeq := frameSeq
+			if selected == "data" {
+				selectedSeq = dataSeq
+			}
+			if selected == "control" {
+				selectedSeq = controlSeq
+			}
 			after := fault.Int(params, "after_frames", 1)
 			if after < 1 {
 				after = 1
 			}
 			every := fault.Int(params, "every", 1)
-			if (direction == "both" || direction == dir) && frameSeq >= uint64(after) && (frameSeq-uint64(after))%uint64(every) == 0 {
+			if (selected == "all" || selected == class) && (direction == "both" || direction == dir) && selectedSeq >= uint64(after) && (selectedSeq-uint64(after))%uint64(every) == 0 {
 				action = fault.String(params, "action", "drop")
 				ruleID = rule.ID
 				p.countRule(gen, rule, "matched", "")
@@ -254,8 +381,7 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 				preview = string(snippet)
 			}
 		}
-		p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "frame_seq": frameSeq, "ts_ms": time.Now().UnixMilli(), "dir": dir, "opcode": f.Opcode, "bytes": len(f.Payload), "fault": action, "fault_type": "ws-glitch", "rule_id": ruleID, "applied": action != "", "action": action, "preview": preview})
-		data := f.Opcode == 0 || f.Opcode == 1 || f.Opcode == 2
+		p.publish(gen, "ws_frame", map[string]any{"conn_id": seq, "frame_seq": frameSeq, "data_seq": dataSeq, "control_seq": controlSeq, "class": class, "ts_ms": time.Now().UnixMilli(), "dir": dir, "opcode": f.Opcode, "bytes": len(f.Payload), "fault": action, "fault_type": "ws-glitch", "rule_id": ruleID, "applied": action != "", "action": action, "preview": preview})
 		switch action {
 		case "drop":
 			if dir == "s2c" && data {
@@ -291,15 +417,18 @@ func (p *Proxy) pump(ctx context.Context, src io.Reader, dst net.Conn, masked bo
 			if count > len(f.Payload) {
 				count = len(f.Payload)
 			}
-			_, _ = dst.Write(wire[:header+count])
+			dst.truncate(wire[:header+count])
 			closeBoth(action)
 			return
 		}
 		if f.Opcode == 8 {
 			beginClose()
 		}
-		if wsframe.Write(dst, f, masked) != nil {
-			closeBoth("")
+		if err := dst.write(f); err != nil {
+			var protocol *wsframe.ErrProtocol
+			if action == "corrupt" && errors.As(err, &protocol) {
+				fail(dir, "invalid_after_fault", err)
+			}
 			return
 		}
 		if dir == "s2c" && data && f.Fin {

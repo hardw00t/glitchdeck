@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -41,6 +42,7 @@ type Options struct {
 type RuleStats struct {
 	Matched, Applied, Skipped uint64
 	SkipReasons               map[string]uint64
+	Replays                   *ReplayStats
 }
 
 func (s *RuleStats) skip(reason string) {
@@ -51,9 +53,24 @@ func (s *RuleStats) skip(reason string) {
 	s.SkipReasons[reason]++
 }
 
+type ReplayStats struct {
+	Mode            string                  `json:"mode"`
+	Sent            uint64                  `json:"sent"`
+	Status          map[string]uint64       `json:"status"`
+	Outcomes        map[string]uint64       `json:"outcomes"`
+	MaxSkewMS       *int64                  `json:"max_skew_ms,omitempty"`
+	CommittedStatus int                     `json:"committed_status,omitempty"`
+	OriginalOutcome string                  `json:"original_outcome,omitempty"`
+	ByMode          map[string]*ReplayStats `json:"by_mode,omitempty"`
+}
+
+type appliedKey struct{ RuleID, Type string }
+
 type AppliedFault struct {
 	RuleID, Type string
 	Count        uint64
+	Replays      *ReplayStats
+	SkipReasons  map[string]uint64
 }
 
 func (p *Proxy) AppliedFaults() []AppliedFault {
@@ -61,7 +78,12 @@ func (p *Proxy) AppliedFaults() []AppliedFault {
 	defer p.mu.Unlock()
 	out := make([]AppliedFault, 0, len(p.applied))
 	for key, count := range p.applied {
-		out = append(out, AppliedFault{RuleID: key.RuleID, Type: key.Type, Count: count})
+		item := AppliedFault{RuleID: key.RuleID, Type: key.Type, Count: count}
+		if key.Type == "dup-webhook" {
+			item.Replays = cloneReplay(p.stats[key.RuleID].Replays)
+		}
+		item.SkipReasons = cloneReasons(p.stats[key.RuleID].SkipReasons)
+		out = append(out, item)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].RuleID < out[j].RuleID || out[i].RuleID == out[j].RuleID && out[i].Type < out[j].Type
@@ -95,6 +117,7 @@ func (p *Proxy) Stats() map[string]RuleStats {
 	out := make(map[string]RuleStats, len(p.stats))
 	for k, v := range p.stats {
 		v.SkipReasons = cloneReasons(v.SkipReasons)
+		v.Replays = cloneReplay(v.Replays)
 		out[k] = v
 	}
 	return out
@@ -106,6 +129,34 @@ func cloneReasons(in map[string]uint64) map[string]uint64 {
 		out[k] = v
 	}
 	return out
+}
+
+func cloneReplay(in *ReplayStats) *ReplayStats {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Status = cloneReasons(in.Status)
+	out.Outcomes = cloneReasons(in.Outcomes)
+	if in.MaxSkewMS != nil {
+		v := *in.MaxSkewMS
+		out.MaxSkewMS = &v
+	}
+	if len(in.ByMode) != 0 {
+		out.ByMode = make(map[string]*ReplayStats, len(in.ByMode))
+		for _, mode := range slices.Sorted(maps.Keys(in.ByMode)) {
+			stats := cloneReplay(in.ByMode[mode])
+			out.ByMode[mode] = stats
+			out.Sent += stats.Sent
+			for _, code := range slices.Sorted(maps.Keys(stats.Status)) {
+				out.addStatus(code, stats.Status[code])
+			}
+			for outcome, count := range stats.Outcomes {
+				out.Outcomes[outcome] += count
+			}
+		}
+	}
+	return &out
 }
 
 func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) {
@@ -121,9 +172,9 @@ func (p *Proxy) countRule(gen uint64, rule *fault.Rule, kind, reason string) {
 		v.Matched++
 	case "applied":
 		if p.applied == nil {
-			p.applied = make(map[AppliedFault]uint64)
+			p.applied = make(map[appliedKey]uint64)
 		}
-		p.applied[AppliedFault{RuleID: rule.ID, Type: rule.Fault.Type}]++
+		p.applied[appliedKey{RuleID: rule.ID, Type: rule.Fault.Type}]++
 		v.Applied++
 	case "skipped":
 		v.skip(reason)
@@ -208,6 +259,8 @@ func restrictedEgress(ip netip.Addr) bool {
 	return !ip.IsValid() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
+var errEgressDenied = errors.New("egress denied")
+
 func (p *Proxy) restrictEgressLocked(ctx context.Context) bool {
 	if p.options.AllowLoopbackEgress {
 		return false
@@ -241,7 +294,7 @@ func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restri
 	}
 	reverseTarget := ctx.Value(reverseTargetKey{}) == true && p.target != nil && !p.options.RequireUpstreamAllow && strings.EqualFold(host, p.target.Hostname()) && port == upstreamPort(p.target.Scheme, p.target.Port())
 	if !p.allowed(host, port) && !reverseTarget {
-		return nil, errors.New("egress denied")
+		return nil, errEgressDenied
 	}
 	// The operator-configured reverse target is reachable on any listener; clients
 	// cannot choose it, so exposing the proxy does not turn it into an open relay.
@@ -257,7 +310,7 @@ func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restri
 			}
 			ip, err := netip.ParseAddr(host)
 			if err != nil || restrictedEgress(ip) {
-				return errors.New("egress denied")
+				return errEgressDenied
 			}
 			return nil
 		}

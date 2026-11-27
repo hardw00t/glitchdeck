@@ -1,0 +1,10 @@
+version: 2
+name: your-app-stripe-timeout-retry
+target: http://127.0.0.1:3000
+rules:
+  - id: commit-then-timeout
+    enabled: true
+    match: {method: POST, path_prefix: /webhooks/stripe, seq: [1]}
+    fault: {type: dup-webhook, params: {mode: timeout_retry, count: 2, delay_ms: 500, replay_timeout_ms: 10000, client_result: gateway_timeout}}
+expect:
+  faults: [{rule: commit-then-timeout, min_applied: 1}]

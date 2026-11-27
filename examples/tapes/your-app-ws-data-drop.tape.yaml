@@ -1,0 +1,10 @@
+version: 2
+name: your-app-ws-data-drop
+target: http://127.0.0.1:3000
+rules:
+  - id: drop-data
+    enabled: true
+    match: {path_prefix: /ws}
+    fault: {type: ws-glitch, params: {dir: s2c, action: drop, frames: data, after_frames: 5, every: 1000}}
+expect:
+  faults: [{rule: drop-data, min_applied: 1}]

@@ -124,16 +124,18 @@ These tapes close cleanly after three events. **Your SDK may not raise:** in [lo
 
 Tool argument corruption re-marshals JSON, so object key order may change; compare normalized JSON. Gemini `functionCall.args` is an object, not streamed argument strings, and is not corrupted (`no_tool_args`). Matched gzip and deflate SSE streams are decoded and sent as identity; unsupported encodings such as br pass through unchanged and skip the SSE fault.
 
-### Duplicate Stripe webhook
+### Stripe/webhook idempotency
 
 Run against a local endpoint accepting this test payload; use a valid signed fixture if signature verification is enabled:
 
 ```sh
-glitchdeck exec --tape examples/tapes/your-app-stripe-dup-webhook.tape.yaml --json -- sh -c '
+glitchdeck exec --tape examples/tapes/your-app-stripe-concurrent-race.tape.yaml --json -- sh -c '
   curl -q -fsS -H "Content-Type: application/json" -d '\''{"id":"evt_test_1","type":"payment_intent.succeeded"}'\'' "$GLITCHDECK_PROXY_URL/webhooks/stripe"'
 ```
 
-The proxy replays the same POST; assert in your app's tests that the event produces only one charge or other side effect.
+- **Concurrent delivery:** `mode: concurrent` starts the original and four copies together. Use it to test whether a check-then-insert handler can process the same event twice.
+- **Commit then retry:** switch to `examples/tapes/your-app-stripe-timeout-retry.tape.yaml`. Change curl's `-fsS` to `-sS -w "\nHTTP %{http_code}\n"` to observe the injected `504`. The original reaches the receiver before the timeout response; the same event is then retried.
+- **Read the report and check the database:** `faults_triggered[].replays.status` counts copy responses and `outcomes` groups their results. Across all five deliveries, five `200`s and five rows means duplicate processing; one `200` and four `409`s, or five `200`s and one row, means deduplication. The replay histogram excludes the original.
 
 ### WebSocket silent drop
 
@@ -145,7 +147,7 @@ glitchdeck exec --tape examples/tapes/your-app-ws-drop-1006.tape.yaml --timeout 
   ws.onclose = e => { console.log("close code:", e.code); process.exit(e.code === 1006 ? 0 : 1); };'
 ```
 
-Change `after_frames` in the tape to choose when to drop the connection, then use your mobile client to test reconnect and backoff.
+Set `frames: data` and choose `after_frames` to count data frames without touching Close, Ping, or Pong; `all` remains the default. For a frame-drop example, see `examples/tapes/your-app-ws-data-drop.tape.yaml`. Oversized frames get Close `1009` (4 MiB limit) and malformed frames get Close `1002`; both appear in `ws_frame` events and reports. An intentional `close_1006` still simulates a silent disconnect.
 
 ### gRPC deadline and HTTP/2 reset
 
@@ -198,11 +200,11 @@ args = ["mcp"]
 | Fault | Behavior |
 | --- | --- |
 | `tcp-rst` | Reset the TCP connection before headers or after a byte budget |
-| `dup-webhook` | Replay a request after a configured delay |
+| `dup-webhook` | Replay a buffered request in staggered (`sequential`), simultaneous (`concurrent`), or commit-then-retry (`timeout_retry`) mode |
 | `rate-limit` | Return a status and `Retry-After`; `provider`, `retry_after_ms`, `reset_sec`, and `burst` add provider envelopes and retry-storm behavior |
 | `byte-trickle` | Pace response chunks and optionally stall once |
 | `latency-wave` | Add seeded sine, spike, or jitter delay |
-| `ws-glitch` | Drop, delay, corrupt, truncate, or abnormally close frames |
+| `ws-glitch` | Drop, delay, corrupt, truncate, or abnormally close `data`, `control`, or `all` frames |
 | `sse-glitch` | Stall, drop, truncate, corrupt JSON or tool arguments (`corrupt_tool_args`), inject provider errors (`inject_error`), or close before a terminator; `done_events` adds custom terminal names |
 | `h2-glitch` | Send RST_STREAM or GOAWAY with a selected error code |
 | `grpc-glitch` | Return an injected gRPC status before or after response messages |

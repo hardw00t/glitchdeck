@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,19 +88,21 @@ type Assertion struct {
 	Failures []string `json:"failures"`
 }
 type Envelope struct {
-	SchemaVersion   int         `json:"schema_version"`
-	Command         string      `json:"command"`
-	OK              bool        `json:"ok"`
-	ExitCode        int         `json:"exit_code"`
-	Tape            string      `json:"tape"`
-	Target          string      `json:"target"`
-	DurationMS      int64       `json:"duration_ms"`
-	Summary         Summary     `json:"summary"`
-	FaultsTriggered []any       `json:"faults_triggered"`
-	Assertions      []Assertion `json:"assertions"`
-	Diff            []string    `json:"diff"`
-	Exec            *Exec       `json:"exec,omitempty"`
-	Error           any         `json:"error"`
+	SchemaVersion      int                     `json:"schema_version"`
+	Command            string                  `json:"command"`
+	OK                 bool                    `json:"ok"`
+	ExitCode           int                     `json:"exit_code"`
+	Tape               string                  `json:"tape"`
+	Target             string                  `json:"target"`
+	DurationMS         int64                   `json:"duration_ms"`
+	Summary            Summary                 `json:"summary"`
+	FaultsTriggered    []any                   `json:"faults_triggered"`
+	FrameErrors        []proxy.FrameErrorEntry `json:"frame_errors,omitempty"`
+	FrameErrorsOmitted uint64                  `json:"frame_errors_omitted,omitempty"`
+	Assertions         []Assertion             `json:"assertions"`
+	Diff               []string                `json:"diff"`
+	Exec               *Exec                   `json:"exec,omitempty"`
+	Error              any                     `json:"error"`
 }
 
 func NewEnvelope(command, path, target string) Envelope {
@@ -207,6 +210,8 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		hosts.observe(event)
 	})
 	p := proxy.New(parsed, fault.Config{Seed: seed, Rules: t.Rules}, bus)
+	var frameErrors proxy.FrameErrorLog
+	p.OnOutcome = frameErrors.Observe
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
 	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), TLSPassthrough: append(append([]string{}, t.TLSPassthrough...), o.TLSPassthrough...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress}
@@ -243,6 +248,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	opts.OnReset = func() {
 		tlsFailures.reset()
 		hosts.reset()
+		frameErrors.Reset()
 	}
 	var system, sslCerts []byte
 	if o.TLS || o.UpstreamCA != "" || os.Getenv("SSL_CERT_FILE") != "" || os.Getenv("SSL_CERT_DIR") != "" {
@@ -528,6 +534,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	e.Summary.RequestsTotal = p.RequestsTotal()
 	e.SetAppliedFaults(p.AppliedFaults())
+	e.FrameErrors, e.FrameErrorsOmitted = frameErrors.Snapshot()
 	e.Exec.TLSHandshakeFailureCount, e.Exec.TLSHandshakeFailures = tlsFailures.snapshot()
 	e.Exec.TLSHandshakeFailuresOmitted = e.Exec.TLSHandshakeFailureCount - uint64(len(e.Exec.TLSHandshakeFailures))
 	e.Exec.Traffic = childStats
@@ -579,7 +586,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		} else if (childStats.InterceptedEmpty > 0 || childStats.InterceptedOK > 0 && childStats.InnerRequests == 0) && !innerOK && childStats.PassthroughOK+childStats.BlindOK == 0 {
 			e.Diff = append(e.Diff, "no_usable_traffic: intercepted CONNECT closed without usable application traffic; check client proxy configuration and CA trust")
 			failed = true
-		} else if len(childFaults) == 0 && len(t.Rules)+len(t.ConfigChanges) != 0 {
+		} else if !slices.ContainsFunc(childFaults, func(f proxy.AppliedFault) bool { return f.Count != 0 }) && len(t.Rules)+len(t.ConfigChanges) != 0 {
 			rules := make(map[string]bool)
 			for _, rule := range t.Rules {
 				if rule.Enabled {
