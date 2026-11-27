@@ -152,8 +152,11 @@ func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn st
 		tc := tls.Server(conn, &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			NextProtos: protocols,
-			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
 				serverName = info.ServerName
+				return nil, nil
+			},
+			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 				name := info.ServerName
 				if name == "" {
 					name = host

@@ -16,6 +16,30 @@ type evidenceKey struct {
 	method, path, host string
 }
 
+type tlsFailureEvidence struct {
+	mu      sync.Mutex
+	count   uint64
+	details []json.RawMessage
+}
+
+func (c *tlsFailureEvidence) observe(e telemetry.Event) {
+	if e.Type != "tls_handshake_failed" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.count++
+	if len(c.details) < 100 && len(e.Data) <= 4096 {
+		c.details = append(c.details, e.Data)
+	}
+}
+
+func (c *tlsFailureEvidence) snapshot() (uint64, []json.RawMessage) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.count, append([]json.RawMessage(nil), c.details...)
+}
+
 type assertionEvidence struct {
 	mu       sync.Mutex
 	limits   map[evidenceKey]int

@@ -70,7 +70,7 @@ The checkout regression tape exits `1` and reports `duplicate_charges: expected 
 
 `exec` injects `GLITCHDECK_PROXY_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and lowercase variants. The `NO_PROXY` list includes the proxy's own host and port. Point a client's base URL at `GLITCHDECK_PROXY_URL` to use reverse mode, including with Go clients that bypass environment proxies for loopback. `exec` sets `NODE_USE_ENV_PROXY=1` and, when TLS is enabled, provides temporary CA paths to supported clients. Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers the process group; detached descendants can escape. Windows cleanup is best-effort and does not guarantee stopping grandchildren.
 
-`exec` exits `1` if no child requests reach the proxy, or if the tape enables fault rules but none apply to child traffic and no fault expectation permits zero. Use `--allow-zero-traffic` to skip those two checks; explicit expectations still apply. If traffic is missing, check the client's proxy bypass and TLS CA trust. Client TLS handshake failures appear on stderr, in the wire log, and in `exec.tls_handshake_failures` in the JSON report.
+`exec` exits `1` if no child requests reach the proxy, or if the tape enables fault rules but none apply to child traffic and the enabled rules do not all explicitly permit zero. Use `--allow-zero-traffic` to skip those two checks; explicit fault counts still apply to child traffic only. If traffic is missing, check proxy bypass and TLS CA trust. Client TLS handshake failures appear on stderr and in the wire log; `exec.tls_handshake_failure_count` counts them even if report details are omitted.
 
 | Exit | Meaning |
 | --- | --- |

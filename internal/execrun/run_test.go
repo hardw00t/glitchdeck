@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -437,7 +438,90 @@ func TestExecReportsTLSHandshakeFailure(t *testing.T) {
 		TLS: true, JSON: true, Command: []string{os.Args[0], "-test.run=^TestExecReportsTLSHandshakeFailure$"},
 	})
 	if r.ExitCode != 0 || len(r.Diff) != 0 || len(r.Exec.TLSHandshakeFailures) != 1 ||
+		r.Exec.TLSHandshakeFailureCount != 1 || r.Exec.TLSHandshakeFailuresOmitted != 0 ||
 		!strings.Contains(string(r.Exec.TLSHandshakeFailures[0]), "bad certificate") {
 		t.Fatalf("missing TLS failure in report: %+v", r)
+	}
+}
+
+func TestExecFaultExpectationsUseChildTrafficOnly(t *testing.T) {
+	if os.Getenv("GD_FAULT_CHILD") == "1" {
+		resp, err := http.Get(os.Getenv("GLITCHDECK_PROXY_URL") + "/api/state")
+		if err != nil {
+			os.Exit(9)
+		}
+		resp.Body.Close()
+		return
+	}
+	t.Setenv("GD_FAULT_CHILD", "1")
+	zero, one := uint64(0), uint64(1)
+	rules := []fault.Rule{
+		{ID: "optional", Enabled: true, Match: fault.Match{PathPrefix: "/optional"}, Fault: fault.Fault{Type: "rate-limit"}},
+		{ID: "required", Enabled: true, Match: fault.Match{PathPrefix: "/required"}, Fault: fault.Fault{Type: "rate-limit"}},
+	}
+	for _, tc := range []struct {
+		name     string
+		min, max *uint64
+		want     int
+	}{
+		{"minimum", &one, nil, 1}, {"maximum", nil, &zero, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tp := tape.Tape{Version: 2, Target: "demo", Rules: rules,
+				Assertions: []tape.Assertion{{Name: "probe", HTTPGet: "/required", ExpectStatus: 429}},
+				Expect:     tape.Expect{Faults: []tape.FaultExpect{{Rule: "optional", MinApplied: &zero}, {Rule: "required", MinApplied: tc.min, MaxApplied: tc.max}}}}
+			r := Run(context.Background(), tp, Options{Command: []string{os.Args[0], "-test.run=^TestExecFaultExpectationsUseChildTrafficOnly$"}, JSON: true})
+			if r.ExitCode != tc.want || r.Summary.FaultsTriggered != 1 {
+				t.Fatalf("unexpected result: %+v", r)
+			}
+		})
+	}
+}
+
+func TestTLSFailureEvidenceSurvivesHistoryEvictionAndIsBounded(t *testing.T) {
+	bus := telemetry.New()
+	var failures tlsFailureEvidence
+	bus.SetObserver(failures.observe)
+	for range 110 {
+		bus.Publish("tls_handshake_failed", map[string]string{"error": "rejected"})
+	}
+	bus.Publish("tls_handshake_failed", map[string]string{"error": strings.Repeat("x", 5000)})
+	for range 4100 {
+		bus.Publish("http_req", nil)
+	}
+	count, details := failures.snapshot()
+	if count != 111 || len(details) != 100 {
+		t.Fatalf("count=%d details=%d", count, len(details))
+	}
+}
+
+func TestExecWaitTimeoutSkipsAssertions(t *testing.T) {
+	if os.Getenv("GD_WAIT_CHILD") == "1" {
+		resp, err := http.Get(os.Getenv("GLITCHDECK_PROXY_URL") + "/slow")
+		if err != nil {
+			os.Exit(9)
+		}
+		resp.Body.Close()
+		return
+	}
+	var slow atomic.Int32
+	var probes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			slow.Add(1)
+		} else {
+			probes.Add(1)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("GD_WAIT_CHILD", "1")
+	t.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
+	tp := tape.Tape{Version: 2, Target: srv.URL, Rules: []fault.Rule{{ID: "dup", Enabled: true, Match: fault.Match{PathPrefix: "/slow"}, Fault: fault.Fault{Type: "dup-webhook", Params: map[string]any{"delay_ms": 500}}}}, Assertions: []tape.Assertion{{Name: "probe", HTTPGet: "/probe", ExpectStatus: 200}}}
+	r := Run(context.Background(), tp, Options{Command: []string{os.Args[0], "-test.run=^TestExecWaitTimeoutSkipsAssertions$"}, JSON: true, Grace: 50 * time.Millisecond, AllowLoopbackEgress: true})
+	if slow.Load() != 1 {
+		t.Fatalf("slow requests = %d", slow.Load())
+	}
+	if r.ExitCode != 3 || probes.Load() != 0 {
+		t.Fatalf("exit=%d probes=%d result=%+v", r.ExitCode, probes.Load(), r)
 	}
 }

@@ -55,16 +55,18 @@ type Options struct {
 	Seed                *uint64
 }
 type Exec struct {
-	Cmd                  []string          `json:"cmd"`
-	ProxyURL             string            `json:"proxy_url"`
-	UIURL                string            `json:"ui_url,omitempty"`
-	ExitCode             int               `json:"exit_code"`
-	TimedOut             bool              `json:"timed_out"`
-	StdoutTail           string            `json:"stdout_tail"`
-	StderrTail           string            `json:"stderr_tail"`
-	PID                  int               `json:"pid,omitempty"`
-	LeakedPIDs           []int             `json:"leaked_pids"`
-	TLSHandshakeFailures []json.RawMessage `json:"tls_handshake_failures,omitempty"`
+	Cmd                         []string          `json:"cmd"`
+	ProxyURL                    string            `json:"proxy_url"`
+	UIURL                       string            `json:"ui_url,omitempty"`
+	ExitCode                    int               `json:"exit_code"`
+	TimedOut                    bool              `json:"timed_out"`
+	StdoutTail                  string            `json:"stdout_tail"`
+	StderrTail                  string            `json:"stderr_tail"`
+	PID                         int               `json:"pid,omitempty"`
+	LeakedPIDs                  []int             `json:"leaked_pids"`
+	TLSHandshakeFailures        []json.RawMessage `json:"tls_handshake_failures,omitempty"`
+	TLSHandshakeFailureCount    uint64            `json:"tls_handshake_failure_count,omitempty"`
+	TLSHandshakeFailuresOmitted uint64            `json:"tls_handshake_failures_omitted,omitempty"`
 }
 type Summary struct {
 	AssertionsTotal  int    `json:"assertions_total"`
@@ -189,7 +191,11 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	bus := telemetry.New()
 	evidence := newAssertionEvidence(t)
-	bus.SetObserver(evidence.observe)
+	var tlsFailures tlsFailureEvidence
+	bus.SetObserver(func(event telemetry.Event) {
+		evidence.observe(event)
+		tlsFailures.observe(event)
+	})
 	p := proxy.New(parsed, fault.Config{Seed: seed, Rules: t.Rules}, bus)
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
@@ -464,29 +470,32 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			proxyAssertions = proxyAssertions || !a.Direct
 		}
 	}
-	childFaultApplied := false
-	if !o.AllowZeroTraffic && childRequests != 0 && proxyAssertions && len(t.Rules)+len(t.ConfigChanges) != 0 {
-		// A proxy assertion must not supply the only fault on behalf of the child.
-		waitCtx, stopWait := context.WithTimeout(context.Background(), o.Grace)
-		_ = p.Wait(waitCtx)
-		stopWait()
-		childFaultApplied = len(p.AppliedFaults()) != 0
-	}
-	httpResults := assertions(ctx, httpTape, "http://"+listener.Addr().String(), target, opts.ProxyAuth, nil)
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
-	waitErr = p.Drain(drainCtx)
-	cancelDrain()
-	e.Summary.RequestsTotal = p.RequestsTotal()
-	stats := p.Stats()
-	e.SetAppliedFaults(p.AppliedFaults())
-	if !proxyAssertions {
-		childFaultApplied = e.Summary.FaultsTriggered != 0
-	}
-	for _, event := range bus.History(0) {
-		if event.Type == "tls_handshake_failed" {
-			e.Exec.TLSHandshakeFailures = append(e.Exec.TLSHandshakeFailures, event.Data)
+	defer cancelDrain()
+	var childFaults []proxy.AppliedFault
+	waitErr = nil
+	if proxyAssertions {
+		waitErr = p.Wait(drainCtx)
+		if waitErr == nil {
+			childFaults = p.AppliedFaults()
 		}
 	}
+	var httpResults []tape.Result
+	if waitErr == nil {
+		httpResults = assertions(ctx, httpTape, "http://"+listener.Addr().String(), target, opts.ProxyAuth, nil)
+	}
+	drainErr := p.Drain(drainCtx)
+	if waitErr == nil {
+		waitErr = drainErr
+	}
+	e.Summary.RequestsTotal = p.RequestsTotal()
+	allFaults := p.AppliedFaults()
+	e.SetAppliedFaults(allFaults)
+	if !proxyAssertions {
+		childFaults = allFaults
+	}
+	e.Exec.TLSHandshakeFailureCount, e.Exec.TLSHandshakeFailures = tlsFailures.snapshot()
+	e.Exec.TLSHandshakeFailuresOmitted = e.Exec.TLSHandshakeFailureCount - uint64(len(e.Exec.TLSHandshakeFailures))
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))
 	}
@@ -511,7 +520,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		if childRequests == 0 {
 			e.Diff = append(e.Diff, "zero_traffic: no requests reached the proxy; check HTTP(S)_PROXY bypass (Go ignores proxies for localhost/127.0.0.1) and CA trust")
 			failed = true
-		} else if !childFaultApplied && len(t.Rules)+len(t.ConfigChanges) != 0 {
+		} else if len(childFaults) == 0 && len(t.Rules)+len(t.ConfigChanges) != 0 {
 			rules := make(map[string]bool)
 			for _, rule := range t.Rules {
 				if rule.Enabled {
@@ -525,20 +534,26 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 					}
 				}
 			}
-			allowsZero := false
 			for _, x := range t.Expect.Faults {
-				if rules[x.Rule] && ((x.MinApplied != nil && *x.MinApplied == 0) || (x.MinApplied == nil && x.MaxApplied != nil)) {
-					allowsZero = true
+				if (x.MinApplied != nil && *x.MinApplied == 0) || (x.MinApplied == nil && x.MaxApplied != nil) {
+					delete(rules, x.Rule)
 				}
 			}
-			if len(rules) > 0 && !allowsZero {
+			if len(rules) > 0 {
 				e.Diff = append(e.Diff, "zero_faults: no faults triggered; check rule matching, proxy bypass and CA trust")
 				failed = true
 			}
 		}
 	}
+	var childCounts map[string]uint64
+	if len(t.Expect.Faults) != 0 {
+		childCounts = make(map[string]uint64, len(childFaults))
+		for _, f := range childFaults {
+			childCounts[f.RuleID] += f.Count
+		}
+	}
 	for _, x := range t.Expect.Faults {
-		n := stats[x.Rule].Applied
+		n := childCounts[x.Rule]
 		result := tape.Result{Name: "fault " + x.Rule, Failures: []string{}}
 		if x.MinApplied != nil && n < *x.MinApplied || x.MaxApplied != nil && n > *x.MaxApplied {
 			failed = true
