@@ -56,7 +56,7 @@ func TestExecForwardsChildHelp(t *testing.T) {
 	if err := os.WriteFile(path, []byte("version: 2\nname: child-help\ntarget: demo\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	code, stdout, stderr := runHelpProcess(t, "exec", "--tape", path, "--json", "--",
+	code, stdout, stderr := runHelpProcess(t, "exec", "--tape", path, "--json", "--allow-zero-traffic", "--",
 		sh, "-c", `printf 'child received %s' "$1"`, "sh", "--help")
 	if code != 0 || !strings.Contains(stdout, "child received --help") || stderr != "" {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)

@@ -23,10 +23,10 @@ func TestGitHubSummaryForTestAndExecReports(t *testing.T) {
 			return []string{"test", "../../examples/checkout-dup-webhook.tape.yaml", "--json", "--report", report}
 		}, 1, "no-duplicate-charges:", []string{"| 1 | 2 | 1 | 0 | 1 |", "- dup-pay (dup-webhook): 1", "- no-duplicate-charges: duplicate\\_charges: expected 0, got 1"}},
 		{"exec", func(report string) []string {
-			return []string{"exec", "--tape", "../../examples/tapes/your-app-openai-sse-cut.tape.yaml", "--json", "--report", report, "--", "sh", "-c", "exit 0"}
+			return []string{"exec", "--tape", "../../examples/tapes/your-app-openai-sse-cut.tape.yaml", "--json", "--report", report, "--allow-zero-traffic", "--", "sh", "-c", "exit 0"}
 		}, 0, "", []string{"| Exit code | Child exit code | Requests total | Faults triggered | Assertions passed | Assertions failed |", "| --- | --- | --- | --- | --- | --- |", "| 0 | 0 | 0 | 0 | 0 | 0 |"}},
 		{"exec failure", func(report string) []string {
-			return []string{"exec", "--tape", "../../examples/tapes/your-app-openai-sse-cut.tape.yaml", "--json", "--report", report, "--", "sh", "-c", "exit 7"}
+			return []string{"exec", "--tape", "../../examples/tapes/your-app-openai-sse-cut.tape.yaml", "--json", "--report", report, "--allow-zero-traffic", "--", "sh", "-c", "exit 7"}
 		}, 1, "child_exit: expected 0, got 7", []string{"| 1 | 7 | 0 | 0 | 0 | 0 |", "- child\\_exit: expected 0, got 7"}},
 		{"exec timeout", func(report string) []string {
 			return []string{"exec", "--tape", "../../examples/tapes/your-app-openai-sse-cut.tape.yaml", "--json", "--report", report, "--timeout", "100ms", "--", "sh", "-c", "sleep 2"}

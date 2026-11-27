@@ -12,12 +12,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/h2tap"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
 	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 	"golang.org/x/net/http2/hpack"
 )
@@ -122,6 +124,53 @@ func TestTLSInterceptNegotiatesHTTP2(t *testing.T) {
 	}
 	if res.TLS == nil || res.TLS.NegotiatedProtocol != "h2" || res.TLS.PeerCertificates[0].VerifyHostname("127.0.0.1") != nil {
 		t.Fatalf("wrong intercepted TLS identity: %+v", res.TLS)
+	}
+}
+
+func TestTLSHandshakeFailureIsReported(t *testing.T) {
+	ca, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := telemetry.New()
+	_, events, unsubscribe := bus.Subscribe()
+	defer unsubscribe()
+	p := New(nil, fault.Config{}, bus)
+	p.SetOptions(Options{CA: ca})
+	addr := listenProxy(t, p)
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = writer
+	defer func() { os.Stderr = old; reader.Close(); writer.Close() }()
+	c, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	fmt.Fprint(c, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+	if _, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect}); err != nil {
+		t.Fatal(err)
+	}
+	tc := tls.Client(c, &tls.Config{ServerName: "example.test", RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12})
+	if err := tc.Handshake(); err == nil {
+		t.Fatal("expected untrusted certificate failure")
+	}
+	select {
+	case event := <-events:
+		if event.Type != "tls_handshake_failed" || !strings.Contains(string(event.Data), "example.test") || !strings.Contains(string(event.Data), "error") {
+			t.Fatalf("unexpected wire event: %+v", event)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("missing TLS failure event")
+	}
+	writer.Close()
+	logged, err := io.ReadAll(reader)
+	if err != nil || !strings.Contains(string(logged), "example.test") || !strings.Contains(string(logged), "tls_handshake_failed") {
+		t.Fatalf("missing TLS diagnostic: %q, %v", logged, err)
 	}
 }
 

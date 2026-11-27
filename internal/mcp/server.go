@@ -488,6 +488,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, bool) {
 					item[k] = v
 				}
 			}
+			if event.Type == "tls_handshake_failed" {
+				item["host"], item["sni"] = d["host"], d["sni"]
+			}
 			if id, ok := d["rule_id"]; ok {
 				item["fault_id"] = id
 			}

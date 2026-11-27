@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -100,7 +102,10 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if intercept {
-		if secured, spec, ok := f.intercept(c, rw.Reader, r.Host, host, p.options.MITMALPN); ok {
+		if secured, spec, ok := f.intercept(c, rw.Reader, r.Host, host, p.options.MITMALPN, func(name string, err error) {
+			fmt.Fprintf(os.Stderr, "tls_handshake_failed: host=%q sni=%q: %q\n", r.Host, name, err)
+			p.publish(gen, "tls_handshake_failed", map[string]any{"host": r.Host, "sni": name, "error": err.Error(), "ts_ms": start.UnixMilli()})
+		}); ok {
 			handedOver = true
 			f.route(secured, spec)
 		}
@@ -131,7 +136,7 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	p.tunnelEvent(r, start, seq, gen, 200, "blind", "", sent, fromUp)
 }
 
-func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn string) (net.Conn, ConnMeta, bool) {
+func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn string, failed func(string, error)) (net.Conn, ConnMeta, bool) {
 	first, err := br.Peek(1)
 	if err != nil {
 		return nil, ConnMeta{}, false
@@ -143,10 +148,12 @@ func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn st
 		if alpn == "h1" {
 			protocols = protocols[1:]
 		}
+		serverName := ""
 		tc := tls.Server(conn, &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			NextProtos: protocols,
 			GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				serverName = info.ServerName
 				name := info.ServerName
 				if name == "" {
 					name = host
@@ -155,6 +162,7 @@ func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn st
 			},
 		})
 		if err := tc.Handshake(); err != nil {
+			failed(serverName, err)
 			return nil, ConnMeta{}, false
 		}
 		state := tc.ConnectionState()

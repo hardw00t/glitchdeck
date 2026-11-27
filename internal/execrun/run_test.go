@@ -3,11 +3,13 @@ package execrun
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +31,7 @@ func TestExecInjectsProxy(t *testing.T) {
 		os.Exit(0)
 	}
 	t.Setenv("GD_HELPER", "1")
-	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{os.Args[0], "-test.run=TestExecInjectsProxy"}})
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{os.Args[0], "-test.run=TestExecInjectsProxy"}, AllowZeroTraffic: true})
 	if r.ExitCode != 0 {
 		t.Fatalf("exit %d: %+v", r.ExitCode, r)
 	}
@@ -121,7 +123,7 @@ func TestExecTLSExportsUsableBundle(t *testing.T) {
 		return
 	}
 	t.Setenv("GD_TLS_HELPER", "1")
-	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{TLS: true, Command: []string{os.Args[0], "-test.run=^TestExecTLSExportsUsableBundle$"}, JSON: true})
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{TLS: true, Command: []string{os.Args[0], "-test.run=^TestExecTLSExportsUsableBundle$"}, JSON: true, AllowZeroTraffic: true})
 	if r.ExitCode != 0 {
 		t.Fatalf("exit %d: %+v", r.ExitCode, r)
 	}
@@ -154,7 +156,7 @@ func TestExecExitCodesAndSecretRedaction(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: tc.cmd, Timeout: tc.timeout, Grace: 50 * time.Millisecond, JSON: true})
+			r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: tc.cmd, Timeout: tc.timeout, Grace: 50 * time.Millisecond, JSON: true, AllowZeroTraffic: true})
 			if r.ExitCode != tc.want {
 				t.Fatalf("exit %d, want %d: %+v", r.ExitCode, tc.want, r)
 			}
@@ -326,7 +328,7 @@ func TestAssertionEvidenceSurvivesHistoryEviction(t *testing.T) {
 func TestPassingFaultExpectationIsCounted(t *testing.T) {
 	min := uint64(0)
 	tp := tape.Tape{Version: 2, Target: "demo", Expect: tape.Expect{Faults: []tape.FaultExpect{{Rule: "unused", MinApplied: &min}}}}
-	r := Run(context.Background(), tp, Options{Command: []string{os.Args[0], "-test.run=^$"}, JSON: true})
+	r := Run(context.Background(), tp, Options{Command: []string{os.Args[0], "-test.run=^$"}, JSON: true, AllowZeroTraffic: true})
 	if r.Summary.AssertionsTotal != 1 || r.Summary.AssertionsPassed != 1 {
 		t.Fatalf("unexpected summary: %+v", r.Summary)
 	}
@@ -365,5 +367,77 @@ func TestObservedSSEUsesDeliveredSummary(t *testing.T) {
 	a := tape.Assertion{StreamStep: "stream", ExpectSSE: &tape.SSEExpect{MinEvents: &one, MaxEvents: &one, ValidJSON: &yes}}
 	if r := observedAssertion(a, tp, bus.History(10)); len(r.Failures) != 0 {
 		t.Fatal(r.Failures)
+	}
+}
+
+func TestExecRejectsUnobservedTrafficAndFaults(t *testing.T) {
+	if os.Getenv("GD_ZERO_HELPER") == "1" {
+		resp, err := http.Get(os.Getenv("GLITCHDECK_PROXY_URL") + "/api/state")
+		if err != nil {
+			os.Exit(9)
+		}
+		resp.Body.Close()
+		os.Exit(0)
+	}
+	zero := uint64(0)
+	rule := fault.Rule{ID: "miss", Enabled: true, Match: fault.Match{PathPrefix: "/never"}, Fault: fault.Fault{Type: "rate-limit"}}
+	for _, tc := range []struct {
+		name           string
+		traffic, allow bool
+		assertions     []tape.Assertion
+		rules          []fault.Rule
+		expect         []tape.FaultExpect
+		want           int
+		diff           string
+	}{
+		{name: "no traffic", want: 1, diff: "zero_traffic"},
+		{name: "assertion traffic is not child traffic", assertions: []tape.Assertion{{Name: "state", HTTPGet: "/api/state", ExpectStatus: 200}}, want: 1, diff: "zero_traffic"},
+		{name: "opt out", allow: true, want: 0},
+		{name: "no matched fault", traffic: true, rules: []fault.Rule{rule}, want: 1, diff: "zero_faults"},
+		{name: "assertion fault is not a child fault", traffic: true, rules: []fault.Rule{rule}, assertions: []tape.Assertion{{Name: "limited probe", HTTPGet: "/never", ExpectStatus: 429}}, want: 1, diff: "zero_faults"},
+		{name: "opt out of no matched fault", traffic: true, allow: true, rules: []fault.Rule{rule}, want: 0},
+		{name: "explicit zero", traffic: true, rules: []fault.Rule{rule}, expect: []tape.FaultExpect{{Rule: "miss", MaxApplied: &zero}}, want: 0},
+		{name: "unrelated zero expectation", traffic: true, rules: []fault.Rule{rule}, expect: []tape.FaultExpect{{Rule: "other", MaxApplied: &zero}}, want: 1, diff: "zero_faults"},
+		{name: "minimum zero", traffic: true, rules: []fault.Rule{rule}, expect: []tape.FaultExpect{{Rule: "miss", MinApplied: &zero}}, want: 0},
+		{name: "zero is not explicit", traffic: true, rules: []fault.Rule{rule}, expect: []tape.FaultExpect{{Rule: "miss"}}, want: 1, diff: "zero_faults"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := []string{os.Args[0], "-test.run=^$"}
+			if tc.traffic {
+				t.Setenv("GD_ZERO_HELPER", "1")
+				cmd = []string{os.Args[0], "-test.run=^TestExecRejectsUnobservedTrafficAndFaults$"}
+			}
+			tp := tape.Tape{Version: 2, Target: "demo", Rules: tc.rules, Assertions: tc.assertions, Expect: tape.Expect{Faults: tc.expect}}
+			r := Run(context.Background(), tp, Options{Command: cmd, JSON: true, AllowZeroTraffic: tc.allow})
+			if r.ExitCode != tc.want || (tc.diff != "" && !strings.Contains(strings.Join(r.Diff, "\n"), tc.diff)) {
+				t.Fatalf("unexpected result: %+v", r)
+			}
+		})
+	}
+}
+
+func TestExecReportsTLSHandshakeFailure(t *testing.T) {
+	if os.Getenv("GD_TLS_REJECT_HELPER") == "1" {
+		proxyURL, err := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
+		if err != nil {
+			os.Exit(9)
+		}
+		client := &http.Client{Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: x509.NewCertPool(), MinVersion: tls.VersionTLS12},
+		}, Timeout: 3 * time.Second}
+		_, err = client.Get("https://127.0.0.1:443/")
+		if err == nil {
+			os.Exit(9)
+		}
+		return
+	}
+	t.Setenv("GD_TLS_REJECT_HELPER", "1")
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{
+		TLS: true, JSON: true, Command: []string{os.Args[0], "-test.run=^TestExecReportsTLSHandshakeFailure$"},
+	})
+	if r.ExitCode != 0 || len(r.Diff) != 0 || len(r.Exec.TLSHandshakeFailures) != 1 ||
+		!strings.Contains(string(r.Exec.TLSHandshakeFailures[0]), "bad certificate") {
+		t.Fatalf("missing TLS failure in report: %+v", r)
 	}
 }

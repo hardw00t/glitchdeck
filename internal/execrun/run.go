@@ -34,34 +34,37 @@ import (
 )
 
 type Options struct {
-	Command          []string
-	TapePath         string
-	Target           string
-	Listen           string
-	UI               string
-	Timeout          time.Duration
-	Grace            time.Duration
-	TLS              bool
-	CADir            string
-	NoProxy          string
-	UpstreamAllow    []string
-	UpstreamCA       string
-	InsecureUpstream bool
-	ProxyAuth        bool
-	JSON             bool
-	AllowRemote      bool
-	Seed             *uint64
+	Command             []string
+	TapePath            string
+	Target              string
+	Listen              string
+	UI                  string
+	Timeout             time.Duration
+	Grace               time.Duration
+	TLS                 bool
+	CADir               string
+	NoProxy             string
+	UpstreamAllow       []string
+	UpstreamCA          string
+	InsecureUpstream    bool
+	ProxyAuth           bool
+	JSON                bool
+	AllowRemote         bool
+	AllowLoopbackEgress bool
+	AllowZeroTraffic    bool
+	Seed                *uint64
 }
 type Exec struct {
-	Cmd        []string `json:"cmd"`
-	ProxyURL   string   `json:"proxy_url"`
-	UIURL      string   `json:"ui_url,omitempty"`
-	ExitCode   int      `json:"exit_code"`
-	TimedOut   bool     `json:"timed_out"`
-	StdoutTail string   `json:"stdout_tail"`
-	StderrTail string   `json:"stderr_tail"`
-	PID        int      `json:"pid,omitempty"`
-	LeakedPIDs []int    `json:"leaked_pids"`
+	Cmd                  []string          `json:"cmd"`
+	ProxyURL             string            `json:"proxy_url"`
+	UIURL                string            `json:"ui_url,omitempty"`
+	ExitCode             int               `json:"exit_code"`
+	TimedOut             bool              `json:"timed_out"`
+	StdoutTail           string            `json:"stdout_tail"`
+	StderrTail           string            `json:"stderr_tail"`
+	PID                  int               `json:"pid,omitempty"`
+	LeakedPIDs           []int             `json:"leaked_pids"`
+	TLSHandshakeFailures []json.RawMessage `json:"tls_handshake_failures,omitempty"`
 }
 type Summary struct {
 	AssertionsTotal  int    `json:"assertions_total"`
@@ -190,7 +193,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	p := proxy.New(parsed, fault.Config{Seed: seed, Rules: t.Rules}, bus)
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
-	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), InsecureUpstream: o.InsecureUpstream}
+	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress}
 	var scheduleStart time.Time
 	var configMu sync.Mutex
 	applied := make([]bool, len(t.ConfigChanges))
@@ -451,12 +454,23 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if cmd.ProcessState != nil {
 		e.Exec.ExitCode = cmd.ProcessState.ExitCode()
 	}
+	childRequests := p.RequestsTotal()
 	httpTape := t
 	httpTape.Assertions = nil
+	proxyAssertions := false
 	for _, a := range t.Assertions {
 		if a.HTTPGet != "" {
 			httpTape.Assertions = append(httpTape.Assertions, a)
+			proxyAssertions = proxyAssertions || !a.Direct
 		}
+	}
+	childFaultApplied := false
+	if !o.AllowZeroTraffic && childRequests != 0 && proxyAssertions && len(t.Rules)+len(t.ConfigChanges) != 0 {
+		// A proxy assertion must not supply the only fault on behalf of the child.
+		waitCtx, stopWait := context.WithTimeout(context.Background(), o.Grace)
+		_ = p.Wait(waitCtx)
+		stopWait()
+		childFaultApplied = len(p.AppliedFaults()) != 0
 	}
 	httpResults := assertions(ctx, httpTape, "http://"+listener.Addr().String(), target, opts.ProxyAuth, nil)
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
@@ -465,6 +479,14 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	e.Summary.RequestsTotal = p.RequestsTotal()
 	stats := p.Stats()
 	e.SetAppliedFaults(p.AppliedFaults())
+	if !proxyAssertions {
+		childFaultApplied = e.Summary.FaultsTriggered != 0
+	}
+	for _, event := range bus.History(0) {
+		if event.Type == "tls_handshake_failed" {
+			e.Exec.TLSHandshakeFailures = append(e.Exec.TLSHandshakeFailures, event.Data)
+		}
+	}
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))
 	}
@@ -485,6 +507,36 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	results := append(httpResults, assertions(ctx, protocolTape, "", target, opts.ProxyAuth, evidence.history())...)
 	e.SetResults(results)
 	failed := e.Summary.AssertionsFailed > 0
+	if !o.AllowZeroTraffic {
+		if childRequests == 0 {
+			e.Diff = append(e.Diff, "zero_traffic: no requests reached the proxy; check HTTP(S)_PROXY bypass (Go ignores proxies for localhost/127.0.0.1) and CA trust")
+			failed = true
+		} else if !childFaultApplied && len(t.Rules)+len(t.ConfigChanges) != 0 {
+			rules := make(map[string]bool)
+			for _, rule := range t.Rules {
+				if rule.Enabled {
+					rules[rule.ID] = true
+				}
+			}
+			for _, change := range t.ConfigChanges {
+				for _, rule := range change.Rules {
+					if rule.Enabled {
+						rules[rule.ID] = true
+					}
+				}
+			}
+			allowsZero := false
+			for _, x := range t.Expect.Faults {
+				if rules[x.Rule] && ((x.MinApplied != nil && *x.MinApplied == 0) || (x.MinApplied == nil && x.MaxApplied != nil)) {
+					allowsZero = true
+				}
+			}
+			if len(rules) > 0 && !allowsZero {
+				e.Diff = append(e.Diff, "zero_faults: no faults triggered; check rule matching, proxy bypass and CA trust")
+				failed = true
+			}
+		}
+	}
 	for _, x := range t.Expect.Faults {
 		n := stats[x.Rule].Applied
 		result := tape.Result{Name: "fault " + x.Rule, Failures: []string{}}

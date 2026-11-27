@@ -46,7 +46,7 @@ func (b *Bus) Publish(kind string, data any) {
 	if b.observer != nil {
 		b.observer(e)
 	}
-	if kind == "http_req" || kind == "ws_frame" || kind == "sse_event" || kind == "grpc_call" {
+	if kind == "http_req" || kind == "ws_frame" || kind == "sse_event" || kind == "grpc_call" || kind == "tls_handshake_failed" {
 		b.ring[b.write] = e
 		b.write = (b.write + 1) % len(b.ring)
 		b.count = min(b.count+1, len(b.ring))

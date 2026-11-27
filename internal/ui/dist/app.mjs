@@ -728,6 +728,7 @@ function renderLog() {
     const d = e.data || {},
       row = document.createElement("details");
     row.dataset.id = e.id;
+    const tlsFailure = e.type === "tls_handshake_failed";
     const protocol = e.type === "sse_event" ? "sse" : ["grpc_call","h2_frame"].includes(e.type) || ["grpc","h2"].includes(d.protocol) ? "grpc" : e.type === "ws_frame" ? "ws" : "http";
     row.className = "wire-row " + protocol + (faultFired(e) ? " fault" : "");
     const summary = document.createElement("summary");
@@ -737,8 +738,9 @@ function renderLog() {
           "." +
           String(new Date(d.ts_ms).getMilliseconds()).padStart(3, "0")
         : "—",
-      protocol === "sse" ? "SSE" : protocol === "grpc" ? (e.type === "h2_frame" || d.protocol === "h2" ? "H2" : "gRPC") : protocol === "ws" ? "WS" : "HTTP",
-      protocol === "sse" ? `${d.event || d.kind || "event"} #${d.event_index || 0} · ${d.preview || ""}` :
+      tlsFailure ? "TLS" : protocol === "sse" ? "SSE" : protocol === "grpc" ? (e.type === "h2_frame" || d.protocol === "h2" ? "H2" : "gRPC") : protocol === "ws" ? "WS" : "HTTP",
+      tlsFailure ? `${d.sni || d.host} · ${d.error}` :
+        protocol === "sse" ? `${d.event || d.kind || "event"} #${d.event_index || 0} · ${d.preview || ""}` :
         protocol === "grpc" ? `${d.service || ""}/${d.method || ""} ${d.action || ""}` :
         protocol === "ws" ? `${d.dir || ""} · ${d.preview || "frame"}` : `${d.method || ""} ${d.path || ""}`,
       d.grpc_status != null ? `g${d.grpc_status}` : d.h2_error ? "RST" : d.status || d.opcode || "—",
@@ -790,7 +792,7 @@ function accept(event) {
   }
   if (event.type === "demo_stream") { acceptDemoStream(event.data); return; }
   if (event.type === "sse_event") acceptStreamEvent(event.data);
-  if (!["http_req", "ws_frame", "sse_event", "grpc_call", "h2_frame"].includes(event.type)) return;
+  if (!["http_req", "ws_frame", "sse_event", "grpc_call", "h2_frame", "tls_handshake_failed"].includes(event.type)) return;
   mergeHistory([event]);
   if (demo) {
     clearTimeout(refreshTimer);
@@ -812,7 +814,7 @@ function connectEvents() {
     $("#disconnect").hidden = false;
     $("#connection").textContent = "OFFLINE";
   };
-  for (const type of ["http_req", "ws_frame", "sse_event", "grpc_call", "h2_frame", "demo_stream", "fault_state"])
+  for (const type of ["http_req", "ws_frame", "sse_event", "grpc_call", "h2_frame", "tls_handshake_failed", "demo_stream", "fault_state"])
     stream.addEventListener(type, (e) => {
       try {
         accept({ id: Number(e.lastEventId), type, data: JSON.parse(e.data) });

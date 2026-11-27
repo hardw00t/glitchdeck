@@ -47,13 +47,15 @@ jobs:
           version: local
           tape: examples/clean.tape.yaml
       - name: Start local handler
-        run: python3 -m http.server 18765 --bind 127.0.0.1 > "$RUNNER_TEMP/handler.log" 2>&1 &
+        run: |
+          python3 -m http.server 18765 --bind 127.0.0.1 > "$RUNNER_TEMP/handler.log" 2>&1 &
+          printf 'version: 2\nname: clean-exec\ntarget: http://127.0.0.1:18765\nrules: []\n' > "$RUNNER_TEMP/clean-exec.tape.yaml"
       - name: Run exec action
         id: exec
         uses: ./
         with:
           version: local
-          tape: examples/tapes/your-app-openai-sse-cut.tape.yaml
+          tape: ${{ runner.temp }}/clean-exec.tape.yaml
           target: http://127.0.0.1:18765
           command: curl --fail --retry 5 --retry-connrefused --retry-delay 1 "$GLITCHDECK_PROXY_URL/"
       - name: Check exec action

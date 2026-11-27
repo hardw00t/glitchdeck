@@ -53,6 +53,8 @@ func execCommand(args []string) int {
 	f.StringVar(&o.UpstreamCA, "upstream-ca", "", "upstream CA")
 	f.BoolVar(&o.InsecureUpstream, "insecure-upstream", false, "skip upstream TLS verification")
 	f.BoolVar(&o.AllowRemote, "allow-remote", false, "permit non-loopback listener")
+	f.BoolVar(&o.AllowLoopbackEgress, "allow-loopback-egress", false, "allow loopback, link-local and unspecified upstream addresses on non-loopback proxy listeners")
+	f.BoolVar(&o.AllowZeroTraffic, "allow-zero-traffic", false, "allow zero requests or zero triggered faults")
 	f.BoolVar(&o.ProxyAuth, "proxy-auth", false, "enable proxy authentication")
 	var allow listFlag
 	f.Var(&allow, "upstream-allow", "allow upstream")

@@ -41,7 +41,7 @@ func TestExecDoesNotKillUnrelatedChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = unrelated.Process.Kill(); _ = unrelated.Wait() }()
-	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{"sh", "-c", "exit 0"}, Grace: 100 * time.Millisecond, JSON: true})
+	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{"sh", "-c", "exit 0"}, Grace: 100 * time.Millisecond, JSON: true, AllowZeroTraffic: true})
 	if r.ExitCode != 0 {
 		t.Fatalf("unexpected exit: %+v", r)
 	}
