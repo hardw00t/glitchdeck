@@ -40,6 +40,28 @@ func TestInheritedCARejectsNamedPipeWithoutWaitingForWriter(t *testing.T) {
 	}
 }
 
+func TestExecStartupRejectsInheritedCAWithoutBlocking(t *testing.T) {
+	if os.Getenv("GD_FIFO_STARTUP") == "1" {
+		r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{TLS: true, JSON: true, AllowZeroTraffic: true, Command: []string{"true"}})
+		if r.ExitCode != 0 {
+			t.Fatalf("run failed: %+v", r)
+		}
+		return
+	}
+	path := filepath.Join(t.TempDir(), "roots.pem")
+	if err := syscall.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestExecStartupRejectsInheritedCAWithoutBlocking$")
+	cmd.Env = append(os.Environ(), "GD_FIFO_STARTUP=1", "SSL_CERT_FILE="+path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("startup blocked or failed: %v: %s", err, out)
+	}
+}
+
 func TestExecReapsDetachedChild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pid")
 	r := Run(context.Background(), tape.Tape{Version: 2, Target: "demo"}, Options{Command: []string{"sh", "-c", `setsid sleep 300 & echo $! > "$1"; exec sleep 300`, "sh", path}, Timeout: 300 * time.Millisecond, Grace: 100 * time.Millisecond})

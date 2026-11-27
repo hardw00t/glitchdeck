@@ -2,6 +2,8 @@ package execrun
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -12,9 +14,15 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
 
-func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password string, events []telemetry.Event) []tape.Result {
+func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password string, events []telemetry.Event, roots ...*x509.CertPool) []tape.Result {
 	out := make([]tape.Result, 0, len(t.Assertions))
 	client := http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	if len(roots) > 0 && roots[0] != nil {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{RootCAs: roots[0], MinVersion: tls.VersionTLS12}
+		client.Transport = transport
+		defer transport.CloseIdleConnections()
+	}
 	for _, a := range t.Assertions {
 		if a.HTTPGet == "" {
 			out = append(out, observedAssertion(a, t, events))
@@ -27,7 +35,7 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+a.HTTPGet, nil)
 		if err != nil {
-			r.Failures = append(r.Failures, err.Error())
+			r.Failures = append(r.Failures, "invalid assertion request URL")
 			out = append(out, r)
 			continue
 		}
@@ -37,7 +45,11 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
-			r.Failures = append(r.Failures, err.Error())
+			safeURL := *req.URL
+			safeURL.User = nil
+			safeURL.RawQuery = ""
+			safeURL.Fragment = ""
+			r.Failures = append(r.Failures, fmt.Sprintf("assertion request failed: %s", safeURL.String()))
 			out = append(out, r)
 			continue
 		}

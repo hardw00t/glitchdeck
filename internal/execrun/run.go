@@ -5,8 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
-	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -132,6 +133,7 @@ type helperReport struct {
 func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	start := time.Now()
 	o.javaHome = os.Getenv("JAVA_HOME") != ""
+	o.TLS = o.TLS || t.TLSMITM
 	target := t.Target
 	if o.Target != "" {
 		target = o.Target
@@ -213,7 +215,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			return finish(2, "USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
 		}
 	}
-	if len(opts.TLSPassthrough) > 0 && !o.TLS && !t.TLSMITM {
+	if len(opts.TLSPassthrough) > 0 && !o.TLS {
 		fmt.Fprintln(os.Stderr, "tls-passthrough has no effect without --tls")
 	}
 	var scheduleStart time.Time
@@ -238,22 +240,27 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	opts.BeforeRequest = applyChanges
 	opts.OnAdmission = evidence.admit
+	opts.OnReset = func() {
+		tlsFailures.reset()
+		hosts.reset()
+	}
+	var system, sslCerts []byte
+	if o.TLS || o.UpstreamCA != "" || os.Getenv("SSL_CERT_FILE") != "" || os.Getenv("SSL_CERT_DIR") != "" {
+		system = systemPEM()
+		sslCerts = inheritedCerts("SSL_CERT_FILE")
+		opts.UpstreamCA = proxyRoots(system, sslCerts)
+	}
 	if o.UpstreamCA != "" {
 		data, x := os.ReadFile(o.UpstreamCA)
 		if x != nil {
 			return finish(3, "CA_ERROR", x)
 		}
-		pool, x := x509.SystemCertPool()
-		if x != nil {
-			pool = x509.NewCertPool()
-		}
-		if !pool.AppendCertsFromPEM(data) {
+		if !opts.UpstreamCA.AppendCertsFromPEM(data) {
 			return finish(3, "CA_ERROR", fmt.Errorf("invalid CA certificate"))
 		}
-		opts.UpstreamCA = pool
 	}
 	env := []string{}
-	if o.TLS || t.TLSMITM {
+	if o.TLS {
 		var ca *tlsmitm.CA
 		if o.CADir != "" {
 			ca, err = (tlsmitm.Store{Dir: o.CADir}).Load()
@@ -274,31 +281,26 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		if x = os.WriteFile(cert, ca.PEM, 0600); x != nil {
 			return finish(3, "CA_ERROR", x)
 		}
-		var data []byte
-		for _, path := range []string{"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"} {
-			data, x = os.ReadFile(path)
-			if x == nil {
-				break
+		inherited := [][]byte{sslCerts}
+		var node []byte
+		if len(sslCerts) > 0 && len(opts.TLSPassthrough) > 0 {
+			if _, set := os.LookupEnv("NODE_USE_SYSTEM_CA"); !set {
+				env = append(env, "NODE_USE_SYSTEM_CA=1")
 			}
 		}
-		var inherited [][]byte
-		var node []byte
-		for _, name := range []string{"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"} {
+		for _, name := range []string{
+			"REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+			"GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "AWS_CA_BUNDLE", "DENO_CERT", "GIT_SSL_CAINFO", "PIP_CERT", "NPM_CONFIG_CAFILE", "CARGO_HTTP_CAINFO",
+		} {
 			certs := inheritedCerts(name)
-			if name == "SSL_CERT_FILE" && len(certs) > 0 && len(opts.TLSPassthrough) > 0 {
-				if _, set := os.LookupEnv("NODE_USE_SYSTEM_CA"); !set {
-					env = append(env, "NODE_USE_SYSTEM_CA=1")
-				}
-			}
 			inherited = append(inherited, certs)
 			if name == "NODE_EXTRA_CA_CERTS" {
 				node = certs
 			}
 		}
-		parts := append([][]byte{data}, inherited...)
-		parts = append(parts, ca.PEM)
+		inherited = append(inherited, ca.PEM)
 		nodePath := filepath.Join(dir, "node-extra.pem")
-		if x = os.WriteFile(bundle, certBundle(parts...), 0600); x != nil {
+		if x = os.WriteFile(bundle, certBundleWithSystem(system, inherited...), 0600); x != nil {
 			return finish(3, "CA_ERROR", x)
 		}
 		if x = os.WriteFile(nodePath, certBundle(node, ca.PEM), 0600); x != nil {
@@ -315,12 +317,6 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		cert, e := tlsmitm.NewMinter(opts.CA, 1, 0).For("localhost")
 		if e != nil {
 			return finish(3, "CA_ERROR", e)
-		}
-		if opts.UpstreamCA == nil {
-			opts.UpstreamCA, e = x509.SystemCertPool()
-			if e != nil {
-				opts.UpstreamCA = x509.NewCertPool()
-			}
 		}
 		opts.UpstreamCA.AddCert(opts.CA.Cert)
 		protocols := demo.Protocols()
@@ -383,7 +379,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	go p.Serve(listener)
 	noProxy, dropped := mergeNoProxy(os.Getenv("NO_PROXY"), os.Getenv("no_proxy"), o.NoProxy, listenerAddr, parsed)
 	e.Exec.NoProxy, e.Exec.NoProxyDropped = reportNoProxy(noProxy), dropped
-	safeTarget := ""
+	safeTarget := "(forward-only)"
 	if parsed != nil {
 		safeTarget = parsed.Scheme + "://" + parsed.Host
 	}
@@ -501,7 +497,6 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if cmd.ProcessState != nil {
 		e.Exec.ExitCode = cmd.ProcessState.ExitCode()
 	}
-	var childStats proxy.TrafficStats
 	httpTape := t
 	httpTape.Assertions = nil
 	proxyAssertions := false
@@ -513,28 +508,26 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
 	defer cancelDrain()
-	var childFaults []proxy.AppliedFault
-	waitErr = p.Wait(drainCtx)
-	childStats = p.TrafficStats()
-	if waitErr == nil {
-		if proxyAssertions {
-			childFaults = p.AppliedFaults()
-		}
-	}
+	waitErr = p.Drain(drainCtx)
+	childStats := p.TrafficStats()
+	childFaults := p.AppliedFaults()
 	var httpResults []tape.Result
 	if waitErr == nil {
-		httpResults = assertions(ctx, httpTape, "http://"+listener.Addr().String(), target, opts.ProxyAuth, nil)
-	}
-	drainErr := p.Drain(drainCtx)
-	if waitErr == nil {
-		waitErr = drainErr
+		probeURL, probePassword := "", ""
+		if proxyAssertions {
+			var stop func()
+			probeURL, probePassword, stop, waitErr = startAssertionProxy(p, opts.ProxyAuth)
+			if stop != nil {
+				defer stop()
+			}
+		}
+		if waitErr == nil {
+			httpResults = assertions(ctx, httpTape, probeURL, target, probePassword, nil, opts.UpstreamCA)
+			waitErr = p.Wait(drainCtx)
+		}
 	}
 	e.Summary.RequestsTotal = p.RequestsTotal()
-	allFaults := p.AppliedFaults()
-	e.SetAppliedFaults(allFaults)
-	if !proxyAssertions {
-		childFaults = allFaults
-	}
+	e.SetAppliedFaults(p.AppliedFaults())
 	e.Exec.TLSHandshakeFailureCount, e.Exec.TLSHandshakeFailures = tlsFailures.snapshot()
 	e.Exec.TLSHandshakeFailuresOmitted = e.Exec.TLSHandshakeFailureCount - uint64(len(e.Exec.TLSHandshakeFailures))
 	e.Exec.Traffic = childStats
@@ -555,11 +548,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			protocolTape.Assertions = append(protocolTape.Assertions, a)
 		}
 	}
-	results := append(httpResults, assertions(ctx, protocolTape, "", target, opts.ProxyAuth, evidence.history())...)
+	results := append(httpResults, assertions(ctx, protocolTape, "", target, "", evidence.history())...)
 	e.SetResults(results)
 	failed := e.Summary.AssertionsFailed > 0
-	innerOK := childStats.InnerRequests > childStats.InnerEgressDenied
-	// A denied CONNECT is not an inner request; subtract only denied HTTP requests.
+	innerOK := childStats.InnerUsable > 0
 	tlsOnly := childStats.TLSRejected > 0 && !innerOK && childStats.PassthroughOK+childStats.BlindOK == 0
 	deniedOnly := childStats.EgressDenied > 0 && !innerOK && childStats.InterceptedOK+childStats.PassthroughOK+childStats.BlindOK == 0
 	hostList := func(kind string) string {
@@ -583,6 +575,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		} else if childStats.RequestsTotal == 0 {
 			line := "zero_traffic: no requests reached the proxy; check HTTP(S)_PROXY bypass (Go ignores proxies for localhost/127.0.0.1) and CA trust"
 			e.Diff = append(e.Diff, strings.Join(append([]string{line}, hint(o, o.Command, parsed, childStats)...), "; "))
+			failed = true
+		} else if (childStats.InterceptedEmpty > 0 || childStats.InterceptedOK > 0 && childStats.InnerRequests == 0) && !innerOK && childStats.PassthroughOK+childStats.BlindOK == 0 {
+			e.Diff = append(e.Diff, "no_usable_traffic: intercepted CONNECT closed without usable application traffic; check client proxy configuration and CA trust")
 			failed = true
 		} else if len(childFaults) == 0 && len(t.Rules)+len(t.ConfigChanges) != 0 {
 			rules := make(map[string]bool)
@@ -649,6 +644,32 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		return finish(1, "", nil)
 	}
 	return finish(0, "", nil)
+}
+
+func startAssertionProxy(p *proxy.Proxy, proxyPassword string) (addr, password string, closeServer func(), err error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", "", nil, err
+	}
+	password = rand.Text()
+	probeAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("glitchdeck:"+password))
+	proxyAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("glitchdeck:"+proxyPassword))
+	server := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Proxy-Authorization")), []byte(probeAuth)) != 1 {
+			http.Error(w, "assertion proxy authentication required", http.StatusForbidden)
+			return
+		}
+		r.Header.Del("Proxy-Authorization")
+		if proxyPassword != "" {
+			r.Header.Set("Proxy-Authorization", proxyAuth)
+		}
+		p.ServeProbeHTTP(w, r)
+	})}
+	go server.Serve(listener)
+	return "http://" + listener.Addr().String(), password, func() {
+		_ = server.Close()
+		_ = listener.Close()
+	}, nil
 }
 
 type tail struct{ b []byte }

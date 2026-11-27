@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -18,6 +20,7 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
 	"github.com/hardw00t/glitchdeck/internal/tlsmitm"
 )
 
@@ -188,7 +191,11 @@ func TestExecNoProxyEnvironment(t *testing.T) {
 	}
 	t.Setenv("GD_NO_PROXY_HELPER", "1")
 	t.Setenv("NO_PROXY", "internal.example.test,localhost")
-	t.Setenv("no_proxy", ".svc.test")
+	if runtime.GOOS == "windows" {
+		t.Setenv("NO_PROXY", "internal.example.test,.svc.test,localhost")
+	} else {
+		t.Setenv("no_proxy", ".svc.test")
+	}
 	r := Run(context.Background(), tape.Tape{Version: 2, Target: "http://localhost:3000"}, Options{JSON: true, AllowZeroTraffic: true, Command: []string{os.Args[0], "-test.run=^TestExecNoProxyEnvironment$"}})
 	if r.ExitCode != 0 || strings.Join(r.Exec.NoProxyDropped, ",") != "localhost" {
 		t.Fatalf("%+v", r)
@@ -199,5 +206,146 @@ func TestReportNoProxyOmitsCredentials(t *testing.T) {
 	const value = "safe.test,http://user:example-secret@example.com,https://example.com/?key=example-secret"
 	if got := reportNoProxy(value); got != "safe.test,[redacted],[redacted]" {
 		t.Fatalf("report projection = %q", got)
+	}
+}
+
+func TestInheritedBypassScopeAndSecrets(t *testing.T) {
+	for _, tc := range []struct {
+		entry, target string
+		want          bool
+	}{
+		{"*", "", true},
+		{"192.0.2.0/24", "http://192.0.2.10", true},
+		{"192.0.3.0/24", "http://192.0.2.10", false},
+		{"2001:db8::/32", "http://[2001:db8::1]", true},
+		{"localhost:3000", "http://127.0.0.2:3000", false},
+		{"127.0.0.2:3000", "http://127.0.0.2:3000", true},
+	} {
+		var target *url.URL
+		if tc.target != "" {
+			target, _ = url.Parse(tc.target)
+		}
+		if got := bypassTarget(tc.entry, target); got != tc.want {
+			t.Errorf("%q %q: got %v", tc.entry, tc.target, got)
+		}
+	}
+	got, dropped := mergeNoProxy("safe.test,http://user:secret@example.com", "", "", "listener", nil)
+	if got != "safe.test,listener" || strings.Contains(strings.Join(dropped, ","), "secret") {
+		t.Fatalf("got %q dropped %q", got, dropped)
+	}
+}
+
+func TestSystemBundlePreservesTrustedBlocks(t *testing.T) {
+	ca, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted := pem.EncodeToMemory(&pem.Block{Type: "TRUSTED CERTIFICATE", Bytes: ca.Cert.Raw})
+	other, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := append(append([]byte{}, trusted...), other.PEM...)
+	got := certBundleWithSystem(system, ca.PEM, other.PEM, other.PEM)
+	if !bytes.Contains(got, trusted) || bytes.Count(got, []byte("BEGIN CERTIFICATE")) != 1 || bytes.Count(got, other.PEM) != 1 {
+		t.Fatalf("bundle lost system trust or failed to deduplicate: %s", got)
+	}
+	if _, err := ca.Cert.Verify(x509.VerifyOptions{Roots: proxyRoots(nil, ca.PEM)}); err != nil {
+		t.Fatalf("inherited root unavailable: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "system.pem")
+	mixed := append(append([]byte{}, trusted...), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("secret")})...)
+	if err := os.WriteFile(path, mixed, 0600); err != nil {
+		t.Fatal(err)
+	}
+	filtered := boundedSystemFile(path)
+	if !bytes.Equal(filtered, trusted) {
+		t.Fatalf("unsafe system bundle: %s", filtered)
+	}
+}
+
+func TestDenoHintReflectsTLS(t *testing.T) {
+	for _, tc := range []struct {
+		tls  bool
+		want bool
+	}{{false, false}, {true, true}} {
+		got := strings.Join(hint(Options{TLS: tc.tls}, []string{"deno"}, nil, proxy.TrafficStats{}), " ")
+		if strings.Contains(got, "DENO_CERT is set") != tc.want {
+			t.Fatalf("TLS=%v: %s", tc.tls, got)
+		}
+	}
+}
+
+func TestAssertionFailureDoesNotExposeQuery(t *testing.T) {
+	tp := tape.Tape{Assertions: []tape.Assertion{{Name: "failure", HTTPGet: "/?token=example-secret", Direct: true}}}
+	result := assertions(context.Background(), tp, "", "http://127.0.0.1:0", "", nil)
+	if len(result) != 1 || len(result[0].Failures) == 0 || strings.Contains(strings.Join(result[0].Failures, " "), "example-secret") {
+		t.Fatalf("unsafe assertion result: %+v", result)
+	}
+}
+
+func TestHTTPSAssertionUsesProvidedRoots(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	tp := tape.Tape{Assertions: []tape.Assertion{{HTTPGet: "/", Direct: true, ExpectStatus: http.StatusNoContent}}}
+	result := assertions(context.Background(), tp, "", server.URL, "", nil, roots)
+	if len(result) != 1 || len(result[0].Failures) != 0 {
+		t.Fatalf("trusted assertion failed: %+v", result)
+	}
+}
+
+func TestTrafficHostsKeepSmallestNormalizedNames(t *testing.T) {
+	var hosts trafficHosts
+	for _, host := range []string{"Z.test:443", "b.test", "A.TEST.", "c.test", "d.test", "e.test", "a.test", "f.test"} {
+		data, _ := json.Marshal(map[string]string{"host": host, "error": "egress_denied"})
+		hosts.observe(telemetry.Event{Type: "http_req", Data: data})
+	}
+	if got := hosts.list("denied"); got != "a.test, b.test, c.test, d.test, e.test" {
+		t.Fatalf("hosts = %q", got)
+	}
+}
+
+func TestTrafficEvidenceReset(t *testing.T) {
+	var hosts trafficHosts
+	var failures tlsFailureEvidence
+	tls := telemetry.Event{Type: "tls_handshake_failed", Data: json.RawMessage(`{"host":"old.test"}`)}
+	denied := telemetry.Event{Type: "http_req", Data: json.RawMessage(`{"host":"denied.test","error":"egress_denied"}`)}
+	hosts.observe(tls)
+	hosts.observe(denied)
+	failures.observe(tls)
+	hosts.reset()
+	failures.reset()
+	if hosts.list("tls") != "" || hosts.list("denied") != "" {
+		t.Fatal("reset retained old hosts")
+	}
+	if count, details := failures.snapshot(); count != 0 || len(details) != 0 {
+		t.Fatalf("reset retained failures: %d %s", count, details)
+	}
+	hosts.observe(tls)
+	failures.observe(tls)
+	if count, _ := failures.snapshot(); count != 1 || hosts.list("tls") != "old.test" {
+		t.Fatal("evidence not recorded after reset")
+	}
+}
+
+func TestInheritedCADiagnosticRedactsURL(t *testing.T) {
+	t.Setenv("SSL_CERT_FILE", "https://user:secret@example.test/roots?token=secret")
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	inheritedCerts("SSL_CERT_FILE")
+	w.Close()
+	os.Stderr = old
+	data, _ := io.ReadAll(r)
+	r.Close()
+	if bytes.Contains(data, []byte("secret")) || !bytes.Contains(data, []byte("SSL_CERT_FILE")) {
+		t.Fatalf("unsafe diagnostic: %s", data)
 	}
 }

@@ -27,6 +27,18 @@ type trafficHosts struct {
 	tls, denied []string
 }
 
+func (c *trafficHosts) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tls, c.denied = nil, nil
+}
+
+func (c *tlsFailureEvidence) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.count, c.details = 0, nil
+}
+
 func (c *trafficHosts) observe(e telemetry.Event) {
 	var data struct {
 		Host  string `json:"host"`
@@ -53,18 +65,22 @@ func (c *trafficHosts) observe(e telemetry.Event) {
 	if err != nil || u.Hostname() == "" {
 		return
 	}
-	host := u.Hostname()
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	list := &c.tls
 	if kind == "denied" {
 		list = &c.denied
 	}
-	for _, existing := range *list {
-		if existing == host {
-			return
-		}
+	i := sort.SearchStrings(*list, host)
+	if i < len(*list) && (*list)[i] == host {
+		return
 	}
-	if len(*list) < 5 {
-		*list = append(*list, host)
+	if i < 5 {
+		*list = append(*list, "")
+		copy((*list)[i+1:], (*list)[i:])
+		(*list)[i] = host
+		if len(*list) > 5 {
+			*list = (*list)[:5]
+		}
 	}
 }
 
