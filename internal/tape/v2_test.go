@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,9 @@ func TestStreamParserAndReport(t *testing.T) {
 }
 
 func TestPassthroughUsesSystemRoots(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skip("native system roots do not honor SSL_CERT_FILE")
+	}
 	if target := os.Getenv("GLITCHDECK_TEST_PASSTHROUGH_TARGET"); target != "" {
 		tp := Tape{Version: 2, Target: target, TLSMITM: true, UpstreamAllow: []string{"127.0.0.1"}, TLSPassthrough: []string{"127.0.0.1"}, Script: []Step{{HTTP: &HTTP{URL: target + "/"}}}}
 		if _, _, err := RunWithTLS(context.Background(), tp, "", "", false); err != nil {
@@ -158,6 +162,43 @@ func TestPassthroughTapeRoundTrip(t *testing.T) {
 	roundTrip, err := Decode(strings.NewReader(encoded.String()))
 	if err != nil || len(roundTrip.TLSPassthrough) != 3 || roundTrip.TLSPassthrough[2] != "[::1]:8443" {
 		t.Fatalf("round trip: %+v, %v", roundTrip.TLSPassthrough, err)
+	}
+}
+
+func TestPassthroughStreamDoesNotExposeAdmissionHeader(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		t.Skip("native system roots do not honor SSL_CERT_FILE")
+	}
+	if target := os.Getenv("GLITCHDECK_TEST_STREAM_TARGET"); target != "" {
+		tp := Tape{Version: 2, Target: target, TLSMITM: true, UpstreamAllow: []string{"127.0.0.1"}, TLSPassthrough: []string{"127.0.0.1"}, Script: []Step{{Name: "s", Stream: &Stream{URL: target}}}}
+		if _, _, err := RunWithTLS(context.Background(), tp, "", "", false); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	headers := make(chan string, 1)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Get(proxy.SSEAdmissionHeader)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	root := filepath.Join(t.TempDir(), "root.pem")
+	if err := os.WriteFile(root, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPassthroughStreamDoesNotExposeAdmissionHeader$")
+	cmd.Env = append(os.Environ(), "GLITCHDECK_TEST_STREAM_TARGET="+server.URL, "SSL_CERT_FILE="+root, "SSL_CERT_DIR="+t.TempDir())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("passthrough stream: %v\n%s", err, output)
+	}
+	select {
+	case got := <-headers:
+		if got != "" {
+			t.Fatalf("private admission header leaked: %q", got)
+		}
+	default:
+		t.Fatal("upstream received no request")
 	}
 }
 

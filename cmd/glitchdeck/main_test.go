@@ -1,15 +1,86 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
+func TestProxyTapePassthroughDoesNotChangeEgressOrTLS(t *testing.T) {
+	if path := os.Getenv("GLITCHDECK_TEST_PROXY_TAPE"); path != "" {
+		args := []string{"proxy", "--tape", path, "--target", "http://127.0.0.1:1", "--listen", "0.0.0.0:0", "--allow-remote", "--ui", "127.0.0.1:0", "--json"}
+		if os.Getenv("GLITCHDECK_TEST_PROXY_TLS") == "1" {
+			args = append(args, "--tls")
+		}
+		os.Exit(run(args))
+	}
+	for _, tc := range []struct {
+		extra string
+		tls   bool
+	}{
+		{"", false}, {"tls_passthrough: [pinned.test]\n", false},
+		{"", true}, {"tls_passthrough: [pinned.test]\n", true},
+	} {
+		path := filepath.Join(t.TempDir(), "policy.yaml")
+		if err := os.WriteFile(path, []byte("version: 2\ntls_mitm: true\nupstream_allow: [0.0.0.0]\n"+tc.extra), 0600); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProxyTapePassthroughDoesNotChangeEgressOrTLS$")
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		cmd.Env = append(os.Environ(), "GLITCHDECK_TEST_PROXY_TAPE="+path)
+		if tc.tls {
+			cmd.Env = append(cmd.Env, "GLITCHDECK_TEST_PROXY_TLS=1")
+		}
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		var ready struct {
+			Proxy string `json:"proxy"`
+			TLS   struct {
+				Enabled bool `json:"enabled"`
+			} `json:"tls"`
+		}
+		err = json.NewDecoder(out).Decode(&ready)
+		if err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			t.Fatalf("missing proxy readiness: %v; stderr=%s", err, stderr.String())
+		}
+		proxyURL, err := url.Parse(ready.Proxy)
+		if err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			t.Fatal(err)
+		}
+		proxyURL.Host = strings.Replace(proxyURL.Host, "0.0.0.0", "127.0.0.1", 1)
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}, Timeout: 3 * time.Second}
+		resp, err := client.Get("http://0.0.0.0:1/")
+		if err == nil {
+			resp.Body.Close()
+		}
+		cmd.Process.Kill()
+		cmd.Wait()
+		if err != nil || resp.StatusCode != http.StatusForbidden || ready.TLS.Enabled != tc.tls {
+			t.Fatalf("passthrough=%q response=%v err=%v tls=%v", tc.extra, resp, err, ready.TLS.Enabled)
+		}
+	}
+}
 func TestTopLevelHelp(t *testing.T) {
 	for _, alias := range []string{"-h", "--help", "help"} {
 		t.Run(alias, func(t *testing.T) {

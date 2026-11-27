@@ -74,10 +74,10 @@ func runStream(ctx context.Context, base string, s Stream, root ...*x509.CertPoo
 }
 
 func runStreamWithTerminals(ctx context.Context, base string, s Stream, extra []string, root ...*x509.CertPool) streamEvidence {
-	return runStreamWithAdmission(ctx, base, s, extra, "", nil, root...)
+	return runStreamWithAdmission(ctx, base, s, extra, "", nil, nil, false, root...)
 }
 
-func runStreamWithAdmission(ctx context.Context, base string, s Stream, extra []string, runID string, admission <-chan []string, root ...*x509.CertPool) streamEvidence {
+func runStreamWithAdmission(ctx context.Context, base string, s Stream, extra []string, runID string, admission <-chan []string, passthrough []string, intercept bool, root ...*x509.CertPool) streamEvidence {
 	result := streamEvidence{End: "eof", Terminal: "none", ValidJSON: true}
 	if s.MaxMS <= 0 {
 		s.MaxMS = 30000
@@ -103,8 +103,17 @@ func runStreamWithAdmission(ctx context.Context, base string, s Stream, extra []
 	for k, v := range s.Headers {
 		req.Header.Set(k, v)
 	}
+	req.Header.Del(proxy.SSEAdmissionHeader)
 	if runID != "" {
-		req.Header.Set(proxy.SSEAdmissionHeader, runID)
+		tunneled := s.URL != "" && strings.EqualFold(req.URL.Scheme, "https")
+		port := req.URL.Port()
+		if port == "" {
+			port = "443"
+		}
+		_, matched := proxy.MatchPassthrough(passthrough, req.URL.Hostname(), port)
+		if !tunneled || intercept && !matched {
+			req.Header.Set(proxy.SSEAdmissionHeader, runID)
+		}
 	}
 	var roots *x509.CertPool
 	if len(root) != 0 {

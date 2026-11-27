@@ -106,8 +106,15 @@ type Result struct {
 
 func Decode(r io.Reader) (Tape, error) {
 	var t Tape
-	var raw bytes.Buffer
-	d := yaml.NewDecoder(io.TeeReader(r, &raw))
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return t, err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return t, err
+	}
+	d := yaml.NewDecoder(bytes.NewReader(raw))
 	d.KnownFields(true)
 	if err := d.Decode(&t); err != nil {
 		return t, err
@@ -124,7 +131,7 @@ func Decode(r io.Reader) (Tape, error) {
 			ExpectSSE map[string]any `yaml:"expect_sse"`
 		} `yaml:"assertions"`
 	}
-	if err := yaml.Unmarshal(raw.Bytes(), &presence); err != nil {
+	if err := yaml.Unmarshal(raw, &presence); err != nil {
 		return t, err
 	}
 	for _, assertion := range presence.Assertions {
@@ -135,9 +142,8 @@ func Decode(r io.Reader) (Tape, error) {
 		}
 	}
 	if t.Version == 1 || len(t.Expect.Faults) != 0 {
-		var doc yaml.Node
-		if err := yaml.Unmarshal(raw.Bytes(), &doc); err != nil {
-			return t, err
+		if len(doc.Content) == 0 {
+			return t, fmt.Errorf("empty tape document")
 		}
 		var err error
 		if t.Version == 1 {
@@ -147,6 +153,16 @@ func Decode(r io.Reader) (Tape, error) {
 		}
 		if err != nil {
 			return t, err
+		}
+	}
+	if t.Version == 2 && len(doc.Content) != 0 {
+		for i, item := range yamlItems(yamlField(doc.Content[0], "tls_passthrough")) {
+			if item.Kind == yaml.AliasNode {
+				item = item.Alias
+			}
+			if item.Kind != yaml.ScalarNode || item.Tag != "!!str" {
+				return t, fmt.Errorf("tls_passthrough[%d]: expected a string", i)
+			}
 		}
 	}
 	if err := validate(t); err != nil {
@@ -756,7 +772,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			sseResults[s.Name] = func() streamEvidence {
 				runID, admission, cleanup := p.WatchSSEAdmission()
 				defer cleanup()
-				return runStreamWithAdmission(ctx, serverURL, *s.Stream, nil, runID, admission, roots)
+				return runStreamWithAdmission(ctx, serverURL, *s.Stream, nil, runID, admission, t.TLSPassthrough, t.TLSMITM, roots)
 			}()
 		case s.GRPC != nil:
 			status, e := runGRPC(ctx, serverURL, *s.GRPC, roots)

@@ -87,6 +87,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	}
 	resp.Header.Del(TransportErrorHeader)
 	if resp.StatusCode != 101 {
+		p.innerUsable.Add(1)
 		defer resp.Body.Close()
 		stripHop(resp.Header)
 		copyHeaders(w.Header(), resp.Header)
@@ -116,6 +117,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 		http.Error(w, err.Error(), 502)
 		return
 	}
+	p.innerUsable.Add(1)
 	_ = up.SetDeadline(time.Time{})
 	h, ok := w.(http.Hijacker)
 	if !ok {

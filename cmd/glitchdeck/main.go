@@ -280,17 +280,6 @@ func serve(args []string, isDemo bool) int {
 		cfg = fault.Config{Seed: t.Seed, Rules: t.Rules}
 		startSeq = t.StartSeq
 		passthrough = append(passthrough, t.TLSPassthrough...)
-		if len(t.TLSPassthrough) != 0 {
-			// Serving tapes without passthrough retains the original flag-only policy.
-			tlsFromFlag := false
-			f.Visit(func(flag *flag.Flag) { tlsFromFlag = tlsFromFlag || flag.Name == "tls" })
-			if !tlsFromFlag {
-				*tlsEnabled = *tlsEnabled || t.TLSMITM
-			}
-			if *tlsEnabled {
-				upstreamAllow = append(upstreamAllow, t.UpstreamAllow...)
-			}
-		}
 	}
 	if len(passthrough) != 0 && !*tlsEnabled {
 		fmt.Fprintln(os.Stderr, "tls-passthrough has no effect without --tls")

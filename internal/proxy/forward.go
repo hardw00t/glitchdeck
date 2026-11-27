@@ -33,6 +33,7 @@ type Options struct {
 	ProxyAuth            string
 	BeforeRequest        func(uint64)
 	OnAdmission          func(seq uint64, method, path, host string)
+	OnReset              func()
 	RequireUpstreamAllow bool
 	AllowLoopbackEgress  bool
 }
@@ -76,7 +77,7 @@ func (p *Proxy) SetOptions(o Options) {
 	o.TLSPassthrough = slices.Clone(o.TLSPassthrough)
 	p.options = o
 	closeIdleTransports(p.transports)
-	p.transports = [4]*http.Transport{}
+	p.transports = [8]*http.Transport{}
 }
 
 func (p *Proxy) TLSInfo() (bool, string) {
@@ -286,7 +287,7 @@ func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restri
 	return nil, last
 }
 
-func closeIdleTransports(transports [4]*http.Transport) {
+func closeIdleTransports(transports [8]*http.Transport) {
 	for _, t := range transports {
 		if t != nil {
 			t.CloseIdleConnections()
@@ -302,6 +303,9 @@ func (p *Proxy) transportFor(ctx context.Context, h2c bool) *http.Transport {
 	i := 0
 	if restrict {
 		i += 2
+	}
+	if ctx.Value(reverseTargetKey{}) == true {
+		i += 4
 	}
 	if h2c {
 		i++

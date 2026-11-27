@@ -69,10 +69,13 @@ type Proxy struct {
 	connectEgressDenied atomic.Int64
 	innerEgressDenied   atomic.Int64
 	dialFailed          atomic.Int64
+	innerUsable         atomic.Int64
+	interceptedEmpty    atomic.Int64
 	bus                 *telemetry.Bus
-	transports          [4]*http.Transport
+	transports          [8]*http.Transport
 	gate                sync.Mutex
 	admission           sync.Mutex
+	resetBarrier        sync.RWMutex
 	generation          uint64
 	activeWS            int
 	activeTunnels       int
@@ -179,6 +182,8 @@ type TrafficStats struct {
 	RequestsTotal     int64 `json:"-"`
 	Connects          int64 `json:"connects"`
 	InnerRequests     int64 `json:"inner_requests"`
+	InnerUsable       int64 `json:"-"`
+	InterceptedEmpty  int64 `json:"-"`
 	InterceptedOK     int64 `json:"intercepted_ok"`
 	TLSRejected       int64 `json:"tls_rejected"`
 	PassthroughOK     int64 `json:"passthrough_ok"`
@@ -189,10 +194,13 @@ type TrafficStats struct {
 }
 
 func (p *Proxy) TrafficStats() TrafficStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	connects, requests := p.connects.Load(), int64(p.requests.Load())
 	innerDenied := p.innerEgressDenied.Load()
 	return TrafficStats{RequestsTotal: requests, Connects: connects, InnerRequests: requests - connects,
 		InterceptedOK: p.interceptedOK.Load(), TLSRejected: p.tlsRejected.Load(),
+		InnerUsable: p.innerUsable.Load(), InterceptedEmpty: p.interceptedEmpty.Load(),
 		PassthroughOK: p.passthroughOK.Load(), BlindOK: p.blindOK.Load(),
 		EgressDenied: p.connectEgressDenied.Load() + innerDenied, InnerEgressDenied: innerDenied, DialFailed: p.dialFailed.Load()}
 }
@@ -237,6 +245,8 @@ func (p *Proxy) WatchSSEAdmission() (string, <-chan []string, func()) {
 }
 func (p *Proxy) Reset() { p.ResetWith(nil) }
 func (p *Proxy) ResetWith(fn func()) {
+	p.resetBarrier.Lock()
+	defer p.resetBarrier.Unlock()
 	p.gate.Lock()
 	defer p.gate.Unlock()
 	p.mu.Lock()
@@ -262,11 +272,16 @@ func (p *Proxy) ResetWith(fn func()) {
 	p.connectEgressDenied.Store(0)
 	p.innerEgressDenied.Store(0)
 	p.dialFailed.Store(0)
+	p.innerUsable.Store(0)
+	p.interceptedEmpty.Store(0)
 	clear(p.stats)
 	clear(p.applied)
 	clear(p.sseEncodingWarned)
 	clear(p.burstUsed)
 	p.mu.Unlock()
+	if p.options.OnReset != nil {
+		p.options.OnReset()
+	}
 	if fn != nil {
 		fn()
 	}
@@ -442,15 +457,25 @@ func normalizeSelfRequest(r *http.Request) bool {
 	return true
 }
 
+type probeKey struct{}
+
+// ServeProbeHTTP serves a trusted in-process assertion after Drain.
+func (p *Proxy) ServeProbeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), probeKey{}, true)))
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.resetBarrier.RLock()
 	p.mu.Lock()
-	if p.closed || p.draining {
+	if p.closed || p.draining && r.Context().Value(probeKey{}) != true {
 		p.mu.Unlock()
+		p.resetBarrier.RUnlock()
 		http.Error(w, "proxy closed", http.StatusServiceUnavailable)
 		return
 	}
 	p.beginPendingLocked()
 	p.mu.Unlock()
+	p.resetBarrier.RUnlock()
 	defer p.finishPending()
 	if !prepareProtocolRequest(r) {
 		http.Error(w, "request does not match CONNECT authority", http.StatusMisdirectedRequest)
@@ -461,7 +486,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !p.authorize(w, r, tunnel || r.URL.IsAbs()) {
 		return
 	}
+	if seen := MetaFrom(r.Context()).innerSeen; seen != nil {
+		seen.Store(true)
+	}
+	p.mu.Lock()
 	p.requests.Add(1)
+	if tunnel {
+		p.connects.Add(1)
+	}
+	p.mu.Unlock()
 	if tunnel {
 		p.connect(w, r)
 		return
@@ -490,7 +523,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.admission.Lock()
 	p.gate.Lock()
 	p.mu.Lock()
-	session, gen, closed := p.ctx, p.generation, p.closed || p.draining
+	session, gen, closed := p.ctx, p.generation, p.closed || p.draining && r.Context().Value(probeKey{}) != true
 	p.mu.Unlock()
 	if closed || session.Err() != nil {
 		p.gate.Unlock()
@@ -581,6 +614,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	incoming := r
 	r = r.WithContext(ctx)
+	usable := false
+	markUsable := func() {
+		if !usable {
+			p.innerUsable.Add(1)
+			usable = true
+		}
+	}
 	meta := MetaFrom(ctx)
 	streamID := streamFrom(ctx)
 	isGRPC := r.ProtoMajor == 2 && fault.NativeGRPC(ctype)
@@ -590,6 +630,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ruleID = rule.ID
 	}
 	markApplied := func() {
+		markUsable()
 		applied = true
 		p.countRule(gen, rule, "applied", "")
 	}
@@ -893,6 +934,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		injectGRPC(14, "upstream is not HTTP/2", "proxy")
 		return
 	}
+	markUsable()
 	resp.Header.Del(TransportErrorHeader)
 	status, upstreamHeaders = resp.StatusCode, resp.Header
 	media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))

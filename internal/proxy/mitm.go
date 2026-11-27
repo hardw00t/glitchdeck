@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,7 +38,6 @@ func (p *Proxy) tunnelSequence() (uint64, uint64) {
 }
 
 func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
-	p.connects.Add(1)
 	start := time.Now()
 	host, port, err := net.SplitHostPort(r.Host)
 	n, portErr := strconv.ParseUint(port, 10, 16)
@@ -113,14 +115,24 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if intercept {
+		rejected := false
 		if secured, spec, ok := f.intercept(c, rw.Reader, r.Host, host, p.options.MITMALPN, func(name string, err error) {
-			p.tlsRejected.Add(1)
+			if certificateAlert(err) {
+				p.tlsRejected.Add(1)
+				rejected = true
+			}
 			fmt.Fprintf(os.Stderr, "tls_handshake_failed: host=%q sni=%q: %q\n", r.Host, name, err)
 			p.publish(gen, "tls_handshake_failed", map[string]any{"host": r.Host, "sni": name, "error": err.Error(), "ts_ms": start.UnixMilli()})
 		}); ok {
+			seen := new(atomic.Bool)
+			spec.innerSeen = seen
+			secured = &countEmptyConn{Conn: secured, p: p, gen: gen, seen: seen}
 			p.interceptedOK.Add(1)
 			handedOver = true
 			f.route(secured, spec)
+		}
+		if !handedOver && !rejected {
+			p.interceptedEmpty.Add(1)
 		}
 		return
 	}
@@ -186,13 +198,56 @@ func (f *front) intercept(c net.Conn, br *bufio.Reader, authority, host, alpn st
 			failed(serverName, err)
 			return nil, ConnMeta{}, false
 		}
+		firstApp := bufio.NewReader(tc)
+		if _, err := firstApp.Peek(1); err != nil {
+			if certificateAlert(err) {
+				failed(serverName, err)
+			}
+			return nil, ConnMeta{}, false
+		}
 		state := tc.ConnectionState()
 		meta.Scheme, meta.SNI, meta.ALPN, meta.tls = "https", state.ServerName, state.NegotiatedProtocol, &state
-		conn = &interceptedTLS{Conn: tc, raw: c}
+		conn = &bufferedConn{Conn: &interceptedTLS{Conn: tc, raw: c}, r: firstApp}
 	}
 	_ = conn.SetDeadline(time.Time{})
 	return conn, meta, true
 }
+
+func certificateAlert(err error) bool {
+	var op *net.OpError
+	if !errors.As(err, &op) || op.Op != "remote error" {
+		return false
+	}
+	switch op.Err.Error() {
+	case "tls: bad certificate", "tls: unsupported certificate", "tls: revoked certificate",
+		"tls: expired certificate", "tls: unknown certificate", "tls: unknown certificate authority",
+		"tls: certificate unobtainable", "tls: bad certificate status response", "tls: bad certificate hash value":
+		return true
+	}
+	return false
+}
+
+type countEmptyConn struct {
+	net.Conn
+	p    *Proxy
+	gen  uint64
+	seen *atomic.Bool
+	once sync.Once
+}
+
+func (c *countEmptyConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		c.p.gate.Lock()
+		defer c.p.gate.Unlock()
+		if c.gen == c.p.generation && !c.seen.Load() {
+			c.p.interceptedEmpty.Add(1)
+		}
+	})
+	return err
+}
+
+func (c *countEmptyConn) Unwrap() net.Conn { return c.Conn }
 
 type interceptedTLS struct {
 	*tls.Conn

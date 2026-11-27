@@ -37,6 +37,8 @@ func TestPassthroughMatching(t *testing.T) {
 		{"*.example.com", "a.b.example.com", "443", true},
 		{"[::1]:8443", "::1", "8443", true},
 		{"::1", "::1", "443", true},
+		{"[::1]", "::1", "443", true},
+		{"*.2.10", "192.0.2.10", "443", false},
 	}
 	for _, tt := range tests {
 		p := New(nil, fault.Config{}, nil)
@@ -50,12 +52,12 @@ func TestPassthroughMatching(t *testing.T) {
 }
 
 func TestValidatePassthrough(t *testing.T) {
-	for _, s := range []string{"example.com", " *.example.com:443 ", "127.0.0.1", "::1", "[::1]:8443"} {
+	for _, s := range []string{"example.com", " *.example.com:443 ", "127.0.0.1", "::1", "[::1]", "[::1]:8443"} {
 		if err := ValidatePassthrough(s); err != nil {
 			t.Errorf("%q: %v", s, err)
 		}
 	}
-	for _, s := range []string{"", "*", "any", "*.", "*.com", "*.127.0.0.1", "api.*.com", "a*.example.com", "https://example.com", "example.com/path", "example.com?q=x", "a@example.com", "127.0.0.0/8", "example.com:0", "example.com:65536", "[bad]:443", strings.Repeat("a", 64) + ".com", strings.Repeat("a.", 127) + "com"} {
+	for _, s := range []string{"", "*", "any", "*.", "*.com", "*.127.0.0.1", "api.*.com", "a*.example.com", "https://example.com", "example.com/path", "example.com?q=x", "a@example.com", "127.0.0.0/8", "example.com:0", "example.com:65536", "[bad]:443", "[::1]:", strings.Repeat("a", 64) + ".com", strings.Repeat("a.", 127) + "com"} {
 		if err := ValidatePassthrough(s); err == nil {
 			t.Errorf("accepted %q", s)
 		}
@@ -88,9 +90,13 @@ func FuzzPassthrough(f *testing.F) {
 func TestPassthroughDoesNotGrantEgress(t *testing.T) {
 	p := New(nil, fault.Config{}, nil)
 	defer p.Close()
-	p.SetOptions(Options{TLSPassthrough: []string{"evil.test"}})
+	ca, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetOptions(Options{CA: ca, TLSPassthrough: []string{"evil.test"}})
 	w := httptest.NewRecorder()
-	p.ServeHTTP(w, httptest.NewRequest(http.MethodConnect, "http://evil.test:443", nil))
+	p.ServeHTTP(w, httptest.NewRequest(http.MethodConnect, "evil.test:443", nil))
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("got status %d", w.Code)
 	}
@@ -109,9 +115,13 @@ func TestPassthroughDeniedBeforeDNS(t *testing.T) {
 	defer func() { net.DefaultResolver = old }()
 	p := New(nil, fault.Config{}, nil)
 	defer p.Close()
-	p.SetOptions(Options{TLSPassthrough: []string{"evil.test"}})
+	ca, err := tlsmitm.Ephemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetOptions(Options{CA: ca, TLSPassthrough: []string{"evil.test"}})
 	w := httptest.NewRecorder()
-	p.ServeHTTP(w, httptest.NewRequest(http.MethodConnect, "http://evil.test:443", nil))
+	p.ServeHTTP(w, httptest.NewRequest(http.MethodConnect, "evil.test:443", nil))
 	if w.Code != http.StatusForbidden || calls.Load() != 0 {
 		t.Fatalf("status %d, DNS dials %d", w.Code, calls.Load())
 	}

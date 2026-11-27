@@ -300,6 +300,13 @@ func TestExposedListenerReachesConfiguredLoopbackTarget(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("configured reverse target: got %d", w.Code)
 	}
+	r = httptest.NewRequest(http.MethodGet, up.URL, nil)
+	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, exposed))
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("forward request reused reverse target connection: got %d", w.Code)
+	}
 	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	defer other.Close()
 	r = httptest.NewRequest(http.MethodGet, other.URL, nil)

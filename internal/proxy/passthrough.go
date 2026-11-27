@@ -18,10 +18,14 @@ func passthroughParts(pattern string) (string, string, error) {
 	}
 	host, port := s, ""
 	if strings.HasPrefix(s, "[") {
-		var err error
-		host, port, err = net.SplitHostPort(s)
-		if err != nil {
-			return "", "", fmt.Errorf("invalid bracketed IPv6")
+		if strings.HasSuffix(s, "]") {
+			host = s[1 : len(s)-1]
+		} else {
+			var err error
+			host, port, err = net.SplitHostPort(s)
+			if err != nil {
+				return "", "", fmt.Errorf("invalid bracketed IPv6")
+			}
 		}
 		ip, err := netip.ParseAddr(host)
 		if err != nil || !ip.Is6() || ip.Zone() != "" {
@@ -42,7 +46,7 @@ func passthroughParts(pattern string) (string, string, error) {
 			return "", "", fmt.Errorf("port must be between 1 and 65535")
 		}
 		port = strings.TrimLeft(port, "0")
-	} else if strings.HasPrefix(s, "[") || strings.HasSuffix(s, ":") && !strings.Contains(host, ":") {
+	} else if strings.HasSuffix(s, ":") {
 		return "", "", fmt.Errorf("port must be between 1 and 65535")
 	}
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
@@ -87,20 +91,23 @@ func ValidatePassthrough(pattern string) error {
 }
 
 func (p *Proxy) passthrough(host, port string) (string, bool) {
-	if len(p.options.TLSPassthrough) == 0 {
-		return "", false
-	}
+	return MatchPassthrough(p.options.TLSPassthrough, host, port)
+}
+
+// MatchPassthrough matches a CONNECT authority against passthrough patterns.
+func MatchPassthrough(patterns []string, host, port string) (string, bool) {
 	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	if ip, err := netip.ParseAddr(host); err == nil {
+	ip, ipErr := netip.ParseAddr(host)
+	if ipErr == nil {
 		host = ip.String()
 	}
 	port = strings.TrimLeft(port, "0")
-	for _, raw := range p.options.TLSPassthrough {
+	for _, raw := range patterns {
 		pattern, matchPort, err := passthroughParts(raw)
 		if err != nil || matchPort != "" && matchPort != port {
 			continue
 		}
-		if host == pattern || strings.HasPrefix(pattern, "*.") && len(host) > len(pattern)-1 && strings.HasSuffix(host, pattern[1:]) {
+		if host == pattern || ipErr != nil && strings.HasPrefix(pattern, "*.") && len(host) > len(pattern)-1 && strings.HasSuffix(host, pattern[1:]) {
 			return strings.TrimSpace(raw), true
 		}
 	}

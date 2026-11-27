@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/h2tap"
@@ -23,6 +24,7 @@ type ConnMeta struct {
 	MITM              bool
 	Tap               *h2tap.Conn
 	tls               *tls.ConnectionState
+	innerSeen         *atomic.Bool
 }
 
 // ForwardH2CHeader marks a prior-knowledge proxy request whose authority is the upstream.
