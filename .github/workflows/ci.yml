@@ -1,0 +1,47 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          test -z "$unformatted"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: node --test internal/ui/model.test.mjs
+      - run: sh -n install.sh
+      - name: Build and smoke test
+        shell: bash
+        run: |
+          go build -o "$RUNNER_TEMP/glitchdeck" ./cmd/glitchdeck
+          set +e
+          "$RUNNER_TEMP/glitchdeck" test examples/checkout-dup-webhook.tape.yaml --json
+          fault=$?
+          "$RUNNER_TEMP/glitchdeck" test examples/clean.tape.yaml --json
+          clean=$?
+          set -e
+          [[ "$fault" -eq 1 && "$clean" -eq 0 ]]
+      - name: Cross-build and package all targets
+        run: scripts/package.sh 0.0.0-ci "$RUNNER_TEMP/glitchdeck-dist"
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          version: local
+          tape: examples/clean.tape.yaml

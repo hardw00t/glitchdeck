@@ -5,20 +5,138 @@ inputs:
     description: Tape file to run
     required: true
   version:
-    description: Go module version or ref
+    description: Release tag, major tag, source ref, or local
     required: false
-    default: latest
+    default: ""
+outputs:
+  exit-code:
+    description: Exit code from the tape test
+    value: ${{ steps.test.outputs.exit-code }}
+  report:
+    description: Path to the JSON report
+    value: ${{ steps.test.outputs.report }}
 runs:
   using: composite
   steps:
-    - name: Install glitchdeck
+    - name: Resolve version
+      id: resolve
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
-      run: go install "github.com/hardw00t/glitchdeck/cmd/glitchdeck@${VERSION}"
+        INPUT_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        ref="${INPUT_VERSION:-${ACTION_REF:-latest}}"
+        tag=""
+        semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+        if [[ "$ref" == *$'\n'* || "$ref" == *$'\r'* ]]; then echo "Invalid version ref" >&2; exit 1; fi
+        if [[ "$ref" =~ $semver ]]; then
+          tag="$ref"
+        elif [[ "$ref" =~ ^v[0-9]+$ ]]; then
+          page=1
+          candidates="$RUNNER_TEMP/glitchdeck-releases.jsonl"
+          : > "$candidates"
+          while :; do
+            response="$RUNNER_TEMP/glitchdeck-release-page.json"
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/hardw00t/glitchdeck/releases?per_page=100&page=$page" -o "$response"
+            count=$(python3 -c 'import json,sys; data=json.load(open(sys.argv[1], encoding="utf-8")); assert isinstance(data,list); sys.stdout.write(str(len(data)))' "$response")
+            python3 -c 'import json,sys; [print(json.dumps(r)) for r in json.load(open(sys.argv[1], encoding="utf-8"))]' "$response" >> "$candidates"
+            (( count < 100 )) && break
+            page=$((page + 1))
+          done
+          tag=$(python3 -c 'import json,re,sys
+        major=sys.argv[1][1:]
+        versions=[]
+        for line in open(sys.argv[2], encoding="utf-8"):
+            release=json.loads(line)
+            match=re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", release.get("tag_name", ""))
+            if match and match.group(1)==major and not release.get("prerelease") and not release.get("draft"):
+                versions.append((tuple(map(int, match.groups())), release["tag_name"]))
+        if versions: sys.stdout.write(max(versions)[1])' "$ref" "$candidates")
+          if [[ -z "$tag" ]]; then
+            echo "No stable release found for $ref" >&2
+            exit 1
+          fi
+        elif [[ "$ref" == latest ]]; then
+          response="$RUNNER_TEMP/glitchdeck-latest.json"
+          status=$(curl -sSL -o "$response" -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/hardw00t/glitchdeck/releases/latest)
+          if [[ "$status" == 200 ]]; then
+            tag=$(python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1], encoding="utf-8"))["tag_name"])' "$response")
+            if [[ ! "$tag" =~ $semver ]]; then
+              echo "Latest release has an invalid tag: $tag" >&2
+              exit 1
+            fi
+          elif [[ "$status" != 404 ]]; then
+            echo "Failed to resolve latest release (HTTP $status)" >&2
+            exit 1
+          fi
+        fi
+        echo "ref=$ref" >> "$GITHUB_OUTPUT"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+    - name: Set up Go for source installation
+      if: steps.resolve.outputs.tag == ''
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install from source
+      if: steps.resolve.outputs.tag == ''
+      shell: bash
+      env:
+        REF: ${{ steps.resolve.outputs.ref }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        if [[ "$REF" == local ]]; then
+          bin=$(mktemp -d "$RUNNER_TEMP/glitchdeck-bin.XXXXXX")
+          executable=glitchdeck
+          if [[ "$RUNNER_OS" == Windows ]]; then executable=glitchdeck.exe; fi
+          (cd "$ACTION_PATH" && go build -o "$bin/$executable" ./cmd/glitchdeck)
+        else
+          bin="$(go env GOPATH)/bin"
+          GOBIN="$bin" go install "github.com/hardw00t/glitchdeck/cmd/glitchdeck@$REF"
+        fi
+        if [[ "$RUNNER_OS" == Windows ]]; then bin=$(cygpath -w "$bin"); fi
+        echo "$bin" >> "$GITHUB_PATH"
+    - name: Install release
+      if: steps.resolve.outputs.tag != ''
+      shell: bash
+      env:
+        TAG: ${{ steps.resolve.outputs.tag }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS" in Linux) os=linux ;; macOS) os=darwin ;; Windows) os=windows ;; *) echo "Unsupported OS: $RUNNER_OS" >&2; exit 1 ;; esac
+        case "$RUNNER_ARCH" in X64) arch=amd64 ;; ARM64) arch=arm64 ;; *) echo "Unsupported architecture: $RUNNER_ARCH" >&2; exit 1 ;; esac
+        ext=tar.gz
+        [[ "$os" == windows ]] && ext=zip
+        archive="glitchdeck_${TAG#v}_${os}_${arch}.${ext}"
+        dir=$(mktemp -d "$RUNNER_TEMP/glitchdeck-release.XXXXXX")
+        base="https://github.com/hardw00t/glitchdeck/releases/download/$TAG"
+        curl -fsSL "$base/$archive" -o "$dir/$archive"
+        curl -fsSL "$base/SHA256SUMS" -o "$dir/SHA256SUMS"
+        cd "$dir"
+        expected=$(awk -v file="$archive" '$2 == file || $2 == "*" file { print $1 }' SHA256SUMS)
+        if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then echo "Missing or invalid checksum for $archive" >&2; exit 1; fi
+        if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$archive"); else actual=$(shasum -a 256 "$archive"); fi
+        actual=${actual%% *}
+        if [[ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ]]; then echo "Checksum mismatch for $archive" >&2; exit 1; fi
+        if [[ "$ext" == zip ]]; then unzip -q "$archive"; else tar -xzf "$archive"; fi
+        if [[ "$RUNNER_OS" == Windows ]]; then dir=$(cygpath -w "$dir"); fi
+        echo "$dir" >> "$GITHUB_PATH"
     - name: Run tape
+      id: test
       shell: bash
       env:
         TAPE: ${{ inputs.tape }}
       run: |
-        "$(go env GOPATH)/bin/glitchdeck" test "$TAPE" --json
+        report="$(mktemp -d "$RUNNER_TEMP/glitchdeck-report.XXXXXX")/report.json"
+        if [[ "$RUNNER_OS" == Windows ]]; then report=$(cygpath -w "$report"); fi
+        set +e
+        glitchdeck test "$TAPE" --json --report "$report"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        exit "$code"
