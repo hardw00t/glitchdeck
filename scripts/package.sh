@@ -12,9 +12,9 @@ if ! printf '%s\n' "$version" | grep -Eq "$semver"; then
     echo "Invalid semantic version: $version" >&2
     exit 1
 fi
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 mkdir -p "$2"
-out=$(CDPATH= cd -- "$2" && pwd)
+out=$(CDPATH='' cd -- "$2" && pwd)
 commit=$(git -C "$root" rev-parse --short HEAD)
 date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 tmp=$(mktemp -d)
