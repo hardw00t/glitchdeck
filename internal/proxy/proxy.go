@@ -1266,6 +1266,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				responseRecord.Header = resp.Header.Clone()
 				stripHop(responseRecord.Header)
 				encoding := strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ", ")))
+				if resp.StatusCode == http.StatusPartialContent && encoding != "" && encoding != "identity" {
+					responseRecord.Truncated = true
+				}
 				responseRecord.Header.Del("Content-Length")
 				if r.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified || resp.StatusCode == http.StatusNoContent || resp.StatusCode < 200 {
 					responseRecord.Header.Del("Content-Encoding")
@@ -1290,7 +1293,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					drainErr = raw.err
 					_ = source.Close()
 					responseRecord.Body = capture.body
-					responseRecord.Truncated = capture.truncated || capture.failed
+					responseRecord.Truncated = responseRecord.Truncated || capture.truncated || capture.failed
 					if capture.failed {
 						responseRecord.Status = 0
 					}
@@ -1347,9 +1350,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream unavailable", status)
 		return
 	}
+	originalBody := resp.Body
+	var decoder *sseDecoder
 	defer func() {
 		if !responseAsync {
-			_ = resp.Body.Close()
+			if decoder != nil {
+				_ = decoder.Close()
+			}
+			_ = originalBody.Close()
 		}
 	}()
 	if isGRPC && resp.ProtoMajor != 2 {
@@ -1377,7 +1385,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyless := r.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified || resp.StatusCode == http.StatusNoContent || resp.StatusCode < 200
 	decodedResponse := false
-	var decoder *sseDecoder
 	if _, ok := resp.Body.(*sseDecoder); ok {
 		decodedResponse = true
 	}
@@ -1385,6 +1392,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		responseRecord.Status = resp.StatusCode
 		responseRecord.Header = resp.Header.Clone()
 		stripHop(responseRecord.Header)
+		if resp.StatusCode == http.StatusPartialContent && encoding != "" && encoding != "identity" {
+			responseRecord.Truncated = true
+		}
 		if len(resp.Trailer) != 0 {
 			responseRecord.Truncated = true
 		}
