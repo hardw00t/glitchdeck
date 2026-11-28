@@ -57,6 +57,7 @@ type Record struct {
 	HasTrailers            bool
 	BodyCaptureStarted     bool
 	FilteredRepresentation bool
+	UnscannableEncoding    bool
 	AssertionProbe         bool
 }
 type ResponseRecord struct {
@@ -67,6 +68,7 @@ type ResponseRecord struct {
 	Truncated              bool
 	Intentional            bool
 	FilteredRepresentation bool
+	UnscannableEncoding    bool
 }
 
 type CassetteError struct {
@@ -123,10 +125,12 @@ type responseCapture struct {
 	eof       bool
 	reserve   func(int) int
 	discard   bool
+	seen      bool
 }
 
 func (c *responseCapture) Read(b []byte) (int, error) {
 	n, err := c.ReadCloser.Read(b)
+	c.seen = c.seen || n > 0
 	take := 0
 	if !c.truncated && !c.discard {
 		take = min(n, maxBody-len(c.body))
@@ -923,9 +927,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		headers := r.Header.Clone()
 		stripHop(headers)
+		unsafeEncoding := unscannableEncoding(r.Header, r.TransferEncoding)
+		contentEncoding := strings.ToLower(strings.TrimSpace(strings.Join(r.Header.Values("Content-Encoding"), ", ")))
+		if contentEncoding != "" && contentEncoding != "identity" && len(headers.Values("Content-Encoding")) == 0 {
+			unsafeEncoding = true
+		}
 		rec := Record{Seq: seq, Method: recordMethod, Path: r.URL.RequestURI(), Header: headers, Body: captured,
 			WebSocket: ws, SSE: isSSE, At: start, Proto: recordProto, UnrecordableBody: missing, BodyTruncated: truncated,
-			BodyCaptureStarted: capturing, MITM: meta.MITM, HasTrailers: hasTrailers, AssertionProbe: r.Context().Value(probeKey{}) == true, FilteredRepresentation: representationRemoved(r.Header, headers, false)}
+			BodyCaptureStarted: capturing, MITM: meta.MITM, HasTrailers: hasTrailers, AssertionProbe: r.Context().Value(probeKey{}) == true, FilteredRepresentation: representationRemoved(r.Header, headers, unsafeEncoding), UnscannableEncoding: unsafeEncoding && len(captured) != 0}
 		if r.URL.IsAbs() {
 			rec.URL = r.URL.String()
 		} else if meta.MITM {
@@ -1289,17 +1298,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				responseRecord.Header = resp.Header.Clone()
 				stripHop(responseRecord.Header)
 				encoding := strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ", ")))
-				responseRecord.FilteredRepresentation = representationRemoved(resp.Header, responseRecord.Header, encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate")
+				responseRecord.UnscannableEncoding = unscannableEncoding(resp.Header, resp.TransferEncoding)
+				responseRecord.FilteredRepresentation = representationRemoved(resp.Header, responseRecord.Header, responseRecord.UnscannableEncoding || encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate")
 				if resp.StatusCode == http.StatusPartialContent && encoding != "" && encoding != "identity" {
 					responseRecord.Truncated = true
 				}
 				responseRecord.Header.Del("Content-Length")
 				if r.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified || resp.StatusCode == http.StatusNoContent || resp.StatusCode < 200 {
 					responseRecord.Header.Del("Content-Encoding")
+					responseRecord.UnscannableEncoding = false
 					_, drainErr = io.Copy(io.Discard, resp.Body)
 				} else if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
-					responseRecord.Truncated = true
-					_, drainErr = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+					n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+					drainErr = err
+					responseRecord.UnscannableEncoding = n > 0
+					responseRecord.Header.Del("Content-Encoding")
 				} else {
 					responseRecord.Header.Del("Content-Encoding")
 					raw := &transportReader{Reader: resp.Body, remaining: maxBody}
@@ -1317,9 +1330,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					drainErr = raw.err
 					_ = source.Close()
 					responseRecord.Body = capture.body
-					responseRecord.Truncated = responseRecord.Truncated || capture.truncated || capture.failed
-					if capture.failed {
-						responseRecord.Status = 0
+					responseRecord.UnscannableEncoding = responseRecord.UnscannableEncoding && capture.seen
+					if capture.failed && encoding != "" && encoding != "identity" && raw.err == nil && raw.remaining > 0 && !capture.truncated {
+						responseRecord.Body = nil
+						responseRecord.UnscannableEncoding = raw.remaining < maxBody
+					} else {
+						responseRecord.Truncated = responseRecord.Truncated || capture.truncated || capture.failed
+						if capture.failed {
+							responseRecord.Status = 0
+						}
 					}
 				}
 				responseRecord.Truncated = responseRecord.Truncated || len(resp.Trailer) != 0
@@ -1416,18 +1435,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		responseRecord.Status = resp.StatusCode
 		responseRecord.Header = resp.Header.Clone()
 		stripHop(responseRecord.Header)
-		responseRecord.FilteredRepresentation = representationRemoved(resp.Header, responseRecord.Header, encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate")
+		responseRecord.UnscannableEncoding = unscannableEncoding(resp.Header, resp.TransferEncoding)
+		responseRecord.FilteredRepresentation = representationRemoved(resp.Header, responseRecord.Header, responseRecord.UnscannableEncoding || encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate")
 		if resp.StatusCode == http.StatusPartialContent && encoding != "" && encoding != "identity" {
 			responseRecord.Truncated = true
 		}
 		if len(resp.Trailer) != 0 {
 			responseRecord.Truncated = true
 		}
-		if !bodyless && encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
-			responseRecord.Header.Del("Content-Length")
-			responseRecord.Truncated = true
-		} else if !bodyless {
+		if !bodyless {
 			capture := &responseCapture{ReadCloser: resp.Body}
+			if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
+				capture.discard = true
+				responseRecord.Header.Del("Content-Encoding")
+				responseRecord.Header.Del("Content-Length")
+			}
 			var decoded *responseCapture
 			var encodedWriter *io.PipeWriter
 			var decodedDone chan struct{}
@@ -1473,6 +1495,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				capture.finish()
 				responseRecord.Body = capture.body
+				responseRecord.UnscannableEncoding = responseRecord.UnscannableEncoding && capture.seen
 				responseRecord.Truncated = responseRecord.Truncated || capture.truncated || capture.failed || len(resp.Trailer) != 0
 				if capture.failed {
 					responseRecord.Status = 0
@@ -1484,9 +1507,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					_ = encodedWriter.Close()
 					<-decodedDone
 					responseRecord.Body = decoded.body
-					responseRecord.Truncated = responseRecord.Truncated || decoded.truncated || decoded.failed
-					if decoded.failed {
-						responseRecord.Status = 0
+					if decoded.failed && !capture.failed && !capture.truncated && !decoded.truncated && capture.seen {
+						responseRecord.Body = nil
+						responseRecord.UnscannableEncoding = true
+					} else {
+						responseRecord.Truncated = responseRecord.Truncated || decoded.truncated || decoded.failed
+						if decoded.failed {
+							responseRecord.Status = 0
+						}
 					}
 				}
 			}
@@ -1512,6 +1540,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					finishCapture()
 				}
 			}()
+		}
+		if bodyless {
+			responseRecord.UnscannableEncoding = false
 		}
 	}
 	switch kind {
@@ -1766,6 +1797,29 @@ func inspectorHeaders(h http.Header) map[string]string {
 	}
 	return out
 }
+func unscannableEncoding(h http.Header, transfer []string) bool {
+	encoding := strings.ToLower(strings.TrimSpace(strings.Join(h.Values("Content-Encoding"), ", ")))
+	if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
+		return true
+	}
+	for _, key := range []string{"Grpc-Encoding", "Transfer-Encoding"} {
+		for _, value := range h.Values(key) {
+			for _, coding := range strings.Split(value, ",") {
+				coding = strings.ToLower(strings.TrimSpace(coding))
+				if coding != "" && coding != "identity" && !(key == "Transfer-Encoding" && coding == "chunked") {
+					return true
+				}
+			}
+		}
+	}
+	for _, coding := range transfer {
+		if !strings.EqualFold(strings.TrimSpace(coding), "chunked") && !strings.EqualFold(strings.TrimSpace(coding), "identity") {
+			return true
+		}
+	}
+	return false
+}
+
 func representationRemoved(original, filtered http.Header, decoded bool) bool {
 	for _, key := range []string{"Content-Type", "Content-Encoding", "Content-Transfer-Encoding", "Content-Disposition"} {
 		if decoded && key == "Content-Encoding" {

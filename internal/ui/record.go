@@ -254,7 +254,8 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 			r.bytes += len(k) + len(headers[k])
 		}
 		e.cassette.Response = tape.NewCassetteResponse(res.Status, headers, res.Body, res.Truncated)
-		if res.FilteredRepresentation && len(res.Body) != 0 {
+		e.cassette.Response.UnscannableEncoding = res.UnscannableEncoding
+		if res.FilteredRepresentation && !res.UnscannableEncoding && len(res.Body) != 0 {
 			e.filteredRepresentation = true
 		}
 		size := len(e.cassette.Response.Body)
@@ -503,8 +504,8 @@ func (r *recorder) request(req proxy.Record) {
 		e.ws = &tape.WS{Path: req.Path}
 		r.streams[req.Seq] = e
 	} else {
-		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body)}
-		e.filteredRepresentation = !req.AssertionProbe && req.FilteredRepresentation && len(req.Body) != 0
+		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body), UnscannableEncoding: req.UnscannableEncoding}
+		e.filteredRepresentation = !req.AssertionProbe && req.FilteredRepresentation && !req.UnscannableEncoding && len(req.Body) != 0
 		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host}}
 		if req.URL != "" {
 			e.http.Path = ""
@@ -754,7 +755,7 @@ func (r *recorder) tapeLocked(fallback fault.Config) tape.Tape {
 			if e.sse {
 				h := e.http
 				step.HTTP = nil
-				step.Stream = &tape.Stream{Method: h.Method, Path: h.Path, URL: h.URL, Proto: h.Proto, Headers: h.Headers, Body: h.Body}
+				step.Stream = &tape.Stream{Method: h.Method, Path: h.Path, URL: h.URL, Proto: h.Proto, Headers: h.Headers, Body: h.Body, UnscannableEncoding: h.UnscannableEncoding}
 			}
 		}
 		if e.ws != nil {

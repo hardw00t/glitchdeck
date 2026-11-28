@@ -36,10 +36,11 @@ func TestResponseCaptureDecodesCompressedBodies(t *testing.T) {
 		want             string
 		truncated        bool
 		capturedEncoding string
+		unscannable      bool
 	}{
-		{"gzip", encoded.Bytes(), "secret response", false, ""},
-		{"gzip", []byte("bad gzip"), "", true, ""},
-		{"br", []byte("opaque"), "", true, "br"},
+		{"gzip", encoded.Bytes(), "secret response", false, "", false},
+		{"gzip", []byte("bad gzip"), "", false, "", true},
+		{"br", []byte("opaque"), "", false, "", true},
 	} {
 		t.Run(tc.encoding+tc.want, func(t *testing.T) {
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,8 +58,8 @@ func TestResponseCaptureDecodesCompressedBodies(t *testing.T) {
 				defer func() { _ = recover() }()
 				p.ServeHTTP(httptest.NewRecorder(), localCassetteRequest("GET", "/"))
 			}()
-			if string(got.Body) != tc.want || got.Truncated != tc.truncated || got.Header.Get("Content-Encoding") != tc.capturedEncoding {
-				t.Fatalf("body=%q truncated=%v headers=%v", got.Body, got.Truncated, got.Header)
+			if string(got.Body) != tc.want || got.Truncated != tc.truncated || got.Header.Get("Content-Encoding") != tc.capturedEncoding || got.UnscannableEncoding != tc.unscannable || got.Status != 200 {
+				t.Fatalf("body=%q truncated=%v unscannable=%v status=%d headers=%v", got.Body, got.Truncated, got.UnscannableEncoding, got.Status, got.Header)
 			}
 		})
 	}
@@ -453,5 +454,63 @@ func TestCaptureProbeBodylessAndTrailers(t *testing.T) {
 	p.ServeHTTP(httptest.NewRecorder(), localCassetteRequest("GET", "/"))
 	if !res.Truncated {
 		t.Fatalf("response trailers not marked incomplete: %+v", res)
+	}
+}
+
+func TestCaptureUnscannableTransferAndRequestEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		transfer []string
+		unsafe   bool
+	}{
+		{"chunked", []string{"chunked"}, false},
+		{"unsupported", []string{"compress", "chunked"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := New(nil, fault.Config{}, nil)
+			defer p.Close()
+			p.SetOptions(Options{CassetteUpstream: func(r *http.Request) (*http.Response, error) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				return &http.Response{StatusCode: 200, Header: make(http.Header), TransferEncoding: tc.transfer, Body: io.NopCloser(strings.NewReader("response")), ContentLength: -1}, nil
+			}})
+			p.ShouldCaptureResponse = func(uint64) bool { return true }
+			var reqRecord Record
+			var respRecord ResponseRecord
+			p.OnRequest = func(r Record) { reqRecord = r }
+			p.OnResponse = func(r ResponseRecord) { respRecord = r }
+			req := localCassetteRequest("POST", "/")
+			req.Body = io.NopCloser(strings.NewReader("request"))
+			req.ContentLength = 7
+			req.Header.Set("Connection", "Grpc-Encoding")
+			req.Header.Set("Grpc-Encoding", "gzip")
+			p.ServeHTTP(httptest.NewRecorder(), req)
+			if !reqRecord.UnscannableEncoding || reqRecord.Header.Get("Grpc-Encoding") != "" {
+				t.Fatalf("request capture: %+v", reqRecord)
+			}
+			if respRecord.UnscannableEncoding != tc.unsafe || respRecord.Truncated || string(respRecord.Body) != "response" {
+				t.Fatalf("response capture: %+v", respRecord)
+			}
+		})
+	}
+}
+
+func TestCaptureNominatedGzipRequestIsUnscannable(t *testing.T) {
+	p := New(nil, fault.Config{}, nil)
+	defer p.Close()
+	p.SetOptions(Options{CassetteUpstream: func(r *http.Request) (*http.Response, error) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), ContentLength: 2}, nil
+	}})
+	var got Record
+	p.OnRequest = func(r Record) { got = r }
+	req := localCassetteRequest("POST", "/")
+	req.Body = io.NopCloser(strings.NewReader("compressed"))
+	req.ContentLength = 10
+	req.Header.Set("Connection", "Content-Encoding, Content-Type")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	p.ServeHTTP(httptest.NewRecorder(), req)
+	if !got.UnscannableEncoding || got.Header.Get("Content-Encoding") != "" || got.Header.Get("Content-Type") != "" {
+		t.Fatalf("request capture: %+v", got)
 	}
 }
