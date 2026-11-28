@@ -2,6 +2,7 @@ package tape
 
 import (
 	"errors"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -75,4 +76,41 @@ func TestCassetteMatchingFullSizeBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+}
+
+type oneByteReader struct{ io.Reader }
+
+func (r oneByteReader) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return r.Reader.Read(p)
+}
+
+func TestCassetteMatchingShortReadsRefundReservation(t *testing.T) {
+	body := strings.Repeat("x", 64<<10)
+	c := Cassette{Request: CassetteRequest{Method: "POST", Path: "/", BodySHA256: BodySHA256([]byte(body), nil)}, Response: CassetteResponse{Status: 200}}
+	other := c
+	other.Request.BodySHA256 = strings.Repeat("0", 64)
+	upstream := (Tape{Cassettes: []Cassette{c, other}}).CassetteUpstream()
+	for _, reader := range []io.Reader{strings.NewReader(body), oneByteReader{strings.NewReader(body)}} {
+		resp, err := upstream(httptest.NewRequest("POST", "http://example.com/", reader))
+		if err != nil {
+			t.Fatalf("matching reader %T: %v", reader, err)
+		}
+		resp.Body.Close()
+	}
+}
+
+func TestMatchReaderRefundsUnusedBytes(t *testing.T) {
+	r := &matchReader{r: oneByteReader{strings.NewReader("ab")}}
+	buf := make([]byte, 1024)
+	n, err := r.Read(buf)
+	if n != 1 || err != nil {
+		t.Fatalf("read = %d, %v", n, err)
+	}
+	defer matchWork.Add(-r.reserved)
+	if r.reserved != 32 {
+		t.Fatalf("reserved %d after reading one byte", r.reserved)
+	}
 }

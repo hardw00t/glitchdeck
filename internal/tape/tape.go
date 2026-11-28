@@ -109,17 +109,25 @@ type Result struct {
 	Failures []string `json:"failures"`
 }
 
-func legacyLargeInput(raw []byte) bool {
+func legacyLargeInput(raw []byte, partial bool) bool {
 	data := bytes.TrimPrefix(raw, []byte("\ufeff"))
-	documentStart, version := false, false
+	documentStart, version, unknown, ambiguous := false, false, false, false
 	for len(data) != 0 {
 		line, rest, more := bytes.Cut(data, []byte("\n"))
+		if partial && !more {
+			break
+		}
 		line = bytes.TrimSuffix(line, []byte("\r"))
 		if bytes.ContainsAny(line, "\r\u0085\u2028\u2029") {
-			return false
+			unknown = true
+			break
 		}
 		data = rest
-		if len(line) == 0 || line[0] == ' ' || line[0] == '\t' || line[0] == '#' {
+		if len(line) == 0 || line[0] == '#' {
+			continue
+		}
+		if line[0] == ' ' || line[0] == '\t' || line[0] == '-' && (len(line) == 1 || line[1] == ' ' || line[1] == '\t') {
+			ambiguous = ambiguous || bytes.ContainsAny(line, "[{'\"")
 			continue
 		}
 		if bytes.Equal(line, []byte("---")) && !documentStart && !version {
@@ -128,37 +136,40 @@ func legacyLargeInput(raw []byte) bool {
 		}
 		key, value, ok := bytes.Cut(line, []byte(":"))
 		if !ok || len(key) == 0 {
+			unknown = true
+			continue
+		}
+		if len(key) >= 2 && (key[0] == '\'' || key[0] == '"') && key[len(key)-1] == key[0] {
+			key = key[1 : len(key)-1]
+		}
+		if !bytes.Equal(key, []byte("version")) {
+			ambiguous = ambiguous || bytes.ContainsAny(value, "[{'\"")
+			unknown = true
+			continue
+		}
+		if ambiguous {
+			unknown = true
+			continue
+		}
+		if version {
 			return false
 		}
-		for _, c := range key {
-			if c < 'a' || c > 'z' {
-				if c != '_' {
-					return false
-				}
+		value = bytes.TrimSpace(value)
+		if len(value) == 0 || (value[0] != '1' && value[0] != '2') {
+			if len(value) != 0 && value[0] == '3' && (len(value) == 1 || value[1] == ' ' || value[1] == '\t' || value[1] == '#') {
+				return false
 			}
+			unknown = true
+			continue
 		}
-		if !version {
-			if !bytes.Equal(key, []byte("version")) || !more {
-				return false
-			}
-			value = bytes.TrimSpace(value)
-			if len(value) == 0 || (value[0] != '1' && value[0] != '2') {
-				return false
-			}
-			value = value[1:]
-			if len(value) != 0 && value[0] != ' ' && value[0] != '\t' {
-				return false
-			}
-			value = bytes.TrimSpace(value)
-			if len(value) != 0 && value[0] != '#' {
-				return false
-			}
-			version = true
-		} else if bytes.Equal(key, []byte("version")) {
-			return false
+		value = bytes.TrimSpace(value[1:])
+		if len(value) != 0 && value[0] != '#' {
+			unknown = true
+			continue
 		}
+		version = true
 	}
-	return version
+	return version || partial || unknown
 }
 
 func Decode(r io.Reader) (Tape, error) {
@@ -168,7 +179,7 @@ func Decode(r io.Reader) (Tape, error) {
 		return t, err
 	}
 	if len(raw) > maxTapeInput {
-		if !legacyLargeInput(raw) {
+		if !legacyLargeInput(raw, true) {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
 		rest, err := io.ReadAll(io.LimitReader(r, (64<<20)-int64(len(raw))+1))
@@ -179,7 +190,7 @@ func Decode(r io.Reader) (Tape, error) {
 		if len(raw) > 64<<20 {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
-		if !legacyLargeInput(raw) {
+		if !legacyLargeInput(raw, false) {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
 	}
@@ -208,6 +219,9 @@ func Decode(r io.Reader) (Tape, error) {
 	d.KnownFields(true)
 	if err := d.Decode(&t); err != nil {
 		return t, err
+	}
+	if len(raw) > maxTapeInput && t.Version == 3 {
+		return t, fmt.Errorf("tape exceeds input limit")
 	}
 	var extra any
 	if err := d.Decode(&extra); err != io.EOF {
@@ -285,11 +299,11 @@ func validate(t Tape) error {
 	if len(t.Cassettes) > maxCassettes {
 		return fmt.Errorf("too many cassettes")
 	}
+	components := 0
 	for _, path := range t.IgnoreJSONPaths {
-		for _, part := range strings.Split(path, ".") {
-			if part == "" {
-				return fmt.Errorf("invalid ignore_json_paths")
-			}
+		components += strings.Count(path, ".") + 1
+		if components > 32768 || path == "" || strings.HasPrefix(path, ".") || strings.HasSuffix(path, ".") || strings.Contains(path, "..") {
+			return fmt.Errorf("invalid ignore_json_paths")
 		}
 	}
 	total := 0
@@ -305,6 +319,14 @@ func validate(t Tape) error {
 		}
 		if c.Response.Status < 100 || c.Response.Status > 599 {
 			return fmt.Errorf("cassettes[%d]: invalid response status", i)
+		}
+		headers := make(map[string]struct{}, len(c.Response.Headers))
+		for name := range c.Response.Headers {
+			key := strings.ToLower(name)
+			if _, ok := headers[key]; ok {
+				return fmt.Errorf("cassettes[%d]: duplicate response header", i)
+			}
+			headers[key] = struct{}{}
 		}
 		size, err := c.Response.decodedSize()
 		if err != nil || size > maxCassetteBody || size > maxDecodedAggregate-total || c.Response.Truncated {

@@ -135,8 +135,11 @@ func (r *matchReader) Read(p []byte) (int, error) {
 			break
 		}
 	}
-	r.reserved += n
-	return r.r.Read(p)
+	read, err := r.r.Read(p)
+	unused := n - int64(read)*32
+	matchWork.Add(-unused)
+	r.reserved += n - unused
+	return read, err
 }
 
 func matchJSONComplexityOK(body []byte) bool {
@@ -178,6 +181,14 @@ func matchJSONComplexityOK(body []byte) bool {
 }
 
 func BodySHA256(body []byte, ignore []string) string {
+	parts := make([][]string, len(ignore))
+	for i, path := range ignore {
+		parts[i] = strings.Split(path, ".")
+	}
+	return bodySHA256(body, parts)
+}
+
+func bodySHA256(body []byte, ignore [][]string) string {
 	if !matchJSONComplexityOK(body) {
 		return ""
 	}
@@ -187,8 +198,7 @@ func BodySHA256(body []byte, ignore []string) string {
 	if losslessJSON(body) && d.Decode(&value) == nil {
 		var extra any
 		if d.Decode(&extra) == io.EOF {
-			for _, path := range ignore {
-				parts := strings.Split(path, ".")
+			for _, parts := range ignore {
 				obj, ok := value.(map[string]any)
 				for _, part := range parts[:len(parts)-1] {
 					if !ok {
@@ -332,9 +342,15 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 		}
 		cassettes[i] = replayCassette{cassette: c, valid: valid}
 	}
-	ignore := append([]string(nil), t.IgnoreJSONPaths...)
+	ignore := make([][]string, len(t.IgnoreJSONPaths))
+	for i, path := range t.IgnoreJSONPaths {
+		ignore[i] = strings.Split(path, ".")
+	}
 	return func(req *http.Request) (*http.Response, error) {
 		path := req.URL.EscapedPath()
+		if path == "" {
+			path = "/"
+		}
 		scheme := req.URL.Scheme
 		if scheme == "" && req.TLS != nil {
 			scheme = "https"
@@ -373,7 +389,7 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 				if !matchJSONComplexityOK(body) {
 					return "", true, nil
 				}
-				return BodySHA256(body, ignore), false, nil
+				return bodySHA256(body, ignore), false, nil
 			}()
 			if limited {
 				return nil, &proxy.CassetteError{Kind: "cassette_match_limit"}

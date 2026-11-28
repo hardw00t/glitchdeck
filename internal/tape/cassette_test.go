@@ -27,6 +27,7 @@ func TestCassetteValidation(t *testing.T) {
 		{"invalid status", "version: 3\ncassettes: [{request: {method: GET, path: /}, response: {status: 600}}]", false},
 		{"query", "version: 3\ncassettes: [{request: {method: GET, path: '/?x=1'}, response: {status: 200}}]", false},
 		{"invalid method", "version: 3\ncassettes: [{request: {method: 'GET POST', path: /}, response: {status: 200}}]", false},
+		{"duplicate headers", "version: 3\ncassettes: [{request: {method: GET, path: /}, response: {status: 200, headers: {Content-Type: a, content-type: b}}}]", false},
 		{"oversized", "version: 3\ncassettes: [{request: {method: GET, path: /}, response: {status: 200, body: " + strings.Repeat("x", (4<<20)+1) + "}}]", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -40,6 +41,17 @@ func TestCassetteValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestIgnoreJSONPathComponentLimit(t *testing.T) {
+	paths := []string{strings.Repeat("a.", 16383) + "a", strings.Repeat("b.", 16383) + "b"}
+	if err := validate(Tape{Version: 3, IgnoreJSONPaths: paths}); err != nil {
+		t.Fatalf("at component limit: %v", err)
+	}
+	paths = append(paths, "extra")
+	if err := validate(Tape{Version: 3, IgnoreJSONPaths: paths}); err == nil {
+		t.Fatal("accepted too many ignore path components")
 	}
 }
 
@@ -101,6 +113,17 @@ func TestCassetteEscapedPathIsExact(t *testing.T) {
 	if res.StatusCode != 201 {
 		t.Fatalf("escaped path selected status %d", res.StatusCode)
 	}
+}
+
+func TestCassetteEmptyAbsolutePathMatchesRoot(t *testing.T) {
+	upstream := (Tape{Cassettes: []Cassette{{Request: CassetteRequest{Method: "GET", Path: "/"}, Response: CassetteResponse{Status: 200}}}}).CassetteUpstream()
+	req := httptest.NewRequest("GET", "http://example.com", nil)
+	req.URL.Path = ""
+	resp, err := upstream(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
 }
 
 func FuzzCassette(f *testing.F) {

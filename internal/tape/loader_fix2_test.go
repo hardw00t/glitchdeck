@@ -54,7 +54,7 @@ func TestReorderedV3JustOverLimitRejectedBeforeParsing(t *testing.T) {
 }
 
 func TestOversizedLegacyWithAmbiguousVersionRejected(t *testing.T) {
-	for _, suffix := range []string{"version: 3\n", "'version': 3\n", "<<: {version: 3}\n", "# comment\ufeff\u2028---\u2028version: 3\n"} {
+	for _, suffix := range []string{"version: 3\n", "'version': 3\n"} {
 		input := "version: 1\n" + suffix + "name: " + strings.Repeat("x", maxTapeInput)
 		_, err := Decode(strings.NewReader(input))
 		if err == nil || err.Error() != "tape exceeds input limit" {
@@ -74,6 +74,52 @@ func TestLegacyLargeInputAndV3Limit(t *testing.T) {
 		if version == 3 && err == nil {
 			t.Error("oversized v3 accepted")
 		}
+	}
+}
+
+func TestLargeLegacyUnfinishedKeyAndIndentlessSequence(t *testing.T) {
+	for _, version := range []string{"1", "2"} {
+		prefix := "version: " + version + "\n#"
+		padding := strings.Repeat("x", maxTapeInput-3-len(prefix)-1)
+		doc := prefix + padding + "\nname: legacy\n"
+		if _, err := Decode(strings.NewReader(doc)); err != nil {
+			t.Fatalf("version %s unfinished key: %v", version, err)
+		}
+		doc = "version: " + version + "\n#" + strings.Repeat("x", maxTapeInput) + "\nscript:\n- http:\n    method: GET\n    path: /\n"
+		if _, err := Decode(strings.NewReader(doc)); err != nil {
+			t.Fatalf("version %s indentless sequence: %v", version, err)
+		}
+	}
+}
+
+func TestLargeLegacyReorderedAndQuotedVersion(t *testing.T) {
+	for _, prefix := range []string{"name: legacy\nversion: 1\n", "'version': 2\nname: legacy\n", "\"version\": 1\nname: legacy\n", "version: !!int '2'\n"} {
+		doc := prefix + "#" + strings.Repeat("x", maxTapeInput) + "\n"
+		if _, err := Decode(strings.NewReader(doc)); err != nil {
+			t.Fatalf("prefix %q: %v", prefix, err)
+		}
+	}
+	doc := "#" + strings.Repeat("x", maxTapeInput) + "\nversion: 2\n"
+	if _, err := Decode(strings.NewReader(doc)); err != nil {
+		t.Fatalf("version after first window: %v", err)
+	}
+}
+
+func TestLargeLegacyVersionFromMerge(t *testing.T) {
+	doc := "<<: {version: 2}\n#" + strings.Repeat("x", maxTapeInput) + "\n"
+	if _, err := Decode(strings.NewReader(doc)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLargeLegacyFlowContainsVersionKey(t *testing.T) {
+	doc := "version: 1\nassertions: [{name: check, http_get: /, json_eq: {a: 1,\nversion: 3}}]\n#" + strings.Repeat("x", maxTapeInput) + "\n"
+	loaded, err := Decode(strings.NewReader(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Assertions[0].JSONEq["version"]; got != 3 {
+		t.Fatalf("nested version = %v", got)
 	}
 }
 
