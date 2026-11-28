@@ -731,10 +731,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	seq := p.seq.Add(1)
 	p.gate.Unlock()
 	ws := r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
-	captureResponse := !ws && r.ProtoMajor != 2 && p.OnResponse != nil && p.ShouldCaptureResponse != nil && p.ShouldCaptureResponse(seq)
+	captureResponse := false
 	responseRecord := ResponseRecord{Seq: seq}
 	responseAsync := false
-	if captureResponse || !ws && r.ProtoMajor == 2 && p.OnResponse != nil {
+	if !ws && p.OnResponse != nil {
 		defer func() {
 			if !responseAsync && (captureResponse || responseRecord.Intentional) {
 				p.OnResponse(responseRecord)
@@ -794,6 +794,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.activeWS++
 	}
 	p.gate.Unlock()
+	synthetic := skip == "" && (kind == "rate-limit" || kind == "tcp-rst" && fault.Bool(params, "before_headers", false) || kind == "grpc-glitch" && fault.Int(params, "after_messages", 0) == 0)
+	captureResponse = !synthetic && !ws && r.ProtoMajor != 2 && p.OnResponse != nil && p.ShouldCaptureResponse != nil && p.ShouldCaptureResponse(seq)
 	if p.options.OnAdmission != nil {
 		p.options.OnAdmission(seq, r.Method, r.URL.RequestURI(), host)
 	}
@@ -816,8 +818,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 	ctx, cancel := context.WithCancel(r.Context())
-	stop := context.AfterFunc(session, cancel)
-	defer stop()
+	interruptDone := make(chan struct{})
+	stop := context.AfterFunc(session, func() {
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+		cancel()
+		close(interruptDone)
+	})
+	defer func() {
+		if !stop() {
+			<-interruptDone
+		}
+	}()
 	defer cancel()
 	incoming := r
 	r = r.WithContext(ctx)
@@ -1252,6 +1263,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			status, end = http.StatusBadGateway, "upstream_error"
 			http.Error(w, err.Error(), status)
 			return
+		}
+		if capturing && !buffered && hasBody {
+			_, _ = io.Copy(io.Discard, io.LimitReader(q.Body, maxBody+1))
 		}
 	} else {
 		resp, err = transport.RoundTrip(q)
