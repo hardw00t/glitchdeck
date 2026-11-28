@@ -130,8 +130,8 @@ func TestPrepareExportCompressedBodies(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	body := base64.StdEncoding.EncodeToString(b.Bytes())
-	input := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: map[string]string{"Content-Encoding": "gzip"}, Body: body, BodyEncoding: "base64"}}}}
+	body := b.String()
+	input := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Encoding": "gzip"}, Body: body}}}}
 	if _, err := PrepareExport(input, false); err == nil {
 		t.Fatal("compressed secret not blocked")
 	}
@@ -139,11 +139,7 @@ func TestPrepareExportCompressedBodies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := base64.StdEncoding.DecodeString(clean.Cassettes[0].Response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r, err := gzip.NewReader(bytes.NewReader(data))
+	r, err := gzip.NewReader(strings.NewReader(clean.Script[0].HTTP.Body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +150,7 @@ func TestPrepareExportCompressedBodies(t *testing.T) {
 	if output.String() != "REDACTED" {
 		t.Fatal("compressed redaction failed")
 	}
-	if input.Cassettes[0].Response.Body != body {
+	if input.Script[0].HTTP.Body != body {
 		t.Fatal("mutated original")
 	}
 	if _, err := PrepareExport(clean, false); err != nil {

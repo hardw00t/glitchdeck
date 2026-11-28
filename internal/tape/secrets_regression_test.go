@@ -85,7 +85,7 @@ func TestScannerCompressedBoundaries(t *testing.T) {
 		enc string
 		b   []byte
 	}{{"gzip", gz.Bytes()}, {"deflate", z.Bytes()}} {
-		in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: map[string]string{"Content-Encoding": tc.enc}, BodyEncoding: "base64", Body: base64.StdEncoding.EncodeToString(tc.b)}}}}
+		in := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Encoding": tc.enc}, Body: string(tc.b)}}}}
 		if _, err := PrepareExport(in, false); err == nil {
 			t.Fatal("uninspected compressed bytes accepted")
 		}
@@ -94,16 +94,12 @@ func TestScannerCompressedBoundaries(t *testing.T) {
 	fw, _ := flate.NewWriter(&raw, flate.DefaultCompression)
 	_, _ = fw.Write([]byte(secret))
 	_ = fw.Close()
-	in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: map[string]string{"Content-Encoding": "deflate"}, BodyEncoding: "base64", Body: base64.StdEncoding.EncodeToString(raw.Bytes())}}}}
+	in := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Encoding": "deflate"}, Body: raw.String()}}}}
 	out, err := PrepareExport(in, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := base64.StdEncoding.DecodeString(out.Cassettes[0].Response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := flate.NewReader(bytes.NewReader(b))
+	r := flate.NewReader(strings.NewReader(out.Script[0].HTTP.Body))
 	decoded, err := io.ReadAll(r)
 	if err != nil || string(decoded) != "REDACTED" {
 		t.Fatalf("decoded %q: %v", decoded, err)
@@ -181,8 +177,7 @@ func TestScannerCompressedExpansionLimit(t *testing.T) {
 	w := gzip.NewWriter(&compressed)
 	_, _ = w.Write(bytes.Repeat([]byte("x"), 4<<20))
 	_ = w.Close()
-	body := base64.StdEncoding.EncodeToString(compressed.Bytes())
-	response := CassetteResponse{Headers: map[string]string{"Content-Encoding": "gzip"}, BodyEncoding: "base64", Body: body}
+	response := CassetteResponse{Headers: map[string]string{"Content-Encoding": "gzip"}, Body: compressed.String()}
 	if _, err := PrepareExport(Tape{Cassettes: []Cassette{{Response: response}}}, false); err != nil {
 		t.Fatalf("valid 4 MiB gzip: %v", err)
 	}
@@ -190,7 +185,7 @@ func TestScannerCompressedExpansionLimit(t *testing.T) {
 	w = gzip.NewWriter(&compressed)
 	_, _ = w.Write(bytes.Repeat([]byte("x"), 1024))
 	_ = w.Close()
-	response.Body = base64.StdEncoding.EncodeToString(compressed.Bytes())
+	response.Body = compressed.String()
 	one := Cassette{Response: response}
 	const work = 1 << 20
 	budget := work

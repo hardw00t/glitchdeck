@@ -53,7 +53,6 @@ type exportBodyKind uint8
 
 const (
 	exportCleanText exportBodyKind = iota
-	exportKnownBinary
 	exportCompressed
 	exportMultipart
 )
@@ -85,13 +84,16 @@ func classifyExportBody(body, contentType, encoding, transfer, inheritedCharset,
 	blocked := func() (exportBodyClass, error) {
 		return exportBodyClass{}, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 	}
+	if storedBase64 || len(body) > maxCassetteBody {
+		return blocked()
+	}
 	result := exportBodyClass{text: body}
 	if transfer = strings.ToLower(strings.TrimSpace(transfer)); transfer != "" && transfer != "binary" && transfer != "7bit" && transfer != "8bit" {
 		return blocked()
 	}
 	if contentType != "" {
 		if len(contentType) > *budget/32 {
-			return exportBodyClass{}, unsupportedBody(field)
+			return blocked()
 		}
 		*budget -= len(contentType) * 32
 		var err error
@@ -168,11 +170,22 @@ func classifyExportBody(body, contentType, encoding, transfer, inheritedCharset,
 		"application/x-tar", "application/x-rar-compressed", "application/vnd.rar",
 		"application/x-compress", "application/compress", "application/x-lz4", "application/lz4":
 		return blocked()
+	case "application/octet-stream", "application/pdf", "application/zip":
+		return blocked()
+	}
+	if strings.HasPrefix(result.media, "image/") || strings.HasPrefix(result.media, "audio/") ||
+		strings.HasPrefix(result.media, "video/") || strings.HasPrefix(result.media, "font/") {
+		return blocked()
 	}
 	if !declaredJSON && (strings.HasPrefix(body, "BZh") ||
 		strings.HasPrefix(body, "\xfd7zXZ\x00") || strings.HasPrefix(body, "\x28\xb5\x2f\xfd") ||
 		strings.HasPrefix(body, "7z\xbc\xaf\x27\x1c") || strings.HasPrefix(body, "\x1f\x9d") ||
 		strings.HasPrefix(body, "\x04\x22\x4d\x18") || strings.HasPrefix(body, "Rar!\x1a\x07") ||
+		strings.HasPrefix(body, "PK\x03\x04") || strings.HasPrefix(body, "PK\x05\x06") ||
+		strings.HasPrefix(body, "%PDF-") || strings.HasPrefix(body, "GIF87a") || strings.HasPrefix(body, "GIF89a") ||
+		len(body) >= 12 && (body[4:8] == "ftyp" || body[:4] == "RIFF" && (body[8:12] == "WEBP" || body[8:12] == "WAVE")) ||
+		strings.HasPrefix(body, "wOFF") || strings.HasPrefix(body, "wOF2") || strings.HasPrefix(body, "OTTO") ||
+		strings.HasPrefix(body, "OggS") || len(body) >= 10 && strings.HasPrefix(body, "ID3") ||
 		len(body) >= 262 && body[257:262] == "ustar") {
 		return blocked()
 	}
@@ -189,74 +202,10 @@ func classifyExportBody(body, contentType, encoding, transfer, inheritedCharset,
 		if err != nil {
 			return exportBodyClass{}, err
 		}
-		if storedBase64 && result.order == nil {
-			if err := scanBodyEntities(result.text, field, false, budget); err != nil {
-				if e, ok := err.(*ExportBlockedError); ok && e.Kind == "unscannable_xml_entity" {
-					return exportBodyClass{}, err
-				}
-			}
-			return blocked()
-		}
 		result.kind = exportCleanText
 		return result, nil
 	}
-	if charsetDeclared {
-		return blocked()
-	}
-	if knownBinarySignature(body, result.media) {
-		result.kind = exportKnownBinary
-		return result, nil
-	}
 	return blocked()
-}
-
-func knownBinarySignature(body, media string) bool {
-	octet := media == "application/octet-stream"
-	match := func(types ...string) bool {
-		if octet {
-			return true
-		}
-		for _, typ := range types {
-			if media == typ {
-				return true
-			}
-		}
-		return false
-	}
-	switch {
-	case strings.HasPrefix(body, "\x89PNG\r\n\x1a\n"):
-		return match("image/png")
-	case strings.HasPrefix(body, "\xff\xd8\xff"):
-		return match("image/jpeg")
-	case strings.HasPrefix(body, "GIF87a"), strings.HasPrefix(body, "GIF89a"):
-		return match("image/gif")
-	case len(body) >= 12 && body[:4] == "RIFF" && body[8:12] == "WEBP":
-		return match("image/webp")
-	case strings.HasPrefix(body, "PK\x03\x04") && len(body) >= 30,
-		strings.HasPrefix(body, "PK\x05\x06") && len(body) >= 22:
-		return octet
-	case strings.HasPrefix(body, "%PDF-"):
-		return octet
-	case strings.HasPrefix(body, "wOFF"):
-		return match("font/woff")
-	case strings.HasPrefix(body, "wOF2"):
-		return match("font/woff2")
-	case strings.HasPrefix(body, "\x00\x01\x00\x00"):
-		return match("font/ttf")
-	case strings.HasPrefix(body, "OTTO"):
-		return match("font/otf")
-	case len(body) >= 10 && strings.HasPrefix(body, "ID3"):
-		return match("audio/mpeg")
-	case len(body) >= 12 && body[4:8] == "ftyp":
-		return match("video/mp4", "audio/mp4")
-	case strings.HasPrefix(body, "OggS"):
-		return match("audio/ogg", "video/ogg")
-	case len(body) >= 12 && body[:4] == "RIFF" && body[8:12] == "WAVE":
-		return match("audio/wav", "audio/x-wav")
-	case strings.HasPrefix(body, "\x1a\x45\xdf\xa3"):
-		return match("video/webm", "audio/webm")
-	}
-	return false
 }
 
 func textScanView(body string, params map[string]string, field string, budget *int) (string, utf16Order, error) {

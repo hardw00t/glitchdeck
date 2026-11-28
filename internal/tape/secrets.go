@@ -466,11 +466,11 @@ func scanValueFiltered(v reflect.Value, field string, redact bool, budget *int, 
 			out.Set(v)
 		}
 		changed := false
-		base64Body := false
 		bodyChanged := false
 		replaceBody := false
-		bodyType := v.Type().Name()
-		hasBody := bodyType == "HTTP" || bodyType == "Stream" || bodyType == "CassetteResponse"
+		bodyType := v.Type()
+		cassette := bodyType == reflect.TypeFor[CassetteResponse]()
+		hasBody := cassette || bodyType == reflect.TypeFor[HTTP]() || bodyType == reflect.TypeFor[Stream]()
 		bodyIndex := -1
 		if hasBody {
 			f, _ := v.Type().FieldByName("Body")
@@ -497,7 +497,7 @@ func scanValueFiltered(v reflect.Value, field string, redact bool, budget *int, 
 				continue
 			}
 			path := field + "." + name
-			if f.Name == "Messages" && bodyType == "WS" {
+			if f.Name == "Messages" && bodyType == reflect.TypeFor[WS]() {
 				messages := v.Field(i)
 				if redact && !messages.IsNil() {
 					out.Field(i).Set(reflect.MakeSlice(messages.Type(), messages.Len(), messages.Len()))
@@ -527,10 +527,10 @@ func scanValueFiltered(v reflect.Value, field string, redact bool, budget *int, 
 			}
 			body := f.Name == "Body" && hasBody
 			bodyEncoding := ""
-			if body && bodyType == "CassetteResponse" {
+			if body && cassette {
 				bodyEncoding = v.FieldByName("BodyEncoding").String()
 			}
-			encoded := f.Name == "MessageB64" || bodyEncoding == "base64"
+			encoded := f.Name == "MessageB64" && bodyType == reflect.TypeFor[GRPC]()
 			if encoded || body {
 				if body && v.Field(i).String() == "" && bodyEncoding == "" && !v.FieldByName("UnscannableEncoding").Bool() {
 					continue
@@ -591,10 +591,6 @@ func scanValueFiltered(v reflect.Value, field string, redact bool, budget *int, 
 				if c && body {
 					bodyChanged = true
 				}
-				if c && redact && body && !replaceBody && v.Type().Name() == "CassetteResponse" && !encoded && encoding != "" && encoding != "identity" {
-					s = base64.StdEncoding.EncodeToString([]byte(s))
-					base64Body = true
-				}
 				if redact {
 					out.Field(i).SetString(s)
 				}
@@ -610,20 +606,17 @@ func scanValueFiltered(v reflect.Value, field string, redact bool, budget *int, 
 			}
 			changed = changed || c
 		}
-		if base64Body {
-			out.FieldByName("BodyEncoding").SetString("base64")
-		}
 		if bodyChanged {
 			if replaceBody {
 				out.FieldByName("UnscannableEncoding").SetBool(false)
-				if v.Type().Name() == "CassetteResponse" {
+				if cassette {
 					out.FieldByName("BodyEncoding").SetString("")
 				}
 			}
-			if !replaceBody && v.Type().Name() == "CassetteResponse" && v.FieldByName("Status").Int() == 206 {
+			if !replaceBody && cassette && v.FieldByName("Status").Int() == 206 {
 				return reflect.Value{}, false, unsupportedBody(field + ".body")
 			}
-			if replaceBody && v.Type().Name() == "CassetteResponse" && v.FieldByName("Status").Int() == 206 {
+			if replaceBody && cassette && v.FieldByName("Status").Int() == 206 {
 				out.FieldByName("Status").SetInt(200)
 			}
 			headers := out.FieldByName("Headers")
@@ -724,20 +717,20 @@ func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, 
 
 func scanStoredExportBody(body string, encoded, cassetteBase64 bool, encoding, contentType, transfer, field string, redact bool, budget *int) (string, bool, error) {
 	if len(body) > *budget {
-		return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
+		return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 	}
 	*budget -= len(body)
 	raw := body
 	if encoded {
 		if base64.StdEncoding.DecodedLen(len(body)) > *budget+2 {
-			return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
+			return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 		}
 		bytes, err := base64.StdEncoding.DecodeString(body)
 		if err != nil {
 			return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 		}
 		if len(bytes) > *budget {
-			return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
+			return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 		}
 		*budget -= len(bytes)
 		raw = string(bytes)
@@ -822,7 +815,7 @@ func scanCompressedExportBody(body, contentType, encoding, inheritedCharset, fie
 	raw, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
 	closeErr := reader.Close()
 	if len(raw) > limit {
-		return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
+		return blocked()
 	}
 	if err != nil || closeErr != nil || source.Len() != 0 {
 		return blocked()

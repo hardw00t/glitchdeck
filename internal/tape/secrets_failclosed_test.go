@@ -189,15 +189,15 @@ func TestExportEncodedXMLDeclaration(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, body := range []string{base64.StdEncoding.EncodeToString([]byte(xml)), base64.StdEncoding.EncodeToString(compressed.Bytes())} {
-		input := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Status: 200, Body: body, BodyEncoding: "base64"}}}}
+	for _, body := range []string{xml, compressed.String()} {
+		input := Tape{Script: []Step{{HTTP: &HTTP{Body: body}}}}
 		_, err := PrepareExport(input, false)
 		var blocked *ExportBlockedError
 		if !errors.As(err, &blocked) || blocked.Kind != "unscannable_xml_entity" {
 			t.Fatalf("expected XML block, got %v", err)
 		}
 		out, err := PrepareExport(input, true)
-		if err != nil || !out.Redacted || out.Cassettes[0].Response.Body != "REDACTED" || out.Cassettes[0].Response.BodyEncoding != "" {
+		if err != nil || !out.Redacted || out.Script[0].HTTP.Body != "REDACTED" {
 			t.Fatalf("unsafe replacement: %#v, %v", out, err)
 		}
 	}

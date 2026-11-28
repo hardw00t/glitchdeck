@@ -3,7 +3,6 @@ package tape
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"strings"
@@ -87,19 +86,18 @@ func TestExportAllowedTextEncodings(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			makeTape := func(value string) Tape {
 				raw := []byte(strings.Replace(tc.format, "%s", value, 1))
-				encoding := ""
 				if tc.order != nil {
 					data := tc.order.AppendUint16(nil, 0xfeff)
 					for _, u := range utf16.Encode([]rune(string(raw))) {
 						data = tc.order.AppendUint16(data, u)
 					}
-					raw, encoding = []byte(base64.StdEncoding.EncodeToString(data)), "base64"
+					raw = data
 				}
-				return Tape{Cassettes: []Cassette{{Response: CassetteResponse{Status: 200, Body: string(raw), BodyEncoding: encoding, Headers: map[string]string{"Content-Type": tc.media}}}}}
+				return Tape{Script: []Step{{HTTP: &HTTP{Body: string(raw), Headers: map[string]string{"Content-Type": tc.media}}}}}
 			}
 			in := makeTape("ordinary")
 			out, err := PrepareExport(in, false)
-			if err != nil || out.Cassettes[0].Response.Body != in.Cassettes[0].Response.Body || out.Redacted {
+			if err != nil || out.Script[0].HTTP.Body != in.Script[0].HTTP.Body || out.Redacted {
 				t.Errorf("clean allowed text rejected or changed: %v", err)
 			}
 			var blocked *ExportBlockedError
@@ -107,21 +105,25 @@ func TestExportAllowedTextEncodings(t *testing.T) {
 				t.Errorf("allowed text did not reveal its credential: %v", err)
 			}
 			redacted, err := PrepareExport(makeTape(secret), true)
-			if err != nil || !redacted.Redacted || redacted.Cassettes[0].Response.Body != makeTape("REDACTED").Cassettes[0].Response.Body {
+			if err != nil || !redacted.Redacted || redacted.Script[0].HTTP.Body != makeTape("REDACTED").Script[0].HTTP.Body {
 				t.Errorf("redaction did not preserve the allowed representation: %v", err)
 			}
 		})
 	}
 }
 
-func TestExportPreservesBinaryBase64(t *testing.T) {
+func TestExportRedactsBinaryBase64(t *testing.T) {
 	const binaryBody = "iVBORw0KGgo="
 	input := Tape{Cassettes: []Cassette{{Response: CassetteResponse{
 		Status: 200, Body: binaryBody, BodyEncoding: "base64", Headers: map[string]string{"Content-Type": "application/octet-stream"},
 	}}}}
-	out, err := PrepareExport(input, false)
-	if err != nil || out.Cassettes[0].Response.Body != binaryBody || out.Cassettes[0].Response.BodyEncoding != "base64" {
-		t.Fatalf("binary body was rejected or changed: %v", err)
+	var blocked *ExportBlockedError
+	if _, err := PrepareExport(input, false); !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+		t.Fatalf("binary body was not blocked: %v", err)
+	}
+	out, err := PrepareExport(input, true)
+	if err != nil || !out.Redacted || out.Cassettes[0].Response.Body != "REDACTED" || out.Cassettes[0].Response.BodyEncoding != "" {
+		t.Fatalf("binary body was not replaced: %v", err)
 	}
 }
 
@@ -137,12 +139,16 @@ func TestExportEncodingContainerBoundaries(t *testing.T) {
 			t.Fatalf("unrecognised binary body was not replaced: %v", err)
 		}
 	})
-	t.Run("multipart binary part preserved", func(t *testing.T) {
-		raw := []byte("--x\r\nContent-Type: application/octet-stream\r\n\r\n\x89PNG\r\n\x1a\n\r\n--x--\r\n")
-		in := Tape{Cassettes: []Cassette{{Response: NewCassetteResponse(200, map[string]string{"Content-Type": "multipart/mixed; boundary=x"}, raw, false)}}}
-		out, err := PrepareExport(in, false)
-		if err != nil || out.Cassettes[0].Response.Body != in.Cassettes[0].Response.Body {
-			t.Fatalf("binary part was rejected or changed: %v", err)
+	t.Run("multipart with a binary part is unscannable", func(t *testing.T) {
+		raw := "--x\r\nContent-Type: application/octet-stream\r\n\r\n\x89PNG\r\n\x1a\n\r\n--x--\r\n"
+		in := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Type": "multipart/mixed; boundary=x"}, Body: raw}}}}
+		var blocked *ExportBlockedError
+		if _, err := PrepareExport(in, false); !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+			t.Fatalf("binary part was not blocked: %v", err)
+		}
+		out, err := PrepareExport(in, true)
+		if err != nil || out.Script[0].HTTP.Body != "REDACTED" {
+			t.Fatalf("multipart body was not replaced: %v", err)
 		}
 	})
 	t.Run("declared compression does not clear charset", func(t *testing.T) {

@@ -24,7 +24,7 @@ func TestFix7EncodedRepresentations(t *testing.T) {
 		{"nul entity", "application/xml", strings.Join(strings.Split("sk&#45;ant-"+strings.Repeat("z", 24), ""), "\x00"), "", ""},
 		{"header comment", "", "clean", "", `(sk\-ant-` + strings.Repeat("z", 24) + `)`},
 		{"header unquoted", "", "clean", "", `sk\-ant-` + strings.Repeat("z", 24)},
-		{"inferred gzip form", "application/x-www-form-urlencoded", base64.StdEncoding.EncodeToString(compressed.Bytes()), "base64", ""},
+		{"inferred gzip form", "application/x-www-form-urlencoded", compressed.String(), "", ""},
 		{"stored base64", "application/octet-stream", "AK" + "IA" + strings.Repeat("A", 16), "base64", ""},
 		{"compress media", "application/x-compress", "clean", "", ""},
 		{"compress magic", "application/octet-stream", base64.StdEncoding.EncodeToString([]byte("\x1f\x9d\x90clean")), "base64", ""},
