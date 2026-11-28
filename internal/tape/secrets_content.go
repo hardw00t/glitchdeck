@@ -283,7 +283,7 @@ func scanBodyText(body, contentType, field string, redact bool) (string, bool, e
 func scanClassifiedBody(class exportBodyClass, original, field string, redact bool, depth int, budget *int) (out string, changed bool, err error) {
 	body, media := class.text, class.media
 	if class.kind == exportMultipart {
-		if err := scanExportMultipart(body, media, class.params["boundary"], field, depth, budget); err != nil {
+		if err := scanExportMultipart(body, media, class.params["boundary"], field, &body, redact, depth, budget); err != nil {
 			return "", false, err
 		}
 	}
@@ -415,5 +415,6 @@ func scanClassifiedBody(class exportBodyClass, original, field string, redact bo
 		}
 		return body, false, nil
 	}
-	return scanTextDepth(body, field, redact, 0, budget)
+	clean, c, err := scanTextDepth(body, field, redact, 0, budget)
+	return clean, c || body != class.text, err
 }

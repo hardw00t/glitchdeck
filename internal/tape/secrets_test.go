@@ -139,15 +139,7 @@ func TestPrepareExportCompressedBodies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := gzip.NewReader(strings.NewReader(clean.Script[0].HTTP.Body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var output bytes.Buffer
-	if _, err := output.ReadFrom(r); err != nil {
-		t.Fatal(err)
-	}
-	if output.String() != "REDACTED" {
+	if clean.Script[0].HTTP.Body != "REDACTED" || clean.Script[0].HTTP.Headers["Content-Encoding"] != "" {
 		t.Fatal("compressed redaction failed")
 	}
 	if input.Script[0].HTTP.Body != body {

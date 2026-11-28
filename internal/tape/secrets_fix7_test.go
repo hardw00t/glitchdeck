@@ -42,6 +42,12 @@ func TestFix7EncodedRepresentations(t *testing.T) {
 			for _, redact := range []bool{false, true} {
 				out, err := PrepareExport(in, redact)
 				unscannable := strings.HasPrefix(tc.name, "compress") || tc.name == "nul entity" || tc.name == "stored base64"
+				if redact && tc.name == "inferred gzip form" {
+					if err != nil || !out.Redacted || out.Cassettes[0].Response.Body != "v=REDACTED" {
+						t.Errorf("expected decoded form with the credential removed, got %v", err)
+					}
+					continue
+				}
 				if unscannable && redact {
 					if err != nil || out.Cassettes[0].Response.Body != "REDACTED" || !out.Redacted {
 						t.Errorf("expected whole-body replacement, got %v", err)

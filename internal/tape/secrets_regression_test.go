@@ -81,14 +81,12 @@ func TestScannerCompressedBoundaries(t *testing.T) {
 	_, _ = zw.Write([]byte("clean"))
 	_ = zw.Close()
 	z.WriteString(secret)
-	for _, tc := range []struct {
-		enc string
-		b   []byte
-	}{{"gzip", gz.Bytes()}, {"deflate", z.Bytes()}} {
-		in := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Encoding": tc.enc}, Body: string(tc.b)}}}}
-		if _, err := PrepareExport(in, false); err == nil {
-			t.Fatal("uninspected compressed bytes accepted")
-		}
+	clean, err := PrepareExport(Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Encoding": "gzip"}, Body: gz.String()}}}}, false)
+	if err != nil || clean.Script[0].HTTP.Body != "clean" || clean.Script[0].HTTP.Headers["Content-Encoding"] != "" {
+		t.Fatalf("gzip metadata was not stripped: %v", err)
+	}
+	if _, err := PrepareExport(Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Encoding": "deflate"}, Body: z.String()}}}}, false); err == nil {
+		t.Fatal("deflate trailing data was accepted")
 	}
 	var raw bytes.Buffer
 	fw, _ := flate.NewWriter(&raw, flate.DefaultCompression)
@@ -99,10 +97,8 @@ func TestScannerCompressedBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := flate.NewReader(strings.NewReader(out.Script[0].HTTP.Body))
-	decoded, err := io.ReadAll(r)
-	if err != nil || string(decoded) != "REDACTED" {
-		t.Fatalf("decoded %q: %v", decoded, err)
+	if out.Script[0].HTTP.Body != "REDACTED" || out.Script[0].HTTP.Headers["Content-Encoding"] != "" {
+		t.Fatal("deflate body not decoded and redacted")
 	}
 }
 
@@ -301,9 +297,13 @@ func TestScannerCompressedMediaAndMagic(t *testing.T) {
 				_, _ = io.WriteString(w, payload)
 				_ = w.Close()
 				for _, media := range []string{tc.media, "text/plain", "application/octet-stream"} {
-					_, _, err := scanBody(compressed.String(), false, "", media, "", "$.body", true)
-					if (err != nil) != (payload != "ordinary" || media == "application/octet-stream") {
-						t.Fatalf("%s payload %q: %v", media, payload, err)
+					got, _, err := scanBody(compressed.String(), false, "", media, "", "$.body", true)
+					want := payload
+					if want != "ordinary" {
+						want = "REDACTED"
+					}
+					if (err != nil) != (media == "application/octet-stream") || err == nil && got != want {
+						t.Fatalf("%s payload %q was not safely normalized: %v", media, payload, err)
 					}
 				}
 			}

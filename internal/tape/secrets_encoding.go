@@ -80,6 +80,16 @@ func textMedia(media string) bool {
 	return false
 }
 
+func exportCompressionMedia(media string) string {
+	switch media {
+	case "application/gzip", "application/x-gzip":
+		return "gzip"
+	case "application/zlib":
+		return "deflate"
+	}
+	return ""
+}
+
 func classifyExportBody(body, contentType, encoding, transfer, inheritedCharset, field string, budget *int, storedBase64 bool) (exportBodyClass, error) {
 	blocked := func() (exportBodyClass, error) {
 		return exportBodyClass{}, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
@@ -135,14 +145,13 @@ func classifyExportBody(body, contentType, encoding, transfer, inheritedCharset,
 	}
 	declaredJSON := (result.media == "application/json" || strings.HasSuffix(result.media, "+json")) && json.Valid([]byte(body))
 	if encoding == "" {
+		encoding = exportCompressionMedia(result.media)
+	}
+	if encoding == "" {
 		switch {
-		case result.media == "application/gzip" || result.media == "application/x-gzip":
-			encoding = "gzip"
-		case result.media == "application/zlib":
-			encoding = "deflate"
 		case !declaredJSON && strings.HasPrefix(body, "\x1f\x8b"):
 			encoding = "gzip"
-		case !declaredJSON && len(body) >= 2 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0:
+		case !declaredJSON && len(body) >= 8 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0:
 			encoding = "deflate"
 		}
 	}

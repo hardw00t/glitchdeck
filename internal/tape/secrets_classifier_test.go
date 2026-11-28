@@ -137,10 +137,6 @@ func TestExportClassifierRejectsUnscannableBodies(t *testing.T) {
 
 func TestExportClassifierAcceptsKnownRepresentations(t *testing.T) {
 	secret := "sk-ant-" + strings.Repeat("Z", 24)
-	var compressed bytes.Buffer
-	writer := gzip.NewWriter(&compressed)
-	_, _ = writer.Write([]byte(`{"value":"ordinary"}`))
-	_ = writer.Close()
 	utf16Body := []byte{0xff, 0xfe}
 	for _, r := range utf16.Encode([]rune(`{"value":"ordinary"}`)) {
 		utf16Body = binary.LittleEndian.AppendUint16(utf16Body, r)
@@ -150,7 +146,6 @@ func TestExportClassifierAcceptsKnownRepresentations(t *testing.T) {
 		{"XML", `<?xml version="1.0" encoding="utf-8"?><x>ordinary</x>`, "application/xml"},
 		{"SSE", "data: ordinary\n\n", "text/event-stream"},
 		{"UTF-16 JSON", string(utf16Body), "application/json"},
-		{"gzip JSON", compressed.String(), "application/gzip"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -216,6 +211,7 @@ func FuzzExportClassifierInvariant(f *testing.F) {
 	f.Add([]byte("h\x00e\x00l\x00l\x00o\x00"), "text/plain", "", "", uint8(0), false)
 	f.Add([]byte("h\x00e\x00l\x00l\x00o\x00"), "text/plain", "", "", uint8(2), false)
 	f.Add([]byte("h\x00e\x00l\x00l\x00o\x00"), "", "", "", uint8(0), true)
+	f.Add([]byte("value\x00hidden"), "", "", "", uint8(3), false)
 	f.Add([]byte("--x\r\nContent-Disposition: form-data; name=\"_charset_\"\r\n\r\nutf-7\r\n--x\r\nContent-Type: text/plain\r\n\r\nsk+AC0-ant-secret\r\n--x--\r\n"), "multipart/form-data; boundary=x", "", "", uint8(0), false)
 	f.Add([]byte(secret), "text/plain; charset=", "", "", uint8(0), false)
 	f.Add([]byte(`<!DOCTYPE x [<!ENTITY x "&#45;">]><x>sk&x;ant-synthetic</x>`), "application/xml", "", "", uint8(0), false)
@@ -233,14 +229,21 @@ func FuzzExportClassifierInvariant(f *testing.F) {
 	writer := gzip.NewWriter(&compressed)
 	_, _ = writer.Write([]byte(`{"value":"` + secret + `"}`))
 	_ = writer.Close()
-	f.Add(compressed.Bytes(), "application/json", "gzip", "", uint8(1), false)
+	f.Add(bytes.Clone(compressed.Bytes()), "application/json", "gzip", "", uint8(1), false)
+	f.Add(bytes.Clone(compressed.Bytes()), "application/json", "gzip", "", uint8(2), false)
+	compressed.Reset()
+	writer.Reset(&compressed)
+	_, _ = writer.Write([]byte(`{"value":"ordinary"}`))
+	_ = writer.Close()
+	f.Add(compressed.Bytes(), "application/json", "gzip", "", uint8(2), false)
 	f.Fuzz(func(t *testing.T, raw []byte, media, encoding, charset string, storage uint8, ws bool) {
 		if len(raw) == 0 || len(raw) > 4096 || len(media) > 256 || len(encoding) > 64 || len(charset) > 64 {
 			return
 		}
 		body := string(raw)
-		http := !ws && storage%3 == 2
-		storedBase64 := !ws && !http && storage%3 == 1
+		http := !ws && storage%4 == 2
+		assertion := !ws && storage%4 == 3
+		storedBase64 := !ws && storage%4 == 1
 		if storedBase64 {
 			body = base64.StdEncoding.EncodeToString(raw)
 		}
@@ -266,6 +269,10 @@ func FuzzExportClassifierInvariant(f *testing.F) {
 		} else if http {
 			in.Script = []Step{{HTTP: &HTTP{Method: "POST", Path: "/", Headers: headers, Body: body}}}
 			field = "$.script[0].http.body"
+		} else if assertion {
+			in.Assertions = []Assertion{{JSONEq: map[string]any{"payload": []any{body}}}}
+			contentType, encoding = "", ""
+			field = "$.assertions[0].json_eq[0]"
 		} else {
 			bodyEncoding := ""
 			if storedBase64 {
@@ -285,10 +292,12 @@ func FuzzExportClassifierInvariant(f *testing.F) {
 				retained = out.Script[0].WS.Messages[0] == body
 			} else if http {
 				retained = out.Script[0].HTTP.Body == body
+			} else if assertion {
+				retained = out.Assertions[0].JSONEq["payload"].([]any)[0] == body
 			} else {
 				retained = out.Cassettes[0].Response.Body == body
 			}
-			if retained && (storedBase64 || classErr != nil || scanErr != nil || (class.kind != exportCleanText && class.kind != exportCompressed && class.kind != exportMultipart)) {
+			if retained && (storedBase64 || classErr != nil || scanErr != nil || class.kind == exportCompressed) {
 				t.Fatalf("export retained an unscannable body: classifier=%v scanner=%v", classErr, scanErr)
 			}
 		}
@@ -305,6 +314,10 @@ func FuzzExportClassifierInvariant(f *testing.F) {
 			} else if http {
 				if clean.Script[0].HTTP.Body != "REDACTED" {
 					t.Fatal("unscannable HTTP body retained")
+				}
+			} else if assertion {
+				if clean.Assertions[0].JSONEq["payload"].([]any)[0] != "REDACTED" {
+					t.Fatal("unscannable assertion value retained")
 				}
 			} else if response := clean.Cassettes[0].Response; response.Body != "REDACTED" || response.BodyEncoding != "" {
 				t.Fatal("unscannable cassette body retained")

@@ -284,12 +284,13 @@ func decode(r io.Reader, cassetteLimit, rawLimit int) (Tape, error) {
 	return t, nil
 }
 func Encode(w io.Writer, t Tape) error {
-	if _, err := PrepareExport(t, false); err != nil {
+	out, err := PrepareExport(t, false)
+	if err != nil {
 		return err
 	}
 	e := yaml.NewEncoder(w)
 	defer e.Close()
-	return e.Encode(t)
+	return e.Encode(out)
 }
 func validPath(p string) bool {
 	return strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") && !strings.ContainsAny(p, "\r\n")
