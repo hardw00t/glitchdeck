@@ -127,6 +127,9 @@ func testTape(args []string) int {
 	var reportDestination *execrun.Destination
 	var reportSafe func() error
 	writeReport := func(e execrun.Envelope) error {
+		if *mode == "passthrough" {
+			return execrun.WriteReport(*report, e)
+		}
 		if err := reportSafe(); err != nil {
 			return err
 		}
@@ -143,7 +146,7 @@ func testTape(args []string) int {
 		if runReport.CassetteError != nil && runReport.CassetteError != err {
 			e.Diff = append(e.Diff, runReport.CassetteError.Error())
 		}
-		if reportDestination != nil {
+		if *report != "" && (*mode == "passthrough" || reportDestination != nil) {
 			if err := writeReport(e); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 			}
@@ -179,7 +182,7 @@ func testTape(args []string) int {
 			defer file.Close()
 		}
 	}
-	if *report != "" {
+	if *report != "" && *mode != "passthrough" {
 		var inputs []*execrun.Destination
 		var missingInputs []string
 		for _, name := range files {
@@ -286,9 +289,11 @@ func testTape(args []string) int {
 	envelope.SetAppliedFaults(runReport.AppliedFaults)
 	envelope.FrameErrors = runReport.FrameErrors
 	envelope.FrameErrorsOmitted = runReport.FrameErrorsOmitted
-	if reportDestination != nil {
+	if *report != "" && (*mode == "passthrough" || reportDestination != nil) {
 		if e := writeReport(envelope); e != nil {
-			reportDestination = nil
+			if *mode != "passthrough" {
+				reportDestination = nil
+			}
 			return fail("TAPE_IO", e)
 		}
 	}

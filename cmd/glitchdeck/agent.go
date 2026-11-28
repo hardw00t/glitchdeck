@@ -95,9 +95,12 @@ func execCommand(args []string) int {
 	var reportDestination *execrun.Destination
 	var reportSafe func() error
 	emit := func(e execrun.Envelope) int {
-		if reportDestination != nil {
-			err := reportSafe()
-			if err == nil {
+		legacyReport := !recordRequested && o.Mode == "passthrough" && o.TapeOut == ""
+		if *report != "" && (legacyReport || reportDestination != nil) {
+			var err error
+			if legacyReport {
+				err = execrun.WriteReport(*report, e)
+			} else if err = reportSafe(); err == nil {
 				err = reportDestination.WriteReport(e)
 			}
 			if err != nil {
@@ -204,7 +207,7 @@ func execCommand(args []string) int {
 		}
 		defer o.TapeDestination.Close()
 	}
-	if *report != "" {
+	if *report != "" && (o.Mode != "passthrough" || o.TapeOut != "") {
 		var inputDestination *execrun.Destination
 		if *path != "" {
 			var err error

@@ -41,7 +41,7 @@ func TestExecRejectsSymlinkDotDotReportAlias(t *testing.T) {
 	if err := os.WriteFile(input, []byte("original"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	code, _ := launchOutput(t, "exec", "--json", "--tape", input, "--report", filepath.Join(dir, "link")+"/../input", "--", "true")
+	code, _ := launchOutput(t, "exec", "--json", "--mode", "replay", "--tape", input, "--report", filepath.Join(dir, "link")+"/../input", "--", "true")
 	got, err := os.ReadFile(input)
 	if code != 2 || err != nil || string(got) != "original" {
 		t.Fatalf("exit %d input %q: %v", code, got, err)

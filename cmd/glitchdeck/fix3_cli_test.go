@@ -164,7 +164,7 @@ func TestExecRechecksRotatedInputSymlink(t *testing.T) {
 		t.Skipf("symlink unavailable: %v", err)
 	}
 	t.Setenv("GD_FIX3_ROTATE_INPUT", input)
-	code, out := launchOutput(t, "exec", "--json", "--tape", input, "--report", next, "--allow-zero-traffic", "--", os.Args[0], "-test.run=^TestExecRechecksRotatedInputSymlink$")
+	code, out := launchOutput(t, "exec", "--json", "--mode", "replay", "--tape", input, "--report", next, "--allow-zero-traffic", "--", os.Args[0], "-test.run=^TestExecRechecksRotatedInputSymlink$")
 	data, err := os.ReadFile(next)
 	if code != 3 || string(data) != raw || err != nil {
 		t.Fatalf("exit %d, selected input %q, err %v: %s", code, data, err, out)

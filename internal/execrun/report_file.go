@@ -2,15 +2,25 @@ package execrun
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 )
 
 func WriteReport(path string, report Envelope) error {
-	destination, err := OpenDestination(path)
+	file, err := os.CreateTemp(filepath.Dir(path), ".glitchdeck-report-*")
 	if err != nil {
 		return err
 	}
-	defer destination.Close()
-	return destination.WriteReport(report)
+	defer os.Remove(file.Name())
+	encodeErr := json.NewEncoder(file).Encode(report)
+	closeErr := file.Close()
+	if encodeErr != nil {
+		return encodeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(file.Name(), path)
 }
 
 func (d *Destination) WriteReport(report Envelope) error {
