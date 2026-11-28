@@ -305,3 +305,77 @@ func TestScannerCompressedMediaAndMagic(t *testing.T) {
 		})
 	}
 }
+
+func TestScannerRejectsSplitAndMismatchedPEM(t *testing.T) {
+	for _, body := range []string{
+		`["\u002d----BEGIN PRIVATE KEY-----","sensitive-payload","-----END PRIVATE KEY-----"]`,
+		`["sk-ant-secret","-----BEGIN RSA ` + `PRIVATE KEY-----payload-----END EC PRIVATE KEY-----"]`,
+		`["\u002d----BEGIN RSA PRIVATE KEY-----wrong-----END EC PRIVATE KEY-----sensitive-payload-----END RSA PRIVATE KEY-----"]`,
+		`["-----BEGIN PRIVATE ` + `KEY-----payload","-----END PRIVATE KEY-----"]`,
+	} {
+		in := Tape{Script: []Step{{HTTP: &HTTP{Body: body}}}}
+		out, err := PrepareExport(in, true)
+		if err == nil {
+			t.Fatalf("exported incomplete PEM: %q", out.Script[0].HTTP.Body)
+		}
+	}
+}
+
+func TestScannerBlocksHTTPQuotedPairHeaderCredential(t *testing.T) {
+	for _, value := range []string{`</>; title="sk\-\ant-secret"`, `</>; title="sk-an\t-secret"`} {
+		in := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Link": value}}}}}
+		for _, redact := range []bool{false, true} {
+			out, err := PrepareExport(in, redact)
+			if err == nil {
+				t.Fatalf("exported escaped header: %q", out.Script[0].HTTP.Headers["Link"])
+			}
+		}
+	}
+}
+
+func TestScannerBlocksDuplicateMultipartEncodings(t *testing.T) {
+	for _, name := range []string{"Content-Transfer-Encoding", "Content-Encoding", "Grpc-Encoding"} {
+		value := "identity"
+		if name == "Content-Transfer-Encoding" {
+			value = "binary"
+		}
+		body := "--x\r\n" + name + ": " + value + "\r\n" + name + ": " + value + "\r\n\r\nok\r\n--x--\r\n"
+		in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: map[string]string{"Content-Type": "multipart/form-data; boundary=x"}, Body: body}}}}
+		if _, err := PrepareExport(in, false); err == nil {
+			t.Fatalf("accepted duplicate %s", name)
+		}
+	}
+}
+
+func TestScannerSSELiteralPercent(t *testing.T) {
+	body := "data: 50% complete\n\n"
+	in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: map[string]string{"Content-Type": "text/event-stream"}, Body: body}}}}
+	for _, redact := range []bool{false, true} {
+		out, err := PrepareExport(in, redact)
+		if err != nil || out.Cassettes[0].Response.Body != body {
+			t.Fatalf("literal percent: %v", err)
+		}
+	}
+	in.Cassettes[0].Response.Body = "data: %2D----BEGIN PRIVATE KEY-----\ndata: sensitive-payload\n\n"
+	for _, redact := range []bool{false, true} {
+		if _, err := PrepareExport(in, redact); err == nil {
+			t.Fatal("escaped SSE private key was exported")
+		}
+	}
+}
+
+func TestScannerRequestOnlyExportSkipsCassetteDigest(t *testing.T) {
+	body := "[" + strings.Repeat("0,", 40000) + `"sk-ant-secret"]`
+	in := Tape{Script: []Step{{HTTP: &HTTP{Method: "POST", Path: "/", Body: body}}}}
+	out, err := PrepareExport(in, true)
+	if err != nil || strings.Contains(out.Script[0].HTTP.Body, "sk-ant-secret") || !out.Redacted {
+		t.Fatalf("request-only redaction failed: %v", err)
+	}
+}
+
+func TestScannerBlocksRedactingPartialResponseBody(t *testing.T) {
+	in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Status: 206, Headers: map[string]string{"Content-Range": "bytes 0-24/100"}, Body: "sk-ant-long-secret-value"}}}}
+	if _, err := PrepareExport(in, true); err == nil {
+		t.Fatal("redacted partial response with stale byte range")
+	}
+}

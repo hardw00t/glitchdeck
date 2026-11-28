@@ -29,10 +29,19 @@ func checkSSEPrivateKey(s, field string, budget *int, depth int) error {
 			return unsupportedBody(field)
 		}
 		*budget -= 2 * len(s)
-		decoded, err := url.PathUnescape(s)
-		if err != nil {
-			return unsupportedBody(field)
+		var decodedBuilder strings.Builder
+		decodedBuilder.Grow(len(s))
+		for i := 0; i < len(s); i++ {
+			if s[i] == '%' && i+2 < len(s) {
+				if decoded, err := url.PathUnescape(s[i : i+3]); err == nil {
+					decodedBuilder.WriteString(decoded)
+					i += 2
+					continue
+				}
+			}
+			decodedBuilder.WriteByte(s[i])
 		}
+		decoded := decodedBuilder.String()
 		if decoded != s {
 			if err := checkSSEPrivateKey(decoded, field, budget, depth+1); err != nil {
 				return err
@@ -71,6 +80,10 @@ func scanHeader(name, value, field string, redact bool, budget *int) (string, bo
 		return "", false, err
 	}
 	if strings.Contains(value, "=?") {
+		return "", false, unsupportedBody(field)
+	}
+	if strings.Contains(value, `\`) && strings.Contains(value, ";") &&
+		!strings.EqualFold(name, "Content-Disposition") && !strings.EqualFold(name, "Content-Type") {
 		return "", false, unsupportedBody(field)
 	}
 	for rest := value; strings.Contains(rest, ";"); {
@@ -226,7 +239,9 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 				}
 			}
 			for k, values := range p.Header {
-				if (strings.EqualFold(k, "Content-Disposition") || strings.EqualFold(k, "Content-Type")) && len(values) != 1 {
+				if (strings.EqualFold(k, "Content-Disposition") || strings.EqualFold(k, "Content-Type") ||
+					strings.EqualFold(k, "Content-Transfer-Encoding") || strings.EqualFold(k, "Content-Encoding") ||
+					strings.EqualFold(k, "Grpc-Encoding")) && len(values) != 1 {
 					return "", false, unsupportedBody(field)
 				}
 				for _, v := range values {

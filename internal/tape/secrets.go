@@ -57,8 +57,10 @@ func PrepareExport(t Tape, redact bool) (Tape, error) {
 	}
 	out := v.Interface().(Tape)
 	if changed {
-		if err := syncRedactedCassetteRequests(t, &out); err != nil {
-			return Tape{}, err
+		if len(t.Cassettes) > 0 {
+			if err := syncRedactedCassetteRequests(t, &out); err != nil {
+				return Tape{}, err
+			}
 		}
 		out.Redacted = true
 	}
@@ -120,6 +122,34 @@ func boundExport(v reflect.Value, remaining *int, depth int) error {
 }
 
 var quotedString = regexp.MustCompile(`"(?:\\.|[^"\\])*"`)
+var pemMarker = regexp.MustCompile(`-----(BEGIN|END) ((?:[A-Z0-9 ]* )?PRIVATE KEY)-----`)
+
+func checkPEMClosers(s, field string) error {
+	var opened string
+	for {
+		match := pemMarker.FindStringSubmatchIndex(s)
+		if match == nil {
+			if opened == "" {
+				return nil
+			}
+			break
+		}
+		kind, label := s[match[2]:match[3]], s[match[4]:match[5]]
+		if kind == "BEGIN" {
+			if opened != "" {
+				break
+			}
+			opened = label
+		} else if opened != "" {
+			if opened != label {
+				break
+			}
+			opened = ""
+		}
+		s = s[match[1]:]
+	}
+	return &ExportBlockedError{Kind: "private_key", Field: field}
+}
 
 func scanText(s, field string, redact bool) (string, bool, error) {
 	budget := 64 << 20
@@ -129,6 +159,11 @@ func scanText(s, field string, redact bool) (string, bool, error) {
 func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string, bool, error) {
 	if depth > 8 {
 		return "", false, &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
+	}
+	if redact {
+		if err := checkPEMClosers(s, field); err != nil {
+			return "", false, err
+		}
 	}
 	if depth == 0 && redact {
 		if _, _, err := scanTextDepth(s, field, false, 0, budget); err == nil {
@@ -219,7 +254,7 @@ func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string
 	}
 	changed := false
 	var scanErr error
-	if strings.Contains(s, `\`) {
+	if strings.Contains(s, `\`) || redact && strings.Contains(s, `"`) {
 		if len(s) > *budget/4 {
 			return "", false, unsupportedBody(field)
 		}
@@ -242,11 +277,20 @@ func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string
 			return "", false, unsupportedBody(field)
 		}
 		s = quotedString.ReplaceAllStringFunc(s, func(part string) string {
-			if scanErr != nil || !strings.Contains(part, `\`) {
+			if scanErr != nil {
 				return part
 			}
 			var value string
 			if json.Unmarshal([]byte(part), &value) != nil {
+				return part
+			}
+			if redact {
+				if err := checkPEMClosers(value, field); err != nil {
+					scanErr = err
+					return part
+				}
+			}
+			if !strings.Contains(part, `\`) {
 				return part
 			}
 			clean, c, err := scanTextDepth(value, field, redact, depth+1, budget)
@@ -495,6 +539,9 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 			out.FieldByName("BodyEncoding").SetString("base64")
 		}
 		if bodyChanged {
+			if v.Type().Name() == "CassetteResponse" && v.FieldByName("Status").Int() == 206 {
+				return reflect.Value{}, false, unsupportedBody(field + ".body")
+			}
 			headers := out.FieldByName("Headers")
 			iter := headers.MapRange()
 			for iter.Next() {
