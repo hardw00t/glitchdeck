@@ -1,6 +1,9 @@
 package tape
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -111,5 +114,131 @@ func TestScannerSSEBufferBudget(t *testing.T) {
 	budget := 1000
 	if _, _, err := scanContentBudget(body, "text/event-stream", "$.body", false, 0, &budget); err == nil {
 		t.Fatal("SSE buffers exceeded work budget")
+	}
+}
+
+func TestExportUnscannableXML(t *testing.T) {
+	secret := "sk-ant-" + strings.Repeat("z", 24)
+	for _, body := range []string{
+		`<!DOCTYPE x [<!ENTITY hyphen "&#45;">]><x key="sk&hyphen;ant-` + strings.Repeat("z", 24) + `"/>`,
+		`<!doctype x [ ]><x/>`,
+		`<!DOCTYPE x SYSTEM "http://example.invalid/a>b" [ ]><x/>`,
+		`&lt;!ENTITY x "value"&gt;<x/>`,
+	} {
+		for _, ws := range []bool{false, true} {
+			input := Tape{Script: []Step{{HTTP: &HTTP{Body: body}}}}
+			if ws {
+				input.Script[0] = Step{WS: &WS{Messages: []string{body}}}
+			}
+			_, err := PrepareExport(input, false)
+			var blocked *ExportBlockedError
+			if !errors.As(err, &blocked) || blocked.Kind != "unscannable_xml_entity" {
+				t.Fatalf("body %q ws=%v: expected XML block, got %v", body, ws, err)
+			}
+			out, err := PrepareExport(input, true)
+			if err != nil || !out.Redacted {
+				t.Fatalf("redact ws=%v: %v", ws, err)
+			}
+			got := ""
+			if ws {
+				got = out.Script[0].WS.Messages[0]
+			} else {
+				got = out.Script[0].HTTP.Body
+			}
+			if got != "REDACTED" || strings.Contains(got, secret) {
+				t.Fatalf("unsafe replacement %q", got)
+			}
+		}
+	}
+}
+
+func TestExportWebSocketEntitySecret(t *testing.T) {
+	body := `<x key="sk&#45;ant-` + strings.Repeat("z", 24) + `"/>`
+	input := Tape{Script: []Step{{WS: &WS{Messages: []string{body}}}}}
+	if _, err := PrepareExport(input, false); err == nil {
+		t.Fatal("entity-encoded WebSocket credential accepted")
+	}
+	out, err := PrepareExport(input, true)
+	if err != nil || !out.Redacted || out.Script[0].WS.Messages[0] != "REDACTED" {
+		t.Fatalf("redaction failed: %#v, %v", out, err)
+	}
+}
+
+func TestExportRetainedUnscannableEncoding(t *testing.T) {
+	for _, header := range []string{"Content-Encoding", "Grpc-Encoding", "Transfer-Encoding"} {
+		input := Tape{Script: []Step{{HTTP: &HTTP{Body: "opaque payload", Headers: map[string]string{header: "br", "Content-Length": "14"}}}}}
+		_, err := PrepareExport(input, false)
+		var blocked *ExportBlockedError
+		if !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+			t.Fatalf("%s: expected encoding block, got %v", header, err)
+		}
+		out, err := PrepareExport(input, true)
+		if err != nil || !out.Redacted || out.Script[0].HTTP.Body != "REDACTED" || len(out.Script[0].HTTP.Headers) != 0 {
+			t.Fatalf("%s: unsafe replacement %#v, %v", header, out, err)
+		}
+	}
+}
+
+func TestExportEncodedXMLDeclaration(t *testing.T) {
+	xml := `<!DOCTYPE x [<!ENTITY x "&#45;">]><x>sk&x;ant-synthetic</x>`
+	var compressed bytes.Buffer
+	w := gzip.NewWriter(&compressed)
+	if _, err := w.Write([]byte(xml)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{base64.StdEncoding.EncodeToString([]byte(xml)), base64.StdEncoding.EncodeToString(compressed.Bytes())} {
+		input := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Status: 200, Body: body, BodyEncoding: "base64"}}}}
+		_, err := PrepareExport(input, false)
+		var blocked *ExportBlockedError
+		if !errors.As(err, &blocked) || blocked.Kind != "unscannable_xml_entity" {
+			t.Fatalf("expected XML block, got %v", err)
+		}
+		out, err := PrepareExport(input, true)
+		if err != nil || !out.Redacted || out.Cassettes[0].Response.Body != "REDACTED" || out.Cassettes[0].Response.BodyEncoding != "" {
+			t.Fatalf("unsafe replacement: %#v, %v", out, err)
+		}
+	}
+}
+
+func TestExportCompressedGRPCFrame(t *testing.T) {
+	frame := "\x01\x00\x00\x00\x03abc"
+	for _, step := range []Step{
+		{HTTP: &HTTP{Body: frame}},
+		{GRPC: &GRPC{MessageB64: base64.StdEncoding.EncodeToString([]byte(frame))}},
+	} {
+		input := Tape{Script: []Step{step}}
+		_, err := PrepareExport(input, false)
+		var blocked *ExportBlockedError
+		if !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+			t.Fatalf("expected encoding block, got %v", err)
+		}
+		out, err := PrepareExport(input, true)
+		if err != nil || !out.Redacted {
+			t.Fatalf("redaction failed: %v", err)
+		}
+		if out.Script[0].HTTP != nil && out.Script[0].HTTP.Body != "REDACTED" {
+			t.Fatal("HTTP frame retained")
+		}
+		if out.Script[0].GRPC != nil && out.Script[0].GRPC.MessageB64 != "UkVEQUNURUQ=" {
+			t.Fatal("gRPC frame retained")
+		}
+	}
+}
+
+func TestExportEmptyEncodedBody(t *testing.T) {
+	input := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Status: 204, Headers: map[string]string{"Content-Encoding": "br"}}}}}
+	if _, err := PrepareExport(input, false); err != nil {
+		t.Fatalf("empty body blocked: %v", err)
+	}
+	input.Cassettes[0].Response.UnscannableEncoding = true
+	if _, err := PrepareExport(input, false); err == nil {
+		t.Fatal("discarded encoded body accepted")
+	}
+	out, err := PrepareExport(input, true)
+	if err != nil || out.Cassettes[0].Response.Body != "REDACTED" {
+		t.Fatalf("discarded body not redacted: %v", err)
 	}
 }

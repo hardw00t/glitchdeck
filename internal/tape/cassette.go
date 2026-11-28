@@ -51,11 +51,12 @@ type CassetteRequest struct {
 }
 
 type CassetteResponse struct {
-	Status       int               `yaml:"status" json:"status"`
-	Headers      map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Body         string            `yaml:"body,omitempty" json:"body,omitempty"`
-	BodyEncoding string            `yaml:"body_encoding,omitempty" json:"body_encoding,omitempty"`
-	Truncated    bool              `yaml:"truncated,omitempty" json:"truncated,omitempty"`
+	Status              int               `yaml:"status" json:"status"`
+	Headers             map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Body                string            `yaml:"body,omitempty" json:"body,omitempty"`
+	BodyEncoding        string            `yaml:"body_encoding,omitempty" json:"body_encoding,omitempty"`
+	Truncated           bool              `yaml:"truncated,omitempty" json:"truncated,omitempty"`
+	UnscannableEncoding bool              `yaml:"-" json:"-"`
 }
 
 func (r CassetteResponse) decodedSize() (int, error) {

@@ -79,12 +79,13 @@ type Step struct {
 	GRPC    *GRPC   `yaml:"grpc,omitempty" json:"grpc,omitempty"`
 }
 type HTTP struct {
-	Method  string            `yaml:"method" json:"method"`
-	Path    string            `yaml:"path" json:"path"`
-	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Body    string            `yaml:"body,omitempty" json:"body,omitempty"`
-	URL     string            `yaml:"url,omitempty" json:"url,omitempty"`
-	Proto   string            `yaml:"proto,omitempty" json:"proto,omitempty"`
+	Method              string            `yaml:"method" json:"method"`
+	Path                string            `yaml:"path" json:"path"`
+	Headers             map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Body                string            `yaml:"body,omitempty" json:"body,omitempty"`
+	URL                 string            `yaml:"url,omitempty" json:"url,omitempty"`
+	Proto               string            `yaml:"proto,omitempty" json:"proto,omitempty"`
+	UnscannableEncoding bool              `yaml:"-" json:"-"`
 }
 type WS struct {
 	Path      string   `yaml:"path" json:"path"`

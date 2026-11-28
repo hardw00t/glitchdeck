@@ -14,6 +14,7 @@ import (
 )
 
 var bodyEntity = regexp.MustCompile(`&(?:amp|lt|gt|quot|apos|#[0-9]+|#[xX][0-9a-fA-F]+);`)
+var xmlEntityDeclaration = regexp.MustCompile(`(?is)<!ENTITY\b|<!DOCTYPE\b(?:[^>"'\[]|"[^"]*"|'[^']*')*\[`)
 
 func decodeBodyEntity(entity string) string {
 	switch entity {
@@ -65,6 +66,9 @@ func checkDerived(raw, decoded, field string, redact bool, budget *int, decode f
 }
 
 func scanBodyEntities(body, field string, redact bool, budget *int) error {
+	if strings.Contains(body, "<!") && xmlEntityDeclaration.MatchString(body) {
+		return &ExportBlockedError{Kind: "unscannable_xml_entity", Field: field}
+	}
 	if !strings.Contains(body, "&") {
 		return nil
 	}
@@ -76,6 +80,9 @@ func scanBodyEntities(body, field string, redact bool, budget *int) error {
 		return bodyEntity.ReplaceAllStringFunc(s, decodeBodyEntity), nil
 	}
 	decoded, _ := decode(body)
+	if strings.Contains(decoded, "<!") && xmlEntityDeclaration.MatchString(decoded) {
+		return &ExportBlockedError{Kind: "unscannable_xml_entity", Field: field}
+	}
 	if decoded != body {
 		return checkDerived(body, decoded, field, redact, budget, decode)
 	}

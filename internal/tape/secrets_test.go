@@ -165,12 +165,14 @@ func TestPrepareExportCompressedBodies(t *testing.T) {
 func TestPrepareExportUnscannableBodies(t *testing.T) {
 	for _, encoding := range []string{"br", "gzip"} {
 		input := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Encoding": encoding}, Body: "invalid"}}}}
-		for _, redact := range []bool{false, true} {
-			_, err := PrepareExport(input, redact)
-			var blocked *ExportBlockedError
-			if !errors.As(err, &blocked) || (blocked.Kind != "unscannable_body" && blocked.Kind != "unsupported_encoding") {
-				t.Fatalf("expected unscannable block: %v", err)
-			}
+		_, err := PrepareExport(input, false)
+		var blocked *ExportBlockedError
+		if !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" || blocked.Field != "$.script[0].http.body" {
+			t.Fatalf("%s: expected unscannable block: %v", encoding, err)
+		}
+		out, err := PrepareExport(input, true)
+		if err != nil || !out.Redacted || out.Script[0].HTTP.Body != "REDACTED" || out.Script[0].HTTP.Headers["Content-Encoding"] != "" {
+			t.Fatalf("%s: expected safe replacement, got %v", encoding, err)
 		}
 	}
 }

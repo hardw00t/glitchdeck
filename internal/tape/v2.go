@@ -24,14 +24,15 @@ import (
 )
 
 type Stream struct {
-	Method        string            `yaml:"method,omitempty" json:"method,omitempty"`
-	Path          string            `yaml:"path,omitempty" json:"path,omitempty"`
-	URL           string            `yaml:"url,omitempty" json:"url,omitempty"`
-	Proto         string            `yaml:"proto,omitempty" json:"proto,omitempty"`
-	Headers       map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Body          string            `yaml:"body,omitempty" json:"body,omitempty"`
-	IdleTimeoutMS int               `yaml:"idle_timeout_ms,omitempty" json:"idle_timeout_ms,omitempty"`
-	MaxMS         int               `yaml:"max_ms,omitempty" json:"max_ms,omitempty"`
+	Method              string            `yaml:"method,omitempty" json:"method,omitempty"`
+	Path                string            `yaml:"path,omitempty" json:"path,omitempty"`
+	URL                 string            `yaml:"url,omitempty" json:"url,omitempty"`
+	Proto               string            `yaml:"proto,omitempty" json:"proto,omitempty"`
+	Headers             map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Body                string            `yaml:"body,omitempty" json:"body,omitempty"`
+	IdleTimeoutMS       int               `yaml:"idle_timeout_ms,omitempty" json:"idle_timeout_ms,omitempty"`
+	MaxMS               int               `yaml:"max_ms,omitempty" json:"max_ms,omitempty"`
+	UnscannableEncoding bool              `yaml:"-" json:"-"`
 }
 type GRPC struct {
 	Path       string `yaml:"path,omitempty" json:"path,omitempty"`
