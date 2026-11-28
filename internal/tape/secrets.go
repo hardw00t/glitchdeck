@@ -688,10 +688,10 @@ func scanBody(body string, encoded bool, encoding, contentType, transfer, field 
 }
 
 func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int) (string, bool, error) {
-	return scanBodyBudgetDepth(body, encoded, encoding, contentType, transfer, field, redact, budget, 0)
+	return scanBodyBudgetDepth(body, encoded, encoding, contentType, transfer, field, redact, budget, 0, encoded)
 }
 
-func scanBodyBudgetDepth(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int, depth int) (string, bool, error) {
+func scanBodyBudgetDepth(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int, depth int, binaryBody bool) (string, bool, error) {
 	if depth > 8 {
 		return "", false, unsupportedBody(field)
 	}
@@ -798,7 +798,7 @@ func scanBodyBudgetDepth(body string, encoded bool, encoding, contentType, trans
 		}
 		return "", false, err
 	}
-	clean, changed, err := scanContentBudget(string(raw), contentType, field, redact, depth, budget)
+	clean, changed, err := scanContentBudget(string(raw), contentType, field, redact, depth, budget, binaryBody)
 	if err != nil {
 		return "", false, err
 	}

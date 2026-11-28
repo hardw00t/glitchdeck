@@ -112,7 +112,7 @@ func TestScannerSSEAndHeaderAllocations(t *testing.T) {
 func TestScannerSSEBufferBudget(t *testing.T) {
 	body := strings.Repeat("\n", 1000)
 	budget := 1000
-	if _, _, err := scanContentBudget(body, "text/event-stream", "$.body", false, 0, &budget); err == nil {
+	if _, _, err := scanContentBudget(body, "text/event-stream", "$.body", false, 0, &budget, false); err == nil {
 		t.Fatal("SSE buffers exceeded work budget")
 	}
 }
@@ -258,13 +258,13 @@ func TestExportReviewFailClosed(t *testing.T) {
 			t.Fatalf("expected encoding block, got %v", err)
 		}
 	})
-	t.Run("XML takes precedence over charset", func(t *testing.T) {
+	t.Run("disallowed charset blocks XML before inspecting declarations", func(t *testing.T) {
 		for _, body := range []string{`<!ENTITY x "value">`, `&lt;!ENTITY x "value"&gt;`} {
 			input := Tape{Script: []Step{{HTTP: &HTTP{Body: body, Headers: map[string]string{"Content-Type": "text/xml; charset=unknown"}}}}}
 			_, err := PrepareExport(input, false)
 			var blocked *ExportBlockedError
-			if !errors.As(err, &blocked) || blocked.Kind != "unscannable_xml_entity" {
-				t.Fatalf("expected XML block, got %v", err)
+			if !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+				t.Fatalf("expected encoding block, got %v", err)
 			}
 			out, err := PrepareExport(input, true)
 			if err != nil || out.Script[0].HTTP.Body != "REDACTED" {

@@ -2,7 +2,6 @@ package tape
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -49,12 +48,13 @@ func TestFix6NULStrippedBodies(t *testing.T) {
 				response.BodyEncoding = "base64"
 				response.Body = base64.StdEncoding.EncodeToString([]byte(response.Body))
 			}
-			for _, redact := range []bool{false, true} {
-				out, err := PrepareExport(Tape{Cassettes: []Cassette{{Response: response}}}, redact)
-				if err == nil {
-					b, _ := json.Marshal(out)
-					t.Fatalf("encoded=%v redact=%v exported hidden credential: %s", encoded, redact, b)
-				}
+			in := Tape{Cassettes: []Cassette{{Response: response}}}
+			if _, err := PrepareExport(in, false); err == nil {
+				t.Fatal("exported BOM-less UTF-16 with a hidden credential")
+			}
+			out, err := PrepareExport(in, true)
+			if err != nil || !out.Redacted || out.Cassettes[0].Response.Body != "REDACTED" {
+				t.Fatalf("BOM-less UTF-16 was not replaced: %v", err)
 			}
 		}
 	}
