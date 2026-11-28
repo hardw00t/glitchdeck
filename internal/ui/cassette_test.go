@@ -227,12 +227,69 @@ func TestCassetteKeyDoesNotRetainRedactedQuery(t *testing.T) {
 	}
 }
 
-func TestComplexJSONRequestMarksRecordingIncomplete(t *testing.T) {
+func TestComplexJSONOnlyFailsWhenResponseNeedsCassette(t *testing.T) {
+	body := "[" + strings.Repeat("0,", 32769) + "0]"
+	for _, tc := range []struct {
+		name       string
+		response   *proxy.ResponseRecord
+		incomplete bool
+	}{
+		{"request only", nil, false},
+		{"synthetic", &proxy.ResponseRecord{Seq: 1, Intentional: true}, false},
+		{"captured", &proxy.ResponseRecord{Seq: 1, Status: 200}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recording := NewRecorder()
+			r := &recording.rec
+			r.start(0, 0, fault.Config{})
+			if tc.response != nil && tc.response.Status != 0 {
+				r.shouldCaptureResponse(1)
+			}
+			r.request(proxy.Record{Seq: 1, Method: "POST", Path: "/", Proto: "h2c", Body: []byte(body)})
+			if tc.response != nil {
+				r.response(*tc.response)
+			}
+			doc, err := recording.Export("complex")
+			if err != nil || doc.Incomplete != tc.incomplete {
+				t.Fatalf("incomplete=%v, reason=%q, err=%v", doc.Incomplete, doc.IncompleteReason, err)
+			}
+			if tc.response == nil || tc.response.Status == 0 {
+				if doc.Version != 2 || len(doc.Cassettes) != 0 {
+					t.Fatalf("request-only export: %+v", doc)
+				}
+			}
+		})
+	}
+}
+
+func TestAbsoluteEmptyPathCassetteRoundTrips(t *testing.T) {
 	var r recorder
 	r.start(0, 0, fault.Config{})
-	body := "[" + strings.Repeat("0,", 32769) + "0]"
-	r.request(proxy.Record{Seq: 1, Method: "POST", Path: "/", Body: []byte(body)})
-	if !r.status().Incomplete {
-		t.Fatal("complex JSON request recorded as a wildcard")
+	r.shouldCaptureResponse(1)
+	r.request(proxy.Record{Seq: 1, Method: "GET", URL: "http://example.com", At: time.Now()})
+	r.response(proxy.ResponseRecord{Seq: 1, Status: 200, Body: []byte("root")})
+	doc := r.tape(fault.Config{})
+	if doc.Incomplete || len(doc.Cassettes) != 1 || doc.Cassettes[0].Request.Path != "/" {
+		t.Fatalf("recorded root: %+v", doc)
+	}
+	var encoded strings.Builder
+	if err := tape.Encode(&encoded, doc); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := tape.Decode(strings.NewReader(encoded.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest("GET", "http://example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := decoded.CassetteUpstream()(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("replay status %d", resp.StatusCode)
 	}
 }

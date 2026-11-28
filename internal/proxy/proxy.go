@@ -895,6 +895,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Glitchdeck-Seq", strconv.FormatUint(seq, 10))
 	}
 	var capturing bool
+	var recordMethod string
+	if p.OnRequest != nil {
+		recordMethod = strings.Clone(r.Method)
+	}
 	hasTrailers := len(r.Trailer) > 0
 	var preReserved int
 	record := func(captured []byte, missing, truncated bool) {
@@ -906,7 +910,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		headers := r.Header.Clone()
 		stripHop(headers)
-		rec := Record{Seq: seq, Method: r.Method, Path: r.URL.RequestURI(), Header: headers, Body: captured,
+		rec := Record{Seq: seq, Method: recordMethod, Path: r.URL.RequestURI(), Header: headers, Body: captured,
 			WebSocket: ws, SSE: isSSE, At: start, Proto: recordProto, UnrecordableBody: missing, BodyTruncated: truncated,
 			BodyCaptureStarted: capturing, MITM: meta.MITM, HasTrailers: hasTrailers, AssertionProbe: r.Context().Value(probeKey{}) == true}
 		if r.URL.IsAbs() {

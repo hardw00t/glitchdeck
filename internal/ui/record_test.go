@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
@@ -32,6 +34,36 @@ func TestStoppedTapeFreezesConfigChangesAndSequenceGaps(t *testing.T) {
 	}
 	if len(doc.ConfigChanges) != 1 || doc.ConfigChanges[0].BeforeSeq != 8 || doc.ConfigChanges[0].Seed != 29 || !doc.ConfigChanges[0].Rules[0].Enabled {
 		t.Fatalf("config timeline = %+v", doc.ConfigChanges)
+	}
+}
+
+func TestRecordedMethodDoesNotRetainParsedRequestLine(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	target, err := proxy.ParseExplicitTarget(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := proxy.New(target, fault.Config{}, nil)
+	defer p.Close()
+	recording := NewRecorder()
+	recording.Start(p)
+	req, err := http.ReadRequest(bufio.NewReader(strings.NewReader("GET /?token=" + strings.Repeat("x", 4096) + " HTTP/1.1\r\nHost: localhost\r\n\r\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	method := req.Method
+	p.ServeHTTP(httptest.NewRecorder(), req)
+	doc := recording.rec.tape(fault.Config{})
+	if len(doc.Script) != 1 || len(doc.Cassettes) != 1 {
+		t.Fatalf("missing captured exchange: %+v", doc)
+	}
+	scriptMethod := doc.Script[0].HTTP.Method
+	keyMethod := doc.Cassettes[0].Request.Method
+	if unsafe.StringData(scriptMethod) == unsafe.StringData(method) || unsafe.StringData(scriptMethod) != unsafe.StringData(keyMethod) {
+		t.Fatal("recorded method must own one shared copy, not retain the parsed request line")
 	}
 }
 

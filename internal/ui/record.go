@@ -225,7 +225,11 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 		if e.seq != res.Seq || e.cassette == nil {
 			continue
 		}
-		keySize := len(e.cassette.Request.Path) + len(e.cassette.Request.Host) + len(e.cassette.Request.Method) + len(e.cassette.Request.BodySHA256)
+		e.cassette.Request.BodySHA256 = tape.BodySHA256([]byte(e.http.Body), r.ignoreJSONPaths)
+		if e.cassette.Request.BodySHA256 == "" {
+			r.markIncomplete("request body exceeds JSON matching complexity")
+		}
+		keySize := len(e.cassette.Request.Path) + len(e.cassette.Request.Host) + len(e.cassette.Request.BodySHA256)
 		e.bytes += keySize
 		r.bytes += keySize
 		headers := make(map[string]string)
@@ -475,7 +479,10 @@ func (r *recorder) request(req proxy.Record) {
 	} else if u, err := url.ParseRequestURI(requestPath); err == nil {
 		requestPath = u.EscapedPath()
 	}
-	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE, probe: req.AssertionProbe, demoScheme: demoScheme}
+	if requestPath == "" {
+		requestPath = "/"
+	}
+	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path) + len(req.Method), mitm: req.MITM, sse: req.SSE, probe: req.AssertionProbe, demoScheme: demoScheme}
 	if req.WebSocket {
 		if req.MITM || req.URL != "" {
 			r.markIncomplete("forwarded WebSocket authority cannot be replayed")
@@ -487,11 +494,7 @@ func (r *recorder) request(req proxy.Record) {
 		r.streams[req.Seq] = e
 	} else {
 		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body)}
-		digest := tape.BodySHA256(req.Body, r.ignoreJSONPaths)
-		if digest == "" {
-			r.markIncomplete("request body exceeds JSON matching complexity")
-		}
-		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host, BodySHA256: digest}}
+		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host}}
 		if req.URL != "" {
 			e.http.Path = ""
 		}
