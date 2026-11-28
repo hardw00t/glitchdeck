@@ -82,9 +82,42 @@ func scanHeader(name, value, field string, redact bool, budget *int) (string, bo
 	if strings.Contains(value, "=?") {
 		return "", false, unsupportedBody(field)
 	}
-	if strings.Contains(value, `\`) && strings.Contains(value, ";") &&
-		!strings.EqualFold(name, "Content-Disposition") && !strings.EqualFold(name, "Content-Type") {
-		return "", false, unsupportedBody(field)
+	if strings.Contains(value, `\`) {
+		if len(value) > *budget/2 {
+			return "", false, unsupportedBody(field)
+		}
+		*budget -= 2 * len(value)
+		for i := 0; i < len(value); i++ {
+			if value[i] != '"' {
+				continue
+			}
+			var decoded strings.Builder
+			escaped, closed := false, false
+			for i++; i < len(value); i++ {
+				if value[i] == '"' {
+					closed = true
+					break
+				}
+				if value[i] == '\\' {
+					escaped = true
+					i++
+					if i == len(value) || value[i] < 0x20 && value[i] != '\t' || value[i] == 0x7f {
+						return "", false, unsupportedBody(field)
+					}
+				}
+				decoded.WriteByte(value[i])
+			}
+			if !closed && escaped {
+				return "", false, unsupportedBody(field)
+			}
+			if escaped {
+				for _, suffix := range [...]string{"", ".location", ".form"} {
+					if _, _, err := scanTextDepth(decoded.String(), field+suffix, false, 0, budget); err != nil {
+						return "", false, err
+					}
+				}
+			}
+		}
 	}
 	for rest := value; strings.Contains(rest, ";"); {
 		_, rest, _ = strings.Cut(rest, ";")
@@ -179,6 +212,16 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 	if depth > 8 || len(body) > 4<<20 {
 		return "", false, unsupportedBody(field)
 	}
+	if strings.ContainsRune(body, 0) {
+		if len(body) > *budget {
+			return "", false, unsupportedBody(field)
+		}
+		*budget -= len(body)
+		stripped := strings.ReplaceAll(body, "\x00", "")
+		if _, _, err := scanTextDepth(stripped, field, false, 0, budget); err != nil {
+			return "", false, err
+		}
+	}
 	if strings.HasPrefix(body, "\xff\xfe") || strings.HasPrefix(body, "\xfe\xff") || strings.HasPrefix(body, "\x00\x00\xfe\xff") {
 		return "", false, unsupportedBody(field)
 	}
@@ -191,9 +234,10 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		return "", false, unsupportedBody(field)
 	}
 	encoding := ""
-	if media == "application/gzip" || media == "application/x-gzip" || strings.HasPrefix(body, "\x1f\x8b") {
+	declaredJSON := (media == "application/json" || strings.HasSuffix(media, "+json")) && json.Valid([]byte(body))
+	if media == "application/gzip" || media == "application/x-gzip" || !declaredJSON && strings.HasPrefix(body, "\x1f\x8b") {
 		encoding = "gzip"
-	} else if media == "application/zlib" || (len(body) >= 2 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0) {
+	} else if media == "application/zlib" || !declaredJSON && len(body) >= 2 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0 {
 		encoding = "deflate"
 	}
 	if encoding != "" {
@@ -209,10 +253,10 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		"application/vnd.rar":
 		return "", false, unsupportedBody(field)
 	}
-	if strings.HasPrefix(body, "PK\x03\x04") || strings.HasPrefix(body, "PK\x05\x06") || strings.HasPrefix(body, "PK\x07\x08") ||
+	if !declaredJSON && (strings.HasPrefix(body, "PK\x03\x04") || strings.HasPrefix(body, "PK\x05\x06") || strings.HasPrefix(body, "PK\x07\x08") ||
 		strings.HasPrefix(body, "BZh") || strings.HasPrefix(body, "\xfd7zXZ\x00") ||
 		strings.HasPrefix(body, "\x28\xb5\x2f\xfd") || strings.HasPrefix(body, "7z\xbc\xaf\x27\x1c") ||
-		strings.HasPrefix(body, "Rar!\x1a\x07") || (len(body) >= 262 && body[257:262] == "ustar") {
+		strings.HasPrefix(body, "Rar!\x1a\x07") || (len(body) >= 262 && body[257:262] == "ustar")) {
 		return "", false, unsupportedBody(field)
 	}
 	if strings.HasPrefix(media, "multipart/") {
