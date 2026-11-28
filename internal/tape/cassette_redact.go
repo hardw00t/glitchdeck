@@ -10,7 +10,7 @@ type cassetteStepKey struct {
 	method, path, host, digest string
 }
 
-func cassetteStepRequest(s Step, ignore []string) (cassetteStepKey, bool) {
+func cassetteStepRequest(s Step) (cassetteStepKey, string, bool) {
 	var method, path, address, body string
 	switch {
 	case s.HTTP != nil:
@@ -18,7 +18,7 @@ func cassetteStepRequest(s Step, ignore []string) (cassetteStepKey, bool) {
 	case s.Stream != nil:
 		method, path, address, body = s.Stream.Method, s.Stream.Path, s.Stream.URL, s.Stream.Body
 	default:
-		return cassetteStepKey{}, false
+		return cassetteStepKey{}, "", false
 	}
 	if method == "" {
 		method = http.MethodGet
@@ -28,13 +28,13 @@ func cassetteStepRequest(s Step, ignore []string) (cassetteStepKey, bool) {
 	}
 	u, err := url.Parse(strings.ReplaceAll(path, "${DEMO_TLS}", "https://localhost"))
 	if err != nil {
-		return cassetteStepKey{}, false
+		return cassetteStepKey{}, "", false
 	}
 	path = u.EscapedPath()
 	if path == "" {
 		path = "/"
 	}
-	return cassetteStepKey{strings.ToUpper(method), path, strings.ToLower(u.Host), BodySHA256([]byte(body), ignore)}, true
+	return cassetteStepKey{method: strings.ToUpper(method), path: path, host: strings.ToLower(u.Host)}, body, true
 }
 
 func cassetteRequestKey(r CassetteRequest) cassetteStepKey {
@@ -47,30 +47,31 @@ func syncRedactedCassetteRequests(before Tape, after *Tape) error {
 		return blocked()
 	}
 	updated := make([]CassetteRequest, len(after.Cassettes))
-	type stepKeys struct {
-		before, after     cassetteStepKey
-		beforeOK, afterOK bool
-	}
-	keys := make([]stepKeys, len(before.Script))
-	for i := range before.Script {
-		keys[i].before, keys[i].beforeOK = cassetteStepRequest(before.Script[i], before.IgnoreJSONPaths)
-		keys[i].after, keys[i].afterOK = cassetteStepRequest(after.Script[i], after.IgnoreJSONPaths)
-		if keys[i].beforeOK && keys[i].before.digest == "" || keys[i].afterOK && keys[i].after.digest == "" {
-			return blocked()
-		}
-	}
+	matcher := NewBodyMatcher(before.IgnoreJSONPaths)
+	afterMatcher := NewBodyMatcher(after.IgnoreJSONPaths)
 	for i, cassette := range before.Cassettes {
 		old := cassetteRequestKey(cassette.Request)
 		updated[i] = after.Cassettes[i].Request
 		var next cassetteStepKey
 		found := false
-		for _, step := range keys {
-			key, ok := step.before, step.beforeOK
-			if !ok || key.method != old.method || key.path != old.path || key.digest != old.digest || old.host != "" && key.host != "" && !overlappingAuthorities(key.host, old.host) {
+		for j, step := range before.Script {
+			key, body, ok := cassetteStepRequest(step)
+			if !ok || key.method != old.method || key.path != old.path || old.host != "" && key.host != "" && !overlappingAuthorities(key.host, old.host) {
 				continue
 			}
-			candidate, ok := step.after, step.afterOK
+			key.digest = matcher.SHA256([]byte(body))
+			if key.digest == "" {
+				return blocked()
+			}
+			if key.digest != old.digest {
+				continue
+			}
+			candidate, afterBody, ok := cassetteStepRequest(after.Script[j])
 			if !ok {
+				return blocked()
+			}
+			candidate.digest = afterMatcher.SHA256([]byte(afterBody))
+			if candidate.digest == "" {
 				return blocked()
 			}
 			if old.host == "" {

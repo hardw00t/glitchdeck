@@ -79,6 +79,7 @@ type recorder struct {
 	demoTLSAuthority      string
 	target                string
 	ignoreJSONPaths       []string
+	bodyMatcher           tape.BodyMatcher
 }
 
 // Recording captures traffic and configuration changes from a single proxy.
@@ -107,6 +108,7 @@ func (r *Recording) SetCassetteMetadata(target string, ignoreJSONPaths []string)
 	defer r.rec.mu.Unlock()
 	r.rec.target = target
 	r.rec.ignoreJSONPaths = slices.Clone(ignoreJSONPaths)
+	r.rec.bodyMatcher = tape.NewBodyMatcher(r.rec.ignoreJSONPaths)
 }
 
 func (r *Recording) SetDemoHTTPAuthority(authority string) {
@@ -225,7 +227,7 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 		if e.seq != res.Seq || e.cassette == nil {
 			continue
 		}
-		e.cassette.Request.BodySHA256 = tape.BodySHA256([]byte(e.http.Body), r.ignoreJSONPaths)
+		e.cassette.Request.BodySHA256 = r.bodyMatcher.SHA256([]byte(e.http.Body))
 		if e.cassette.Request.BodySHA256 == "" {
 			r.markIncomplete("request body exceeds JSON matching complexity")
 		}

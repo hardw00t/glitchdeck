@@ -180,12 +180,30 @@ func matchJSONComplexityOK(body []byte) bool {
 	return true
 }
 
-func BodySHA256(body []byte, ignore []string) string {
+// BodyMatcher prepares JSON ignore paths for repeated digest calculations.
+type BodyMatcher struct {
+	ignore [][]string
+}
+
+// NewBodyMatcher prepares ignore paths once for a recording or replay.
+func NewBodyMatcher(ignore []string) BodyMatcher {
 	parts := make([][]string, len(ignore))
 	for i, path := range ignore {
 		parts[i] = strings.Split(path, ".")
 	}
-	return bodySHA256(body, parts)
+	return BodyMatcher{ignore: parts}
+}
+
+// SHA256 returns the canonical request body digest, or an empty string on complexity overflow.
+func (m BodyMatcher) SHA256(body []byte) string {
+	return bodySHA256(body, m.ignore)
+}
+
+func BodySHA256(body []byte, ignore []string) string {
+	if !json.Valid(body) {
+		return bodySHA256(body, nil)
+	}
+	return NewBodyMatcher(ignore).SHA256(body)
 }
 
 func bodySHA256(body []byte, ignore [][]string) string {
@@ -303,22 +321,24 @@ func uniqueJSONValue(d *json.Decoder) bool {
 	return err == nil
 }
 
+func authorityForm(authority, scheme string) string {
+	host, port, err := net.SplitHostPort(authority)
+	if err == nil && (scheme == "https" && port == "443" || scheme == "http" && port == "80") {
+		return strings.ToLower(strings.Trim(host, "[]"))
+	}
+	return strings.ToLower(strings.Trim(authority, "[]"))
+}
+
 // SameAuthority reports whether two authorities match for a request scheme.
 func SameAuthority(a, b, scheme string) bool {
-	normalize := func(authority string) string {
-		host, port, err := net.SplitHostPort(authority)
-		if err == nil && (scheme == "https" && port == "443" || scheme == "http" && port == "80") {
-			return strings.ToLower(strings.Trim(host, "[]"))
-		}
-		return strings.ToLower(strings.Trim(authority, "[]"))
-	}
-	return normalize(a) == normalize(b)
+	return authorityForm(a, scheme) == authorityForm(b, scheme)
 }
 
 func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 	type replayCassette struct {
-		cassette Cassette
-		valid    bool
+		cassette                       Cassette
+		valid                          bool
+		httpHost, httpsHost, otherHost string
 	}
 	cassettes := make([]replayCassette, len(t.Cassettes))
 	total := 0
@@ -340,12 +360,9 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 			}
 			c.Response.Headers = headers
 		}
-		cassettes[i] = replayCassette{cassette: c, valid: valid}
+		cassettes[i] = replayCassette{cassette: c, valid: valid, httpHost: authorityForm(c.Request.Host, "http"), httpsHost: authorityForm(c.Request.Host, "https"), otherHost: authorityForm(c.Request.Host, "")}
 	}
-	ignore := make([][]string, len(t.IgnoreJSONPaths))
-	for i, path := range t.IgnoreJSONPaths {
-		ignore[i] = strings.Split(path, ".")
-	}
+	ignore := NewBodyMatcher(t.IgnoreJSONPaths)
 	return func(req *http.Request) (*http.Response, error) {
 		path := req.URL.EscapedPath()
 		if path == "" {
@@ -358,13 +375,20 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 		if scheme == "" {
 			scheme = "http"
 		}
-		matches := func(c Cassette) bool {
-			return strings.EqualFold(c.Request.Method, req.Method) && c.Request.Path == path && (c.Request.Host == "" || SameAuthority(c.Request.Host, req.Host, strings.ToLower(scheme)))
+		requestHost := authorityForm(req.Host, strings.ToLower(scheme))
+		matches := func(c *replayCassette) bool {
+			host := c.otherHost
+			if strings.EqualFold(scheme, "http") {
+				host = c.httpHost
+			} else if strings.EqualFold(scheme, "https") {
+				host = c.httpsHost
+			}
+			return strings.EqualFold(c.cassette.Request.Method, req.Method) && c.cassette.Request.Path == path && (c.cassette.Request.Host == "" || host == requestHost)
 		}
 		miss := func() (*http.Response, error) { return nil, &proxy.CassetteError{Kind: "cassette_miss"} }
 		index, count := -1, 0
 		for i := range cassettes {
-			if matches(cassettes[i].cassette) {
+			if matches(&cassettes[i]) {
 				index = i
 				count++
 			}
@@ -389,7 +413,7 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 				if !matchJSONComplexityOK(body) {
 					return "", true, nil
 				}
-				return bodySHA256(body, ignore), false, nil
+				return ignore.SHA256(body), false, nil
 			}()
 			if limited {
 				return nil, &proxy.CassetteError{Kind: "cassette_match_limit"}
@@ -400,7 +424,7 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 			count = 0
 			for i := range cassettes {
 				c := cassettes[i].cassette
-				if matches(c) && (c.Request.BodySHA256 == "" || strings.EqualFold(c.Request.BodySHA256, digest)) {
+				if matches(&cassettes[i]) && (c.Request.BodySHA256 == "" || strings.EqualFold(c.Request.BodySHA256, digest)) {
 					index = i
 					count++
 				}

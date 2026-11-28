@@ -289,6 +289,42 @@ func Encode(w io.Writer, t Tape) error {
 func validPath(p string) bool {
 	return strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") && !strings.ContainsAny(p, "\r\n")
 }
+func validCassetteHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	if len(host) > 259 {
+		return false
+	}
+	u, err := url.Parse("http://" + host)
+	if err != nil || u.Host != host || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Hostname() == "" || strings.HasSuffix(host, ":") {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	name := u.Hostname()
+	if strings.HasPrefix(host, "[") {
+		return net.ParseIP(name) != nil && strings.Contains(name, ":")
+	}
+	if len(name) > 253 {
+		return false
+	}
+	for label := range strings.SplitSeq(strings.TrimSuffix(name, "."), ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+	}
+	for _, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
 func validate(t Tape) error {
 	if t.Version != 1 && t.Version != 2 && t.Version != 3 {
 		return fmt.Errorf("unsupported tape version %d", t.Version)
@@ -308,7 +344,7 @@ func validate(t Tape) error {
 	}
 	total := 0
 	for i, c := range t.Cassettes {
-		if !validCassetteMethod(c.Request.Method) || !validPath(c.Request.Path) || strings.ContainsAny(c.Request.Path, "?#") {
+		if !validCassetteMethod(c.Request.Method) || !strings.HasPrefix(c.Request.Path, "/") || strings.ContainsAny(c.Request.Path, "\r\n?#") || !validCassetteHost(c.Request.Host) {
 			return fmt.Errorf("cassettes[%d]: invalid request", i)
 		}
 		if c.Request.BodySHA256 != "" {
