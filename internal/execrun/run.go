@@ -66,6 +66,7 @@ type Options struct {
 	TailBytes            int
 	RequireUpstreamAllow bool
 	javaHome             bool
+	listen               func(string, string) (net.Listener, error)
 }
 type Exec struct {
 	Cmd                         []string           `json:"cmd"`
@@ -320,7 +321,11 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 	if replay && parsed != nil && parsed.Scheme == "https" {
 		o.TLS = true
 	}
-	listener, err := net.Listen("tcp", o.Listen)
+	listen := o.listen
+	if listen == nil {
+		listen = net.Listen
+	}
+	listener, err := listen("tcp", o.Listen)
 	if err != nil {
 		return finish(3, "PROXY_START_FAILED", err)
 	}
@@ -508,8 +513,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		return true
 	}
 	childTarget := target
+	var serveReplay []func()
 	if replay && parsed != nil {
-		physical, listenErr := net.Listen("tcp", "127.0.0.1:0")
+		physical, listenErr := listen("tcp", "127.0.0.1:0")
 		if listenErr != nil {
 			return finish(3, "PROXY_START_FAILED", listenErr)
 		}
@@ -531,13 +537,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 				return finish(3, "CA_ERROR", certErr)
 			}
 			server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}
-			go server.ServeTLS(physical, "", "")
+			serveReplay = append(serveReplay, func() { server.ServeTLS(physical, "", "") })
 		} else {
-			go server.Serve(physical)
+			serveReplay = append(serveReplay, func() { server.Serve(physical) })
 		}
 	}
 	if replay && recordTarget == "demo" && opts.CA != nil {
-		physical, listenErr := net.Listen("tcp", "127.0.0.1:0")
+		physical, listenErr := listen("tcp", "127.0.0.1:0")
 		if listenErr != nil {
 			return finish(3, "PROXY_START_FAILED", listenErr)
 		}
@@ -555,7 +561,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 			p.ServeHTTP(w, r)
 		}), TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}}
 		defer server.Close()
-		go server.ServeTLS(physical, "", "")
+		serveReplay = append(serveReplay, func() { server.ServeTLS(physical, "", "") })
 		env = append(env, "GLITCHDECK_DEMO_TLS=https://"+demoTLSPhysical)
 	}
 	e.Exec.ProxyURL, e.Exec.LeakedPIDs = publicURL, []int{}
@@ -576,7 +582,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		if bindErr != nil || host != "localhost" && !net.ParseIP(host).IsLoopback() {
 			return finish(2, "TARGET_INVALID", fmt.Errorf("UI listener must be loopback"))
 		}
-		l, listenErr := net.Listen("tcp", o.UI)
+		l, listenErr := listen("tcp", o.UI)
 		if listenErr != nil {
 			return finish(3, "PROXY_START_FAILED", listenErr)
 		}
@@ -587,10 +593,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		}
 		e.Exec.UIURL = "http://" + l.Addr().String()
 		server := &http.Server{Handler: ui.New(p, bus, ui.Options{Target: target, Listen: listener.Addr().String(), UI: l.Addr().String(), DemoURL: demoURL, ProxyAuth: opts.ProxyAuth, Recording: recording, IgnoreJSONPaths: t.IgnoreJSONPaths})}
-		go server.Serve(l)
+		serveReplay = append(serveReplay, func() { server.Serve(l) })
 		defer server.Close()
 	}
 	scheduleStart = time.Now()
+	for _, serve := range serveReplay {
+		go serve()
+	}
 	scheduleCtx, stopSchedule := context.WithCancel(ctx)
 	defer stopSchedule()
 	for _, change := range t.ConfigChanges {

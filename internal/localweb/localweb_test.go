@@ -30,3 +30,20 @@ func TestAllowedControlRequest(t *testing.T) {
 		})
 	}
 }
+
+func TestAllowedTLSOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		origin string
+		want   bool
+	}{
+		{"https://localhost:3000", true},
+		{"http://localhost:3000", false},
+		{"https://evil.example:3000", false},
+	} {
+		r := httptest.NewRequest("POST", "https://localhost:3000/", nil)
+		r.Header.Set("Origin", tc.origin)
+		if got := Allowed(r, "127.0.0.1:3000"); got != tc.want {
+			t.Errorf("Origin %q: got %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+}

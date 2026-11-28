@@ -40,6 +40,28 @@ func TestFix4ReplayChild(t *testing.T) {
 		tr.Proxy = http.ProxyURL(p)
 	}
 	client := &http.Client{Transport: tr}
+	if mode == "tls-origin" {
+		target := os.Getenv("GLITCHDECK_TARGET")
+		for _, tc := range []struct {
+			origin string
+			status int
+		}{{target, http.StatusOK}, {"https://evil.example", http.StatusForbidden}} {
+			req, err := http.NewRequest("POST", target+"/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Origin", tc.origin)
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tc.status {
+				t.Fatalf("origin %s: status %d, want %d", tc.origin, resp.StatusCode, tc.status)
+			}
+		}
+		return
+	}
 	if mode == "hosts" {
 		for _, target := range []string{os.Getenv("GLITCHDECK_TARGET"), os.Getenv("GLITCHDECK_DEMO_TLS")} {
 			for _, origin := range []bool{false, true} {
@@ -112,6 +134,15 @@ func TestFix4ReplayListenerAuthorizationAndProxyRedirect(t *testing.T) {
 				t.Fatalf("run: %+v exec=%+v", result, result.Exec)
 			}
 		})
+	}
+}
+
+func TestReplayTLSOriginAuthorization(t *testing.T) {
+	t.Setenv("GD_FIX4_CHILD", "tls-origin")
+	cassette := []tape.Cassette{{Request: tape.CassetteRequest{Method: "POST", Path: "/"}, Response: tape.CassetteResponse{Status: 200}}}
+	result := Run(context.Background(), tape.Tape{Version: 3, Target: "https://example.test", Cassettes: cassette}, Options{Mode: "replay", TLS: true, JSON: true, AllowZeroTraffic: true, Command: []string{os.Args[0], "-test.run=^TestFix4ReplayChild$"}})
+	if result.ExitCode != 0 {
+		t.Fatalf("run: %+v exec=%+v", result, result.Exec)
 	}
 }
 

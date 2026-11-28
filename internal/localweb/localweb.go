@@ -43,7 +43,11 @@ func Allowed(r *http.Request, bind string) bool {
 		return false
 	}
 	u, err := url.Parse(origins[0])
-	return err == nil && u.Scheme == "http" && u.User == nil && u.Path == "" && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && strings.EqualFold(u.Host, r.Host)
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return err == nil && u.Scheme == scheme && u.User == nil && u.Path == "" && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && strings.EqualFold(u.Host, r.Host)
 }
 
 func hostname(addr string) string {
