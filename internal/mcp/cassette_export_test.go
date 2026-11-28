@@ -108,6 +108,29 @@ func TestBlockedFileExportDoesNotWrite(t *testing.T) {
 	}
 }
 
+func TestCassetteFileExportRejectedEvenOnDowngrade(t *testing.T) {
+	s, proxyURL := exportTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("recorded response"))
+	})
+	req, _ := http.NewRequest("GET", proxyURL+"/", nil)
+	exportTestRequest(t, req)
+	inline, _ := s.call("tape_export", []byte(`{"name":"capture"}`))
+	if inline["version"] != 3 || !strings.Contains(inline["yaml"].(string), "recorded response") {
+		t.Fatalf("expected inline cassette: %v", inline)
+	}
+	for _, format := range []string{"", "v1", "v2", "v3"} {
+		path := filepath.Join(s.opts.Workdir, "capture.yaml")
+		result, _ := s.call("tape_export", []byte(`{"name":"capture","out_path":"capture.yaml","format":"`+format+`"}`))
+		err, ok := result["error"].(map[string]string)
+		if !ok || err["code"] != "INVALID_PATH" {
+			t.Fatalf("%q: expected path error: %v", format, result)
+		}
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("%q: file created or stat failed: %v", format, statErr)
+		}
+	}
+}
+
 func TestExportCountsRemovedCassetteBodies(t *testing.T) {
 	doc := tape.Tape{Version: 3, OmittedBodyBytes: 7}
 	for i := range 20 {

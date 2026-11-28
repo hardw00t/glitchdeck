@@ -340,3 +340,64 @@ func TestConcurrentCapturesRemainChargedAcrossRestart(t *testing.T) {
 	<-uploadDone
 	<-responseDone
 }
+
+func TestLegacyNearLimitRequestReservations(t *testing.T) {
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, _ = io.Copy(io.Discard, req.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	up.Config.Protocols = proxy.H2CProtocols()
+	up.Start()
+	defer up.Close()
+	target, err := proxy.ParseExplicitTarget(up.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := proxy.New(target, fault.Config{}, nil)
+	defer p.Close()
+	recording := NewRecorder()
+	recording.Start(p)
+	p.OnResponse = nil
+	r := &recording.rec
+	body := bytes.Repeat([]byte("a"), 4<<20)
+	for seq := uint64(1); seq <= 3; seq++ {
+		req := httptest.NewRequest("POST", "/upload", bytes.NewReader(body))
+		req.Host = "localhost"
+		req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/2.0", 2, 0
+		response := httptest.NewRecorder()
+		p.ServeHTTP(response, req)
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("request %d: status %d", seq, response.Code)
+		}
+	}
+	r.stop()
+	doc := r.tape(fault.Config{})
+	for i := range doc.Script {
+		doc.Script[i].AtMS = 0
+	}
+	want := tape.Tape{Version: 2, StartSeq: 2, Truncated: true, DroppedEntries: 2,
+		Script: []tape.Step{{Seq: 3, HTTP: &tape.HTTP{Method: "POST", Path: "/upload", Proto: "h2c", Body: string(body)}}}}
+	var gotBytes, wantBytes bytes.Buffer
+	if err := tape.Encode(&gotBytes, doc); err != nil {
+		t.Fatal(err)
+	}
+	if err := tape.Encode(&wantBytes, want); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBytes.Bytes(), wantBytes.Bytes()) {
+		t.Fatalf("near-limit legacy tape differs from v2.2.4 golden")
+	}
+}
+
+func TestReservationEvictsOpenWebSocketInFIFOOrder(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	r.request(proxy.Record{Seq: 1, Path: "/ws", WebSocket: true, At: time.Unix(1, 0)})
+	r.request(proxy.Record{Seq: 2, Method: "POST", Path: "/", Body: bytes.Repeat([]byte("a"), 4<<20), At: time.Unix(1, 0)})
+	if got := r.reserveRequestBytes(3, 4<<20); got != 4<<20 {
+		t.Fatalf("reserved %d bytes", got)
+	}
+	if len(r.entries) != 0 || r.droppedEntries != 2 {
+		t.Fatalf("FIFO entries=%d dropped=%d", len(r.entries), r.droppedEntries)
+	}
+}

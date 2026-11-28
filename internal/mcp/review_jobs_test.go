@@ -154,6 +154,7 @@ func TestCancelledJobDoesNotWaitForStderr(t *testing.T) {
 
 func TestTapeExportReturnsReusableRelativePath(t *testing.T) {
 	s, proxyURL := exportTestServer(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	s.p.ShouldCaptureResponse = func(uint64) bool { return false }
 	req, err := http.NewRequest("GET", proxyURL+"/resource", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -162,6 +163,13 @@ func TestTapeExportReturnsReusableRelativePath(t *testing.T) {
 	got, _ := s.call("tape_export", []byte(`{"name":"capture","out_path":"capture.yaml"}`))
 	if got["out_path"] != filepath.Join(s.opts.Workdir, "capture.yaml") || got["tape_path"] != "capture.yaml" {
 		t.Fatalf("export paths: %v", got)
+	}
+	for _, format := range []string{"v1", "v2"} {
+		args, _ := json.Marshal(map[string]string{"name": "capture", "out_path": format + ".yaml", "format": format})
+		legacy, _ := s.call("tape_export", args)
+		if legacy["out_path"] != filepath.Join(s.opts.Workdir, format+".yaml") || legacy["tape_path"] != format+".yaml" {
+			t.Fatalf("%s export paths: %v", format, legacy)
+		}
 	}
 	args, _ := json.Marshal(map[string]any{"command": []string{"true"}, "tape_path": got["tape_path"]})
 	s.opts.AllowExec = true

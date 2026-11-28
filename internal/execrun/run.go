@@ -40,6 +40,7 @@ type Options struct {
 	TapePath             string
 	Mode                 string
 	TapeOut              string
+	TapeDestination      *Destination
 	RedactSecrets        bool
 	Target               string
 	Listen               string
@@ -180,7 +181,21 @@ type helperReport struct {
 	SpawnError string `json:"spawn_error"`
 }
 
-func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
+func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
+	if o.Mode == "record" {
+		defer func() {
+			result.Tape, result.Target = "", nil
+			result.FaultsTriggered, result.Assertions, result.Diff = []any{}, []Assertion{}, []string{}
+			result.FrameErrors = nil
+			result.FrameErrorsOmitted = 0
+			if result.Exec != nil {
+				result.Exec = &Exec{ExitCode: result.Exec.ExitCode, TimedOut: result.Exec.TimedOut, StdoutBytes: result.Exec.StdoutBytes, StderrBytes: result.Exec.StderrBytes}
+			}
+			if detail, ok := result.Error.(map[string]string); ok {
+				result.Error = map[string]string{"code": detail["code"], "message": detail["code"]}
+			}
+		}()
+	}
 	start := time.Now()
 	o.javaHome = os.Getenv("JAVA_HOME") != ""
 	o.TLS = o.TLS || t.TLSMITM
@@ -191,6 +206,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	e := NewEnvelope("exec", o.TapePath, target)
 	e.Exec = &Exec{Cmd: o.Command}
 	warn := func(message string) {
+		if o.Mode == "record" {
+			return
+		}
 		if !o.DetachStdio {
 			fmt.Fprintln(os.Stderr, message)
 			return
@@ -207,7 +225,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		}
 	}
 	var caWarn func(string)
-	if o.DetachStdio {
+	if o.DetachStdio || o.Mode == "record" {
 		caWarn = warn
 	}
 	finish := func(code int, kind string, err error) Envelope {
@@ -259,7 +277,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	var demoHandler http.Handler
 	if replay && target == "demo" {
-		target = "http://127.0.0.1"
+		target = "http://demo.glitchdeck.invalid"
 	}
 	if !replay && target == "demo" {
 		al, e := net.Listen("tcp", "127.0.0.1:0")
@@ -290,6 +308,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			return finish(2, "TARGET_INVALID", err)
 		}
 	}
+	if replay && parsed != nil && parsed.Scheme == "https" {
+		o.TLS = true
+	}
 	listener, err := net.Listen("tcp", o.Listen)
 	if err != nil {
 		return finish(3, "PROXY_START_FAILED", err)
@@ -314,9 +335,24 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	p.SetSeq(t.StartSeq)
 	defer p.Close()
 	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), TLSPassthrough: append(append([]string{}, t.TLSPassthrough...), o.TLSPassthrough...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress, RequireUpstreamAllow: o.RequireUpstreamAllow}
-	opts.SuppressStderr = o.DetachStdio
+	opts.SuppressStderr = o.DetachStdio || o.Mode == "record"
+	var demoTLSPhysical, targetPhysical string
 	if replay {
-		opts.CassetteUpstream = t.CassetteUpstream()
+		upstream := t.CassetteUpstream()
+		opts.CassetteUpstream = func(r *http.Request) (*http.Response, error) {
+			if demoTLSPhysical != "" && r.URL.Host == demoTLSPhysical {
+				r = r.Clone(r.Context())
+				u := *r.URL
+				u.Host = "localhost"
+				r.URL, r.Host = &u, u.Host
+			} else if targetPhysical != "" && r.URL.Host == targetPhysical {
+				r = r.Clone(r.Context())
+				u := *r.URL
+				u.Scheme, u.Host = parsed.Scheme, parsed.Host
+				r.URL, r.Host = &u, u.Host
+			}
+			return upstream(r)
+		}
 	}
 	for i, pattern := range opts.TLSPassthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {
@@ -425,6 +461,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		}
 		env = append(env, "GLITCHDECK_CA_CERT="+cert, "NODE_EXTRA_CA_CERTS="+nodePath, "SSL_CERT_FILE="+bundle, "REQUESTS_CA_BUNDLE="+bundle, "CURL_CA_BUNDLE="+bundle, "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH="+bundle, "AWS_CA_BUNDLE="+bundle, "DENO_CERT="+bundle, "GIT_SSL_CAINFO="+bundle, "PIP_CERT="+bundle, "NPM_CONFIG_CAFILE="+bundle, "CARGO_HTTP_CAINFO="+bundle)
 	}
+	demoTLSAuthority := ""
 	if opts.CA != nil && demoHandler != nil {
 		l, e := net.Listen("tcp", "127.0.0.1:0")
 		if e != nil {
@@ -441,6 +478,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		server := &http.Server{Handler: demoHandler, Protocols: protocols, TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}}
 		go server.ServeTLS(l, "", "")
 		defer server.Close()
+		demoTLSAuthority = l.Addr().String()
 		env = append(env, "GLITCHDECK_DEMO_TLS=https://"+l.Addr().String())
 	}
 	listenerAddr := listener.Addr().String()
@@ -455,10 +493,67 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		proxyURL = "http://glitchdeck:" + opts.ProxyAuth + "@" + listenerAddr
 	}
 	p.SetOptions(opts)
+	childTarget := target
+	if replay && parsed != nil {
+		physical, listenErr := net.Listen("tcp", "127.0.0.1:0")
+		if listenErr != nil {
+			return finish(3, "PROXY_START_FAILED", listenErr)
+		}
+		defer physical.Close()
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Scheme, r.URL.Host, r.Host = parsed.Scheme, parsed.Host, parsed.Host
+			if opts.ProxyAuth != "" {
+				r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("glitchdeck:"+opts.ProxyAuth)))
+			}
+			p.ServeHTTP(w, r)
+		})
+		server := &http.Server{Handler: handler}
+		defer server.Close()
+		targetPhysical = physical.Addr().String()
+		childTarget = parsed.Scheme + "://" + targetPhysical + parsed.EscapedPath()
+		if parsed.Scheme == "https" {
+			cert, certErr := tlsmitm.NewMinter(opts.CA, 1, 0).For("127.0.0.1")
+			if certErr != nil {
+				return finish(3, "CA_ERROR", certErr)
+			}
+			server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}
+			go server.ServeTLS(physical, "", "")
+		} else {
+			go server.Serve(physical)
+		}
+	}
+	if replay && recordTarget == "demo" && opts.CA != nil {
+		physical, listenErr := net.Listen("tcp", "127.0.0.1:0")
+		if listenErr != nil {
+			return finish(3, "PROXY_START_FAILED", listenErr)
+		}
+		defer physical.Close()
+		demoTLSPhysical = physical.Addr().String()
+		cert, certErr := tlsmitm.NewMinter(opts.CA, 1, 0).For("127.0.0.1")
+		if certErr != nil {
+			return finish(3, "CA_ERROR", certErr)
+		}
+		server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Scheme, r.URL.Host = "https", demoTLSPhysical
+			if opts.ProxyAuth != "" {
+				r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("glitchdeck:"+opts.ProxyAuth)))
+			}
+			p.ServeHTTP(w, r)
+		}), TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}}
+		defer server.Close()
+		go server.ServeTLS(physical, "", "")
+		env = append(env, "GLITCHDECK_DEMO_TLS=https://"+demoTLSPhysical)
+	}
 	e.Exec.ProxyURL, e.Exec.LeakedPIDs = publicURL, []int{}
 	if o.Mode == "record" {
 		recording = ui.NewRecorder()
 		recording.SetCassetteMetadata(recordTarget, t.IgnoreJSONPaths)
+		if recordTarget == "demo" && parsed != nil {
+			recording.SetDemoHTTPAuthority(parsed.Host)
+		}
+		if demoTLSAuthority != "" {
+			recording.SetDemoTLSAuthority(demoTLSAuthority)
+		}
 		recording.Start(p)
 		defer recording.Stop()
 	}
@@ -521,7 +616,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			warn(fmt.Sprintf("no_proxy: dropped %q from inherited NO_PROXY; it would bypass glitchdeck for target %s (pass --no-proxy %s to keep it)", entry, safeTarget, entry))
 		}
 	}
-	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
+	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+childTarget, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
 	if e.Exec.UIURL != "" {
 		env = append(env, "GLITCHDECK_UI_URL="+e.Exec.UIURL)
 	}
@@ -744,10 +839,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			}
 			return finish(3, "TAPE_IO", err)
 		}
-		if !o.JSON && !o.DetachStdio {
-			fmt.Fprint(os.Stdout, e.Exec.StdoutTail)
-			fmt.Fprint(os.Stderr, e.Exec.StderrTail)
-		}
+		// Child output is untrusted even when the tape was successfully redacted.
 	}
 	e.Summary.RequestsTotal = p.RequestsTotal()
 	e.SetAppliedFaults(p.AppliedFaults())

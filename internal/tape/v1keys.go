@@ -70,32 +70,84 @@ func yamlItems(n *yaml.Node) []*yaml.Node {
 	return n.Content
 }
 
-func yamlField(n *yaml.Node, key string) *yaml.Node {
-	if n != nil && n.Kind == yaml.AliasNode {
-		n = n.Alias
+func checkYAMLGraph(root *yaml.Node) error {
+	type visit struct {
+		node *yaml.Node
+		exit bool
 	}
-	if n == nil || n.Kind != yaml.MappingNode {
-		return nil
-	}
-	for i := 0; i < len(n.Content); i += 2 {
-		k, v := n.Content[i], n.Content[i+1]
-		if k.Kind == yaml.AliasNode {
-			k = k.Alias
+	stack := []visit{{node: root}}
+	state := make(map[*yaml.Node]uint8)
+	aliases := 0
+	for len(stack) != 0 {
+		item := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		n := item.node
+		if n == nil {
+			continue
 		}
-		if k.Value == key {
-			return v
+		if item.exit {
+			state[n] = 2
+			continue
 		}
-	}
-	for i := 0; i < len(n.Content); i += 2 {
-		k, v := n.Content[i], n.Content[i+1]
-		if k.Tag == "!!merge" {
-			if found := yamlField(v, key); found != nil {
-				return found
+		if state[n] == 1 {
+			return fmt.Errorf("cyclic YAML alias")
+		}
+		if state[n] == 2 {
+			continue
+		}
+		state[n] = 1
+		stack = append(stack, visit{node: n, exit: true})
+		if n.Kind == yaml.AliasNode || n.Tag == "!!merge" {
+			aliases++
+			if aliases > 100000 {
+				return fmt.Errorf("too many YAML aliases or merges")
 			}
-			for _, m := range yamlItems(v) {
-				if found := yamlField(m, key); found != nil {
-					return found
-				}
+		}
+		if n.Kind == yaml.AliasNode {
+			stack = append(stack, visit{node: n.Alias})
+		}
+		for i := len(n.Content) - 1; i >= 0; i-- {
+			stack = append(stack, visit{node: n.Content[i]})
+		}
+	}
+	return nil
+}
+
+func yamlField(n *yaml.Node, key string) *yaml.Node {
+	seen := make(map[*yaml.Node]bool)
+	stack := []*yaml.Node{n}
+	for len(stack) != 0 {
+		n = stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if n == nil || seen[n] {
+			continue
+		}
+		seen[n] = true
+		if n.Kind == yaml.AliasNode {
+			stack = append(stack, n.Alias)
+			continue
+		}
+		if n.Kind == yaml.SequenceNode {
+			for i := len(n.Content) - 1; i >= 0; i-- {
+				stack = append(stack, n.Content[i])
+			}
+			continue
+		}
+		if n.Kind != yaml.MappingNode {
+			continue
+		}
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k := n.Content[i]
+			if k.Kind == yaml.AliasNode {
+				k = k.Alias
+			}
+			if k != nil && k.Value == key {
+				return n.Content[i+1]
+			}
+		}
+		for i := len(n.Content) - 2; i >= 0; i -= 2 {
+			if n.Content[i].Tag == "!!merge" {
+				stack = append(stack, n.Content[i+1])
 			}
 		}
 	}

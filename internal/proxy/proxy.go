@@ -59,11 +59,12 @@ type Record struct {
 	AssertionProbe     bool
 }
 type ResponseRecord struct {
-	Seq       uint64
-	Status    int
-	Header    http.Header
-	Body      []byte
-	Truncated bool
+	Seq         uint64
+	Status      int
+	Header      http.Header
+	Body        []byte
+	Truncated   bool
+	Intentional bool
 }
 
 type CassetteError struct {
@@ -116,19 +117,20 @@ type responseCapture struct {
 	err       error
 	eof       bool
 	reserve   func(int) int
+	discard   bool
 }
 
 func (c *responseCapture) Read(b []byte) (int, error) {
 	n, err := c.ReadCloser.Read(b)
 	take := 0
-	if !c.truncated {
+	if !c.truncated && !c.discard {
 		take = min(n, maxBody-len(c.body))
 		if c.reserve != nil && take > 0 {
 			take = max(0, min(take, c.reserve(take)))
 		}
 	}
 	c.body = append(c.body, b[:take]...)
-	if n > take {
+	if n > take && !c.discard {
 		c.truncated = true
 	}
 	if err == io.EOF {
@@ -143,11 +145,52 @@ func (c *responseCapture) Read(b []byte) (int, error) {
 
 func (c *responseCapture) finish() {
 	if !c.eof && !c.truncated && !c.failed {
-		_, err := io.Copy(io.Discard, io.LimitReader(c, int64(maxBody-len(c.body)+1)))
+		var err error
+		if c.discard {
+			_, err = io.Copy(io.Discard, c)
+		} else {
+			_, err = io.Copy(io.Discard, io.LimitReader(c, int64(maxBody-len(c.body)+1)))
+		}
 		if err != nil {
 			c.failed = true
 		}
 	}
+}
+
+type transportReader struct {
+	io.Reader
+	err error
+}
+
+func (r *transportReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
+}
+
+type reservationReader struct {
+	io.Reader
+	reserve  func(int) int
+	reserved int
+	full     bool
+}
+
+func (r *reservationReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 && !r.full {
+		want := min(n, maxBody-r.reserved)
+		got := max(0, min(want, r.reserve(want)))
+		r.reserved += got
+		r.full = got < want || r.reserved == maxBody
+	}
+	return n, err
+}
+
+type teeReadCloser struct {
+	io.Reader
+	io.Closer
 }
 
 type Proxy struct {
@@ -615,6 +658,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.resetBarrier.RUnlock()
 	defer p.finishPending()
 	if !prepareProtocolRequest(r) {
+		if r.Method == http.MethodConnect && p.options.CassetteUpstream != nil {
+			p.failCassette("cassette_miss", r.Method, r.URL.Path)
+		}
 		http.Error(w, "request does not match CONNECT authority", http.StatusMisdirectedRequest)
 		return
 	}
@@ -674,9 +720,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	captureResponse := !ws && r.ProtoMajor != 2 && p.OnResponse != nil && p.ShouldCaptureResponse != nil && p.ShouldCaptureResponse(seq)
 	responseRecord := ResponseRecord{Seq: seq}
 	responseAsync := false
-	if captureResponse {
+	if captureResponse || !ws && r.ProtoMajor == 2 && p.OnResponse != nil {
 		defer func() {
-			if !responseAsync {
+			if !responseAsync && (captureResponse || responseRecord.Intentional) {
 				p.OnResponse(responseRecord)
 			}
 		}()
@@ -841,7 +887,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if p.OnRequest == nil {
 			return
 		}
-		if capturing && (kind == "dup-webhook" || kind == "rate-limit") && p.ReserveRequestBytes != nil && len(captured) > preReserved {
+		if capturing && kind == "dup-webhook" && fault.Int(params, "count", 2) > 1 && p.ReserveRequestBytes != nil && len(captured) > preReserved {
 			captured, truncated = captured[:preReserved], true
 		}
 		headers := r.Header.Clone()
@@ -898,6 +944,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if plan.Applied.Load() {
+				if plan.BeforeHdrs {
+					responseRecord.Intentional = true
+				}
 				markApplied()
 				p.outcome(gen, Outcome{Seq: seq, H2Fault: true})
 				if cutsStream {
@@ -922,6 +971,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ws && kind == "tcp-rst" && fault.Bool(params, "before_headers", false) {
 		record(nil, r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0, false)
 		resetWriter(w, func() {
+			responseRecord.Intentional = true
 			end = "rst"
 			markApplied()
 			p.outcome(gen, Outcome{Seq: seq, Reset: true})
@@ -949,6 +999,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				code = 14
 			}
 			injectGRPC(code, fault.String(params, "message", ""), "injected")
+			responseRecord.Intentional = true
 			markApplied()
 			return
 		}
@@ -957,13 +1008,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	capture := hasBody && p.OnRequest != nil && (p.ShouldCaptureBody == nil || p.ShouldCaptureBody(seq))
 	capturing = capture && p.ShouldCaptureBody != nil
 	buffered := kind == "dup-webhook" && fault.Int(params, "count", 2) > 1
-	if capturing && (buffered || kind == "rate-limit") && p.ReserveRequestBytes != nil {
-		preReserved = p.ReserveRequestBytes(seq, maxBody)
+	if capturing && buffered && p.ReserveRequestBytes != nil && r.ContentLength >= 0 {
+		reservation := int(min(int64(maxBody), r.ContentLength))
+		preReserved = p.ReserveRequestBytes(seq, reservation)
 	}
 
 	if buffered && hasBody {
 		var err error
-		body, err = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+		var reader io.Reader = io.LimitReader(r.Body, maxBody+1)
+		var reservation *reservationReader
+		if capturing && p.ReserveRequestBytes != nil && r.ContentLength < 0 {
+			reservation = &reservationReader{Reader: reader, reserve: func(n int) int { return p.ReserveRequestBytes(seq, n) }}
+			reader = reservation
+		}
+		body, err = io.ReadAll(reader)
+		if reservation != nil {
+			preReserved = reservation.reserved
+		}
 		r.Trailer = incoming.Trailer
 		hasTrailers = hasTrailers || len(r.Trailer) != 0
 		streamedBytes.Add(int64(len(body)))
@@ -999,15 +1060,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var recorded []byte
 		missing, truncated := hasBody, false
 		if capture && !isGRPC {
-			var readErr error
-			recorded, readErr = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
+			b := &countingBody{ReadCloser: r.Body, incoming: incoming, count: &streamedBytes, capture: true, previewMu: &previewMu, preview: &preview}
+			if capturing && p.ReserveRequestBytes != nil {
+				b.reserve = func(n int) int { return p.ReserveRequestBytes(seq, n) }
+			}
+			_, readErr := io.Copy(io.Discard, b)
+			recorded, missing, truncated = b.body, readErr != nil, b.truncated
 			hasTrailers = hasTrailers || len(incoming.Trailer) != 0
-			streamedBytes.Add(int64(len(recorded)))
-			preview = recorded[:min(len(recorded), 256)]
-			missing, truncated = readErr != nil, len(recorded) > maxBody
-			recorded = recorded[:min(len(recorded), maxBody)]
 		}
 		record(recorded, missing, truncated)
+		responseRecord.Intentional = true
 		status = fault.Int(params, "status", 429)
 		responseBody := rateLimitResponse(w.Header(), params, status, seq, time.Now())
 		upstreamHeaders = w.Header()
@@ -1053,10 +1115,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ctx = detached
 		}
 	}
+	var cancelLookahead context.CancelFunc
 	var captureCancel context.CancelFunc
 	var stopCaptureSession func() bool
 	var stopCaptureClient func() bool
 	upstreamContext := ctx
+	lookahead := &sseLookahead{}
 	if captureResponse && kind == "sse-glitch" {
 		var detached context.Context
 		detached, captureCancel = context.WithCancel(context.WithoutCancel(ctx))
@@ -1087,8 +1151,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		q.Header.Del("Accept-Encoding")
 		if fault.String(params, "action", "") == "inject_error" && fault.String(params, "provider", "auto") == "auto" {
 			upstreamCtx, cancelUpstream := context.WithCancel(q.Context())
-			defer cancelUpstream()
+			cancelLookahead = cancelUpstream
+			defer func() {
+				if !responseAsync {
+					cancelUpstream()
+				}
+			}()
 			q = q.WithContext(upstreamCtx)
+			if captureResponse {
+				ctx = context.WithValue(ctx, sseLookaheadKey{}, lookahead)
+			}
 			ctx = context.WithValue(ctx, sseUpstreamCancelKey{}, cancelUpstream)
 		}
 	}
@@ -1122,6 +1194,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			captured, truncated := b.body, b.truncated
+			b.body = nil
 			hasTrailers = hasTrailers || b.hasTrailers
 			b.capture = false
 			b.mu.Unlock()
@@ -1195,22 +1268,25 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					_, drainErr = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
 				} else {
 					responseRecord.Header.Del("Content-Encoding")
-					var source io.ReadCloser = resp.Body
+					raw := &transportReader{Reader: io.LimitReader(resp.Body, maxBody)}
+					var source io.ReadCloser = io.NopCloser(raw)
 					if encoding != "" && encoding != "identity" {
-						decoder := &sseDecoder{source: resp.Body, encoding: encoding}
-						defer decoder.Close()
-						source = decoder
+						stripSSEIntegrity(responseRecord.Header)
+						source = &sseDecoder{source: source, encoding: encoding}
 					}
 					capture := &responseCapture{ReadCloser: source}
 					if p.ReserveResponseBytes != nil {
 						capture.reserve = func(n int) int { return p.ReserveResponseBytes(seq, n) }
 					}
 					capture.finish()
-					if capture.failed {
-						drainErr = capture.err
-					}
+					_, _ = io.Copy(io.Discard, raw)
+					drainErr = raw.err
+					_ = source.Close()
 					responseRecord.Body = capture.body
 					responseRecord.Truncated = capture.truncated || capture.failed
+					if capture.failed {
+						responseRecord.Status = 0
+					}
 				}
 				responseRecord.Truncated = responseRecord.Truncated || len(resp.Trailer) != 0
 			} else {
@@ -1309,8 +1385,30 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			responseRecord.Truncated = true
 		} else if !bodyless {
 			capture := &responseCapture{ReadCloser: resp.Body}
-			if p.ReserveResponseBytes != nil {
-				capture.reserve = func(n int) int { return p.ReserveResponseBytes(seq, n) }
+			var decoded *responseCapture
+			var encodedWriter *io.PipeWriter
+			var decodedDone chan struct{}
+			reserve := func(n int) int {
+				if p.ReserveResponseBytes != nil {
+					return p.ReserveResponseBytes(seq, n)
+				}
+				return n
+			}
+			if encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate" {
+				reader, writer := io.Pipe()
+				encodedWriter = writer
+				decoded = &responseCapture{ReadCloser: &sseDecoder{source: reader, encoding: encoding}, reserve: reserve}
+				decodedDone = make(chan struct{})
+				go func() {
+					decoded.finish()
+					_, _ = io.Copy(io.Discard, reader)
+					_ = decoded.Close()
+					close(decodedDone)
+				}()
+				capture.ReadCloser = teeReadCloser{Reader: io.TeeReader(resp.Body, writer), Closer: resp.Body}
+				capture.discard = true
+			} else {
+				capture.reserve = reserve
 			}
 			resp.Body = capture
 			finishCapture := func() {
@@ -1318,25 +1416,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if captureCancel != nil {
 					cancelDrain = captureCancel
 				}
-				timer := time.AfterFunc(2*time.Second, cancelDrain)
+				drainTimeout := 2 * time.Second
+				if lookahead.wait != nil {
+					drainTimeout = 500 * time.Millisecond
+				}
+				timer := time.AfterFunc(drainTimeout, cancelDrain)
 				defer timer.Stop()
+				if lookahead.wait != nil {
+					lookahead.wait()
+				}
 				capture.finish()
 				responseRecord.Body = capture.body
 				responseRecord.Truncated = responseRecord.Truncated || capture.truncated || capture.failed || len(resp.Trailer) != 0
+				if capture.failed {
+					responseRecord.Status = 0
+				}
 				if encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate" {
 					responseRecord.Header.Del("Content-Encoding")
 					responseRecord.Header.Del("Content-Length")
 					stripSSEIntegrity(responseRecord.Header)
-					decoder := &sseDecoder{source: io.NopCloser(bytes.NewReader(capture.body)), encoding: encoding}
-					decoded := &responseCapture{ReadCloser: decoder, reserve: capture.reserve}
-					decoded.finish()
-					_ = decoder.Close()
+					_ = encodedWriter.Close()
+					<-decodedDone
 					responseRecord.Body = decoded.body
 					responseRecord.Truncated = responseRecord.Truncated || decoded.truncated || decoded.failed
+					if decoded.failed {
+						responseRecord.Status = 0
+					}
 				}
 			}
 			defer func() {
-				if captureCancel != nil && !capture.eof && !capture.truncated && !capture.failed {
+				if captureCancel != nil && (lookahead.wait != nil || !capture.eof && !capture.truncated && !capture.failed) {
 					responseAsync = true
 					stopCaptureClient()
 					p.mu.Lock()
@@ -1346,6 +1455,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						defer p.finishPending()
 						defer stopCaptureSession()
 						defer captureCancel()
+						if cancelLookahead != nil {
+							defer cancelLookahead()
+						}
 						defer capture.Close()
 						finishCapture()
 						p.OnResponse(responseRecord)

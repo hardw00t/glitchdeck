@@ -124,6 +124,14 @@ func testTape(args []string) int {
 	}
 	version := 0
 	var runReport tape.RunReport
+	var reportDestination *execrun.Destination
+	var reportSafe func() error
+	writeReport := func(e execrun.Envelope) error {
+		if err := reportSafe(); err != nil {
+			return err
+		}
+		return reportDestination.WriteReport(e)
+	}
 	fail := func(machine string, err error) int {
 		e := execrun.NewEnvelope("test", filename, *target)
 		e.ExitCode = 2
@@ -132,8 +140,11 @@ func testTape(args []string) int {
 		e.FrameErrorsOmitted = runReport.FrameErrorsOmitted
 		e.SetAppliedFaults(runReport.AppliedFaults)
 		e.Summary.RequestsTotal = runReport.RequestsTotal
-		if *report != "" {
-			if err := execrun.WriteReport(*report, e); err != nil {
+		if runReport.CassetteError != nil && runReport.CassetteError != err {
+			e.Diff = append(e.Diff, runReport.CassetteError.Error())
+		}
+		if reportDestination != nil {
+			if err := writeReport(e); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 			}
 		}
@@ -144,6 +155,9 @@ func testTape(args []string) int {
 			cli.Error(os.Stderr, strings.ToLower(machine), err, 2)
 		} else {
 			fmt.Fprintln(os.Stderr, err)
+			for _, diff := range e.Diff {
+				fmt.Fprintln(os.Stderr, diff)
+			}
 		}
 		return 2
 	}
@@ -160,8 +174,35 @@ func testTape(args []string) int {
 	if err != nil {
 		return fail("TAPE_IO", err)
 	}
+	defer file.Close()
+	if *report != "" {
+		input, openErr := execrun.OpenDestination(filename)
+		if openErr != nil {
+			return fail("TAPE_IO", openErr)
+		}
+		defer input.Close()
+		output, openErr := execrun.OpenDestination(*report)
+		if openErr != nil {
+			return fail("TAPE_IO", openErr)
+		}
+		defer output.Close()
+		inputInfo, err := file.Stat()
+		if err != nil {
+			return fail("TAPE_IO", err)
+		}
+		reportSafe = func() error {
+			same, err := output.Same(input, inputInfo)
+			if err != nil || same {
+				return errors.New("report destination must differ from the input tape")
+			}
+			return nil
+		}
+		if err := reportSafe(); err != nil {
+			return fail("USAGE", err)
+		}
+		reportDestination = output
+	}
 	t, err := tape.Decode(file)
-	file.Close()
 	if err != nil {
 		return fail("TAPE_INVALID", err)
 	}
@@ -205,8 +246,9 @@ func testTape(args []string) int {
 	envelope.SetAppliedFaults(runReport.AppliedFaults)
 	envelope.FrameErrors = runReport.FrameErrors
 	envelope.FrameErrorsOmitted = runReport.FrameErrorsOmitted
-	if *report != "" {
-		if e := execrun.WriteReport(*report, envelope); e != nil {
+	if reportDestination != nil {
+		if e := writeReport(envelope); e != nil {
+			reportDestination = nil
 			return fail("TAPE_IO", e)
 		}
 	}

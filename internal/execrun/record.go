@@ -2,11 +2,7 @@ package execrun
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/hardw00t/glitchdeck/internal/tape"
@@ -68,28 +64,13 @@ func writeRecording(recording *ui.Recording, input tape.Tape, o Options) error {
 			return fmt.Errorf("recorded tape is not replayable: %w", err)
 		}
 	}
-	root, err := os.OpenRoot(filepath.Dir(o.TapeOut))
+	if o.TapeDestination != nil {
+		return o.TapeDestination.Write(encoded.Bytes())
+	}
+	destination, err := OpenDestination(o.TapeOut)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
-	var token [16]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return err
-	}
-	name := ".glitchdeck-tape-" + hex.EncodeToString(token[:])
-	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	defer root.Remove(name)
-	_, writeErr := file.Write(encoded.Bytes())
-	closeErr := file.Close()
-	if writeErr != nil {
-		return writeErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return root.Rename(name, filepath.Base(o.TapeOut))
+	defer destination.Close()
+	return destination.Write(encoded.Bytes())
 }

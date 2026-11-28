@@ -68,6 +68,8 @@ func requestSSEEnd(end string) string {
 }
 
 type sseUpstreamCancelKey struct{}
+type sseLookaheadKey struct{}
+type sseLookahead struct{ wait func() }
 
 type sseResult struct {
 	bytes     int64
@@ -261,8 +263,12 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 						f, err = next.frame, next.err
 						timer.Stop()
 					case <-timer.C:
-						cancel()
-						<-result
+						if pending, ok := ctx.Value(sseLookaheadKey{}).(*sseLookahead); ok {
+							pending.wait = func() { <-result }
+						} else {
+							cancel()
+							<-result
+						}
 						provider = "openai"
 						break lookahead
 					case <-ctx.Done():

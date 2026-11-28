@@ -109,6 +109,43 @@ type Result struct {
 	Failures []string `json:"failures"`
 }
 
+func leadingV3(raw []byte) bool {
+	data := bytes.TrimPrefix(raw, []byte("\ufeff"))
+	documentStart := false
+	for {
+		line, rest, ok := bytes.Cut(data, []byte("\n"))
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 || trimmed[0] == '#' {
+			if !ok {
+				return false
+			}
+			data = rest
+			continue
+		}
+		if bytes.Equal(line, []byte("---")) && !documentStart {
+			documentStart = true
+			if !ok {
+				return false
+			}
+			data = rest
+			continue
+		}
+		if !bytes.HasPrefix(line, []byte("version:")) {
+			return false
+		}
+		value := bytes.TrimSpace(line[len("version:"):])
+		if bytes.Equal(value, []byte("3")) {
+			return ok
+		}
+		if len(value) < 2 || value[0] != '3' || value[1] != ' ' && value[1] != '\t' {
+			return false
+		}
+		comment := bytes.TrimSpace(value[1:])
+		return ok && len(comment) != 0 && comment[0] == '#'
+	}
+}
+
 func Decode(r io.Reader) (Tape, error) {
 	var t Tape
 	raw, err := io.ReadAll(io.LimitReader(r, maxTapeInput+1))
@@ -116,14 +153,35 @@ func Decode(r io.Reader) (Tape, error) {
 		return t, err
 	}
 	if len(raw) > maxTapeInput {
-		return t, fmt.Errorf("tape exceeds input limit")
+		if leadingV3(raw) {
+			return t, fmt.Errorf("tape exceeds input limit")
+		}
+		rest, err := io.ReadAll(r)
+		if err != nil {
+			return t, err
+		}
+		raw = append(raw, rest...)
 	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return t, err
 	}
-	if len(doc.Content) != 0 && len(yamlItems(yamlField(doc.Content[0], "cassettes"))) > maxCassettes {
-		return t, fmt.Errorf("too many cassettes")
+	if err := checkYAMLGraph(&doc); err != nil {
+		return t, err
+	}
+	if len(doc.Content) != 0 {
+		var version int
+		if node := yamlField(doc.Content[0], "version"); node != nil {
+			_ = node.Decode(&version)
+		}
+		if version == 3 {
+			if len(raw) > maxTapeInput {
+				return t, fmt.Errorf("tape exceeds input limit")
+			}
+			if len(yamlItems(yamlField(doc.Content[0], "cassettes"))) > maxCassettes {
+				return t, fmt.Errorf("too many cassettes")
+			}
+		}
 	}
 	d := yaml.NewDecoder(bytes.NewReader(raw))
 	d.KnownFields(true)
@@ -484,6 +542,7 @@ type RunReport struct {
 	AppliedFaults      []proxy.AppliedFault
 	FrameErrors        []proxy.FrameErrorEntry
 	FrameErrorsOmitted uint64
+	CassetteError      error
 }
 
 func RunWithReport(ctx context.Context, t Tape, targetOverride string) ([]Result, RunReport, error) {
@@ -614,7 +673,10 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		report.FrameErrors, report.FrameErrorsOmitted = frameErrors.Snapshot()
 		if replay {
 			if err := p.CassetteFailure(); err != nil {
-				results, runErr = nil, err
+				report.CassetteError = err
+				if runErr == nil {
+					runErr = err
+				}
 			}
 		}
 	}()
@@ -748,7 +810,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			}
 		}()
 	}
-	for _, s := range t.Script {
+	for stepIndex, s := range t.Script {
 		if s.HTTP != nil {
 			copy := *s.HTTP
 			copy.URL = strings.ReplaceAll(copy.URL, "${DEMO_TLS}", demoTLS)
@@ -816,6 +878,22 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 				stepClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
 					if len(via) >= 10 || next.URL.Scheme != "http" || next.URL.Host != listener.Addr().String() || next.URL.User != nil {
 						return http.ErrUseLastResponse
+					}
+					if stepIndex+1 < len(t.Script) {
+						hop := t.Script[stepIndex+1].HTTP
+						if hop != nil {
+							method := hop.Method
+							if method == "" {
+								method = http.MethodGet
+							}
+							hopURL := serverURL + hop.Path
+							if hop.URL != "" {
+								hopURL = strings.ReplaceAll(hop.URL, "${DEMO_TLS}", demoTLS)
+							}
+							if method == next.Method && hopURL == next.URL.String() {
+								return http.ErrUseLastResponse
+							}
+						}
 					}
 					return nil
 				}

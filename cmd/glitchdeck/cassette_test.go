@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +23,20 @@ import (
 )
 
 func TestExecHybridCassette(t *testing.T) {
+	if os.Getenv("GD_CASSETTE_DEMO_TLS") != "" {
+		proxyURL, _ := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
+		client := http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}}, Timeout: 5 * time.Second}
+		if os.Getenv("GD_CASSETTE_DEFAULT_CLIENT") != "" {
+			client.Transport = http.DefaultTransport
+		}
+		response, err := client.Get(os.Getenv("GLITCHDECK_DEMO_TLS") + "/")
+		if err != nil {
+			os.Exit(9)
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		os.Exit(0)
+	}
 	if route := os.Getenv("GD_CASSETTE_TEST_PATH"); route != "" {
 		client := http.Client{Transport: &http.Transport{}, Timeout: 5 * time.Second}
 		base := os.Getenv("GLITCHDECK_PROXY_URL")
@@ -29,6 +44,9 @@ func TestExecHybridCassette(t *testing.T) {
 			base = os.Getenv("GLITCHDECK_TARGET")
 			proxyURL, _ := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
 			client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+			if os.Getenv("GD_CASSETTE_DEFAULT_CLIENT") != "" {
+				client.Transport = http.DefaultTransport
+			}
 		}
 		for path := range strings.SplitSeq(route, ",") {
 			response, err := client.Get(base + path)
@@ -68,6 +86,10 @@ func TestExecHybridCassette(t *testing.T) {
 			z := gzip.NewWriter(w)
 			_, _ = fmt.Fprintf(z, `{"api_key":%q}`, secret)
 			_ = z.Close()
+		case "/diagnostics":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Content-Encoding", secret)
+			_, _ = io.WriteString(w, events)
 		default:
 			_, _ = io.WriteString(w, "ordinary response")
 		}
@@ -120,9 +142,8 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 		if code != 0 || report.Exec == nil || report.Summary.FaultsTriggered != 1 {
 			t.Fatalf("exit %d, report %+v", code, report)
 		}
-		body := report.Exec.StdoutTail
-		if strings.Count(body, "data: ") != 3 || strings.Contains(body, "four") || strings.Contains(body, "[DONE]") {
-			t.Fatalf("unexpected child stream %q", body)
+		if report.Exec.StdoutTail != "" && (strings.Count(report.Exec.StdoutTail, "data: ") != 3 || strings.Contains(report.Exec.StdoutTail, "four") || strings.Contains(report.Exec.StdoutTail, "[DONE]")) {
+			t.Fatalf("unexpected child stream %q", report.Exec.StdoutTail)
 		}
 	}
 	t.Setenv("GD_CASSETTE_TEST_PATH", "/plain,/v1/chat/completions")
@@ -211,12 +232,54 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatal("blocked export wrote a file")
 	}
-	if code, report := invoke(input, "--mode", "record", "--tape-out", output, "--redact-secrets"); code != 0 {
-		t.Fatalf("redacted recording: exit %d, error %v", code, report.Error)
+	if code, report := invoke(input, "--mode", "record", "--tape-out", output, "--redact-secrets"); code != 0 || report.Exec == nil || report.Exec.StdoutTail != "" || report.Exec.StderrTail != "" {
+		t.Fatalf("redacted recording: exit %d, report %+v", code, report)
+	}
+	errReader, errWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = errWriter
+	code, stdout = launchOutput(t, "exec", "--tape", input, "--json", "--report", reportPath, "--mode", "record", "--redact-secrets", "--tape-out", output, "--", os.Args[0], "-test.run=^TestExecHybridCassette$")
+	os.Stderr = oldStderr
+	errWriter.Close()
+	stderr, err := io.ReadAll(errReader)
+	errReader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportBytes, err = os.ReadFile(reportPath)
+	if err != nil || code != 0 || strings.Contains(stdout, secret) || bytes.Contains(stderr, []byte(secret)) || bytes.Contains(reportBytes, []byte(secret)) || strings.Contains(stdout, dir) || bytes.Contains(stderr, []byte(dir)) || bytes.Contains(reportBytes, []byte(dir)) {
+		t.Fatalf("redacted diagnostics leaked: exit %d stdout %q stderr %q report %q err %v", code, stdout, stderr, reportBytes, err)
 	}
 	raw = readOutput()
 	if bytes.Contains(raw, []byte(secret)) || !bytes.Contains(raw, []byte("redacted: true")) || !bytes.Contains(raw, []byte("REDACTED")) {
 		t.Fatal("redacted export still contains the original secret or lacks its markers")
+	}
+
+	writeInput("rules:\n  - id: diagnostic\n    enabled: true\n    match: {path_prefix: /diagnostics}\n    fault: {type: sse-glitch, params: {action: eof_early, after_events: 1}}\n")
+	t.Setenv("GD_CASSETTE_TEST_PATH", "/diagnostics,/secret")
+	log, err := os.CreateTemp(dir, "record-stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	os.Stderr = log
+	defer func() { os.Stderr = oldStderr }()
+	code, stdout = launchOutput(t, "exec", "--tape", input, "--json", "--report", reportPath, "--mode", "record", "--tape-out", output, "--", os.Args[0], "-test.run=^TestExecHybridCassette$")
+	logBytes, err := os.ReadFile(log.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportBytes, err = os.ReadFile(reportPath)
+	if err != nil || code != 2 || !strings.Contains(stdout, "EXPORT_BLOCKED") {
+		t.Fatalf("blocked diagnostic run: exit %d, report %q, err %v", code, stdout, err)
+	}
+	for _, sink := range []string{stdout, string(logBytes), string(reportBytes)} {
+		if strings.Contains(sink, secret) || strings.Contains(sink, dir) {
+			t.Fatalf("blocked run disclosed a diagnostic: %q", sink)
+		}
 	}
 }
 
@@ -242,11 +305,32 @@ func TestRecordReplayPreservesLogicalTargetPrefix(t *testing.T) {
 	if code, out := launchOutput(t, args...); code != 0 {
 		t.Fatalf("record exit %d: %s", code, out)
 	}
+	t.Setenv("GD_CASSETTE_DEFAULT_CLIENT", "1")
 	args = append([]string{"exec", "--json", "--tape", output, "--mode", "replay"}, child...)
 	if code, out := launchOutput(t, args...); code != 0 {
 		t.Fatalf("replay exit %d: %s", code, out)
 	}
 	if requests.Load() != 1 {
 		t.Fatalf("replay reached upstream or record missed it: %d requests", requests.Load())
+	}
+}
+
+func TestReplayDemoTLSDefaultClient(t *testing.T) {
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "input.yaml"), filepath.Join(dir, "output.yaml")
+	if err := os.WriteFile(input, []byte("version: 2\ntarget: demo\ntls_mitm: true\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GD_CASSETTE_DEMO_TLS", "1")
+	child := []string{"--", os.Args[0], "-test.run=^TestExecHybridCassette$"}
+	args := append([]string{"exec", "--json", "--tape", input, "--mode", "record", "--tape-out", output}, child...)
+	if code, out := launchOutput(t, args...); code != 0 {
+		t.Fatalf("record exit %d: %s", code, out)
+	}
+	t.Setenv("GD_CASSETTE_DEFAULT_CLIENT", "1")
+	args = append([]string{"exec", "--json", "--tape", output, "--mode", "replay"}, child...)
+	if code, out := launchOutput(t, args...); code != 0 {
+		raw, _ := os.ReadFile(output)
+		t.Fatalf("replay exit %d: %s\nrecorded tape: %s", code, out, raw)
 	}
 }

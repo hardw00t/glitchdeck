@@ -10,7 +10,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -73,20 +72,43 @@ func execCommand(args []string) int {
 		f.PrintDefaults()
 	}
 	wantJSON := cli.JSONRequested(args)
-	if wantJSON {
+	sep := slices.Index(args, "--")
+	options := args
+	if sep >= 0 {
+		options = args[:sep]
+	}
+	recordRequested := false
+	for i, arg := range options {
+		if arg == "--mode=record" || arg == "-mode=record" ||
+			(arg == "--mode" || arg == "-mode") && i+1 < len(options) && options[i+1] == "record" {
+			recordRequested = true
+			break
+		}
+	}
+	if wantJSON || recordRequested {
 		f.SetOutput(io.Discard)
 	}
 	if showCommandHelp(f, args, execUsage) {
 		return 0
 	}
+	var reportDestination *execrun.Destination
+	var reportSafe func() error
 	emit := func(e execrun.Envelope) int {
-		if *report != "" {
-			if err := execrun.WriteReport(*report, e); err != nil {
-				e.ExitCode, e.OK = 3, false
+		if reportDestination != nil {
+			err := reportSafe()
+			if err == nil {
+				err = reportDestination.WriteReport(e)
+			}
+			if err != nil {
 				if problem, ok := e.Error.(map[string]string); ok && problem["code"] == "EXPORT_BLOCKED" {
-					e.Error = map[string]string{"code": "TAPE_IO", "message": "could not write report"}
+					fmt.Fprintln(os.Stderr, "glitchdeck exec: could not write report")
 				} else {
-					e.Error = map[string]string{"code": "TAPE_IO", "message": err.Error()}
+					e.ExitCode, e.OK = 3, false
+					message := err.Error()
+					if o.Mode == "record" {
+						message = "could not write report"
+					}
+					e.Error = map[string]string{"code": "TAPE_IO", "message": message}
 				}
 			}
 		}
@@ -123,13 +145,31 @@ func execCommand(args []string) int {
 		return e.ExitCode
 	}
 	fail := func(code string, err error) int {
+		if recordRequested || o.Mode == "record" {
+			e := execrun.NewEnvelope("exec", "", "")
+			e.Target, e.ExitCode = nil, 2
+			if code == "OUTPUT_IO" {
+				code, e.ExitCode = "TAPE_IO", 3
+			}
+			message := "invalid record options"
+			switch code {
+			case "TAPE_IO":
+				message = "could not access a tape or report destination"
+			case "TAPE_INVALID":
+				message = "invalid input tape"
+			}
+			e.Error = map[string]string{"code": code, "message": message}
+			return emit(e)
+		}
 		e := execrun.NewEnvelope("exec", *path, o.Target)
 		e.ExitCode = 2
+		if code == "OUTPUT_IO" {
+			code, e.ExitCode = "TAPE_IO", 3
+		}
 		e.Error = map[string]string{"code": code, "message": err.Error()}
 		e.Exec = &execrun.Exec{Cmd: f.Args(), LeakedPIDs: []int{}}
 		return emit(e)
 	}
-	sep := slices.Index(args, "--")
 	if sep < 0 {
 		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
 	}
@@ -142,24 +182,54 @@ func execCommand(args []string) int {
 	if err := o.ValidateMode(); err != nil {
 		return fail("USAGE_ERROR", err)
 	}
-	if *report != "" && o.TapeOut != "" {
-		alias, err := sameOutputDestination(*report, o.TapeOut)
-		if err != nil || alias {
-			*report = ""
-			return fail("USAGE_ERROR", errors.New("report and tape output destinations must be distinct and resolvable"))
+	file, err := os.Open(*path)
+	if err != nil {
+		return fail("TAPE_IO", err)
+	}
+	defer file.Close()
+	if o.TapeOut != "" {
+		o.TapeDestination, err = execrun.OpenDestination(o.TapeOut)
+		if err != nil {
+			return fail("OUTPUT_IO", err)
 		}
+		defer o.TapeDestination.Close()
+	}
+	if *report != "" {
+		inputDestination, err := execrun.OpenDestination(*path)
+		if err != nil {
+			return fail("TAPE_IO", err)
+		}
+		defer inputDestination.Close()
+		destination, err := execrun.OpenDestination(*report)
+		if err != nil {
+			return fail("OUTPUT_IO", err)
+		}
+		defer destination.Close()
+		inputInfo, err := file.Stat()
+		if err != nil {
+			return fail("TAPE_IO", err)
+		}
+		reportSafe = func() error {
+			alias, err := destination.Same(inputDestination, inputInfo)
+			if err == nil && !alias && o.TapeDestination != nil {
+				alias, err = destination.Same(o.TapeDestination)
+			}
+			if err != nil || alias {
+				return errors.New("report and tape destinations must be distinct and resolvable")
+			}
+			return nil
+		}
+		if err := reportSafe(); err != nil {
+			return fail("USAGE_ERROR", err)
+		}
+		reportDestination = destination
 	}
 	for i, pattern := range passthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {
 			return fail("USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
 		}
 	}
-	file, err := os.Open(*path)
-	if err != nil {
-		return fail("TAPE_IO", err)
-	}
 	t, err := tape.Decode(file)
-	_ = file.Close()
 	if err != nil {
 		return fail("TAPE_INVALID", err)
 	}
@@ -170,39 +240,6 @@ func execCommand(args []string) int {
 	})
 	o.Command, o.TapePath, o.JSON, o.UpstreamAllow, o.TLSPassthrough = args[sep+1:], *path, *asJSON, allow, passthrough
 	return emit(execrun.Run(context.Background(), t, o))
-}
-
-func sameOutputDestination(a, b string) (bool, error) {
-	resolve := func(path string) (string, error) {
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			return "", err
-		}
-		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-			return resolved, nil
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
-		dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(dir, filepath.Base(abs)), nil
-	}
-	x, err := resolve(a)
-	if err != nil {
-		return false, err
-	}
-	y, err := resolve(b)
-	if err != nil {
-		return false, err
-	}
-	if x == y || (runtime.GOOS == "windows" || runtime.GOOS == "darwin") && strings.EqualFold(x, y) {
-		return true, nil
-	}
-	ax, errA := os.Stat(a)
-	bx, errB := os.Stat(b)
-	return errA == nil && errB == nil && os.SameFile(ax, bx), nil
 }
 
 func mcpCommand(args []string) int {

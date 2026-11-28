@@ -6,8 +6,11 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
+	"mime"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -108,12 +111,113 @@ func TestScannerCompressedBoundaries(t *testing.T) {
 
 func TestScannerInvalidatesValidators(t *testing.T) {
 	secret := "sk-ant-" + strings.Repeat("q", 24)
-	in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: map[string]string{"Content-Length": "1", "Content-MD5": "old", "Content-Digest": "old", "ETag": "\"old\""}, Body: secret}}}}
+	in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: map[string]string{"Content-Length": "1", "Content-MD5": "old", "Content-Digest": "old", "Repr-Digest": "old", "ETag": "\"old\""}, Body: secret}}}}
 	out, err := PrepareExport(in, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out.Cassettes[0].Response.Headers) != 0 {
 		t.Fatal("stale validators retained")
+	}
+}
+
+func TestScannerIndependentParameters(t *testing.T) {
+	secret := "sk-ant-" + strings.Repeat("z", 24)
+	value := `"sk-ant-\u007a` + strings.Repeat("z", 23) + `"`
+	query := "a=%22&b=" + url.QueryEscape(value)
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded string
+	if err := json.Unmarshal([]byte(values.Get("b")), &decoded); err != nil || decoded != secret {
+		t.Fatalf("fixture: %q %v", decoded, err)
+	}
+	for _, field := range []string{"$.url", "$.http_get", "$.location", "$.form"} {
+		input := query
+		if field != "$.form" {
+			input = "/?" + query
+		}
+		if _, _, err := scanText(input, field, false); err == nil {
+			t.Fatalf("%s: missed decoded parameter", field)
+		}
+	}
+}
+
+func TestScannerMIMEParameters(t *testing.T) {
+	header := "form-data; filename*0=sk-ant-; filename*1=" + strings.Repeat("z", 24)
+	_, params, err := mime.ParseMediaType(header)
+	if err != nil || !strings.HasPrefix(params["filename"], "sk-ant-") {
+		t.Fatalf("fixture: %v %v", params, err)
+	}
+	body := "--x\r\nContent-Disposition: " + header + "\r\n\r\nok\r\n--x--\r\n"
+	if _, _, err := scanBodyText(body, "multipart/form-data; boundary=x", "$", false); err == nil {
+		t.Fatal("missed decoded filename")
+	}
+}
+
+func TestScannerRejectsIncompleteMIMEContinuation(t *testing.T) {
+	body := "--x\r\nContent-Disposition: form-data; filename*0=clean; filename*2=ignored\r\n\r\nok\r\n--x--\r\n"
+	if _, _, err := scanBodyText(body, "multipart/form-data; boundary=x", "$", false); err == nil {
+		t.Fatal("accepted incomplete continuation")
+	}
+}
+
+func TestScannerExportWorkLimit(t *testing.T) {
+	value := strings.Repeat("x", 4<<20)
+	in := Tape{Cassettes: make([]Cassette, 9)}
+	for i := range in.Cassettes {
+		in.Cassettes[i].Response.Body = value
+	}
+	if _, err := PrepareExport(in, false); err == nil {
+		t.Fatal("accepted oversized aggregate")
+	}
+}
+
+func TestScannerCompressedExpansionLimit(t *testing.T) {
+	var compressed bytes.Buffer
+	w := gzip.NewWriter(&compressed)
+	_, _ = w.Write(bytes.Repeat([]byte("x"), 4<<20))
+	_ = w.Close()
+	body := base64.StdEncoding.EncodeToString(compressed.Bytes())
+	response := CassetteResponse{Headers: map[string]string{"Content-Encoding": "gzip"}, BodyEncoding: "base64", Body: body}
+	if _, err := PrepareExport(Tape{Cassettes: []Cassette{{Response: response}}}, false); err != nil {
+		t.Fatalf("valid 4 MiB gzip: %v", err)
+	}
+	in := Tape{Cassettes: make([]Cassette, 17)}
+	for i := range in.Cassettes {
+		in.Cassettes[i].Response = response
+	}
+	if _, err := PrepareExport(in, false); err == nil {
+		t.Fatal("accepted excessive aggregate expansion")
+	}
+}
+
+func TestScannerDeclaredRepresentations(t *testing.T) {
+	secret := "sk-ant-" + strings.Repeat("z", 24)
+	var compressed bytes.Buffer
+	w := gzip.NewWriter(&compressed)
+	_, _ = w.Write([]byte(secret))
+	_ = w.Close()
+	utf16 := []byte{0xff, 0xfe}
+	for _, b := range []byte(secret) {
+		utf16 = append(utf16, b, 0)
+	}
+	for _, tc := range []struct{ ct, body string }{
+		{"text/plain", string(utf16)},
+		{"application/gzip", compressed.String()},
+		{"multipart/form-data; boundary=x", "--x\r\nContent-Type: application/gzip\r\n\r\n" + compressed.String() + "\r\n--x--\r\n"},
+	} {
+		if _, _, err := scanBody(tc.body, false, "", tc.ct, "", "$", false); err == nil {
+			t.Fatalf("missed %s", tc.ct)
+		}
+	}
+}
+
+func TestScannerSSEPrivateKeyPayload(t *testing.T) {
+	body := "data: -----BEGIN " + "PRIVATE KEY-----\ndata: sensitive-payload\ndata: -----END " + "PRIVATE KEY-----\n\n"
+	clean, _, err := scanBodyText(body, "text/event-stream", "$", true)
+	if err == nil && strings.Contains(clean, "sensitive-payload") {
+		t.Fatal("private key payload retained")
 	}
 }

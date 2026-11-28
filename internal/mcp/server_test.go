@@ -162,6 +162,9 @@ func TestTapeExportFitsBodyBudgets(t *testing.T) {
 				t.Fatal(start)
 			}
 			t.Cleanup(s.stop)
+			if tc.path != "" {
+				s.p.ShouldCaptureResponse = func(uint64) bool { return false }
+			}
 			body := strings.Repeat("a", tc.budget+10000)
 			for _, payload := range []string{body, "last"} {
 				resp, err := http.Post(start["proxy_url"].(string)+"/upload", "text/plain", strings.NewReader(payload))

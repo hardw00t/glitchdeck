@@ -85,8 +85,8 @@ Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers
 ### Record and replay HTTP cassettes
 
 - **Passthrough** (`--mode passthrough`, the default): use the live upstream and apply the tape's faults.
-- **Record** (`exec --mode record --tape-out recorded.yaml`): capture the live HTTP responses before faults mutate them. Gzip SSE is stored decoded, without `Content-Encoding`. The source tape stays unchanged unless you explicitly use its path for output.
-- **Replay** (`exec --mode replay` or `test --mode replay`): serve cassette responses in-process and apply the same faults without contacting the upstream. A miss returns HTTP 502 (`cassette_miss`); an unresolved tie reports `cassette_ambiguous`. Neither falls through to the network, and `--allow-zero-traffic` does not override them. Use `GLITCHDECK_PROXY_URL` as the child's base URL in reverse mode. The proxy does not sandbox a child that opens its own sockets.
+- **Record** (`exec --mode record --tape-out recorded.yaml`): capture the live HTTP responses before faults mutate them. Gzip SSE is stored decoded, without `Content-Encoding`. The source tape stays unchanged unless you explicitly use its path for output. Record-mode diagnostics omit child output, command arguments, and paths.
+- **Replay** (`exec --mode replay` or `test --mode replay`): serve cassette responses in-process and apply the same faults without contacting the upstream. A miss returns HTTP 502 (`cassette_miss`); an unresolved tie reports `cassette_ambiguous`. Neither falls through to the network, and `--allow-zero-traffic` does not override them. In `exec` replay, `GLITCHDECK_TARGET` and any demo endpoint point to local replay listeners, not live services. The proxy does not sandbox a child that opens unrelated sockets.
 
 ```sh
 glitchdeck test --mode replay examples/tapes/your-app-openai-sse-cassette.tape.yaml
@@ -243,7 +243,7 @@ The ten tools are `proxy_start`, `proxy_stop`, `fault_set`, `fault_clear`, `wire
 
 `exec_run` takes an argv array, not a shell command string; inspect `ok` in its report for assertion failures. Remote targets require the server's `--upstream-allow`; an MCP call can never widen `--upstream-allow`. The `cwd` is resolved within the workdir, but a writable symlink can be swapped between validation and process start (TOCTOU). Windows process cleanup is best-effort and does not guarantee stopping grandchildren.
 
-`tape_export` returns v3 YAML when it contains cassettes and v2 otherwise. Request `format: "v1"` or `"v2"` to omit cassettes; the scanner still checks them before conversion. Exports are inline by default; the existing `out_path` option writes inside the MCP workdir. Incomplete exports report `replayable: false`.
+`tape_export` returns v3 YAML when it contains cassettes and v2 otherwise. Request `format: "v1"` or `"v2"` to omit cassettes from inline output; the scanner still checks them before conversion. The workdir-rooted `out_path` option is limited to request-only recordings; recordings with cassettes are inline only. Incomplete exports report `replayable: false`.
 
 Recordings strip common credential headers and `Referer`, and redact sensitive query values, including ambiguous semicolon-separated suffixes. Response capture also strips `Set-Cookie`. Ring eviction marks the tape truncated; MCP reports `omitted_body_bytes` if it shortens bodies to fit its 64 KiB inline or 1 MiB file limit. Recordings that omit bodies or trailers are incomplete and cannot be replayed.
 

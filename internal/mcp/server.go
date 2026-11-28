@@ -673,6 +673,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		if e != nil {
 			return fail("INVALID_TAPE", e.Error()), nil
 		}
+		hasCassettes := len(t.Cassettes) != 0
 		if s.isDemo {
 			t.Target = "demo"
 		} else {
@@ -685,6 +686,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 				return fail("EXPORT_BLOCKED", e.Error()), nil
 			}
 			return fail("INVALID_TAPE", e.Error()), nil
+		}
+		if a.OutPath != "" && hasCassettes {
+			return fail("INVALID_PATH", "cassette exports are inline only"), nil
 		}
 		if a.Format == "v1" || a.Format == "v2" {
 			if a.Format == "v1" && usesV2(t) {

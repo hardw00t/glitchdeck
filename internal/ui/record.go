@@ -43,6 +43,8 @@ type recorded struct {
 	mitm          bool
 	cassette      *tape.Cassette
 	probe         bool
+	demoScheme    string
+	intentional   bool
 }
 
 type recordedChange struct {
@@ -71,6 +73,8 @@ type recorder struct {
 	requestReservations   map[uint64]int
 	reservedResponseBytes int
 	forwardWarning        bool
+	demoHTTPAuthority     string
+	demoTLSAuthority      string
 	target                string
 	ignoreJSONPaths       []string
 }
@@ -101,6 +105,18 @@ func (r *Recording) SetCassetteMetadata(target string, ignoreJSONPaths []string)
 	defer r.rec.mu.Unlock()
 	r.rec.target = target
 	r.rec.ignoreJSONPaths = slices.Clone(ignoreJSONPaths)
+}
+
+func (r *Recording) SetDemoHTTPAuthority(authority string) {
+	r.rec.mu.Lock()
+	defer r.rec.mu.Unlock()
+	r.rec.demoHTTPAuthority = authority
+}
+
+func (r *Recording) SetDemoTLSAuthority(authority string) {
+	r.rec.mu.Lock()
+	defer r.rec.mu.Unlock()
+	r.rec.demoTLSAuthority = authority
 }
 
 func (r *Recording) Export(name string) (tape.Tape, error) {
@@ -165,6 +181,12 @@ func (r *recorder) reserveRequestBytes(seq uint64, n int) int {
 	if !r.running || seq <= r.startSeq || n <= 0 {
 		return 0
 	}
+	for len(r.entries) > 0 && n > maxRecordBytes-r.bytes-r.reservedResponseBytes {
+		if r.pendingResponses[r.entries[0].seq] {
+			break
+		}
+		r.dropOldest()
+	}
 	allowed := min(n, max(0, maxRecordBytes-r.bytes-r.reservedResponseBytes))
 	r.requestReservations[seq] += allowed
 	r.reservedResponseBytes += allowed
@@ -176,17 +198,28 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 	defer r.mu.Unlock()
 	r.reservedResponseBytes -= r.responseReservations[res.Seq]
 	delete(r.responseReservations, res.Seq)
-	if !r.running || !r.pendingResponses[res.Seq] {
+	if !r.running || !r.pendingResponses[res.Seq] && !res.Intentional {
 		return
 	}
 	delete(r.pendingResponses, res.Seq)
 	if res.Status == 0 {
+		if res.Intentional {
+			for _, e := range r.entries {
+				if e.seq == res.Seq {
+					e.intentional = true
+					break
+				}
+			}
+		}
 		return
 	}
 	for _, e := range r.entries {
 		if e.seq != res.Seq || e.cassette == nil {
 			continue
 		}
+		keySize := len(e.cassette.Request.Path) + len(e.cassette.Request.Host) + len(e.cassette.Request.Method) + len(e.cassette.Request.BodySHA256)
+		e.bytes += keySize
+		r.bytes += keySize
 		headers := make(map[string]string)
 		for k, v := range res.Header {
 			name := strings.ToLower(k)
@@ -412,15 +445,21 @@ func (r *recorder) request(req proxy.Record) {
 	}
 	requestPath := req.Path
 	host := ""
+	demoScheme := ""
 	if req.URL != "" {
 		if u, err := url.Parse(req.URL); err == nil {
 			requestPath, host = u.EscapedPath(), u.Host
+			if host != "" && u.Scheme == "https" && host == r.demoTLSAuthority {
+				host, demoScheme = "localhost", "https"
+			} else if host != "" && u.Scheme == "http" && host == r.demoHTTPAuthority {
+				host, demoScheme = "", "http"
+			}
 		}
 	} else if u, err := url.ParseRequestURI(requestPath); err == nil {
 		requestPath = u.EscapedPath()
 	}
 	req.Path, req.URL = redactQuery(req.Path), redactQuery(req.URL)
-	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE, probe: req.AssertionProbe}
+	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE, probe: req.AssertionProbe, demoScheme: demoScheme}
 	if req.WebSocket {
 		if req.MITM || req.URL != "" {
 			r.markIncomplete("forwarded WebSocket authority cannot be replayed")
@@ -433,7 +472,6 @@ func (r *recorder) request(req proxy.Record) {
 	} else {
 		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body)}
 		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host, BodySHA256: tape.BodySHA256(req.Body, r.ignoreJSONPaths)}}
-		e.bytes += len(requestPath) + len(host) + len(req.Method) + len(e.cassette.Request.BodySHA256)
 		if req.URL != "" {
 			e.http.Path = ""
 		}
@@ -510,14 +548,18 @@ func redactQuery(raw string) string {
 
 func (r *recorder) trim() {
 	for len(r.entries) > 0 && (len(r.entries) > maxEntries || r.bytes+r.reservedResponseBytes > maxRecordBytes) {
-		old := r.entries[0]
-		r.entries[0] = nil
-		r.entries = r.entries[1:]
-		delete(r.streams, old.seq)
-		r.bytes -= old.bytes
-		r.events -= old.events
-		r.droppedEntries++
+		r.dropOldest()
 	}
+}
+
+func (r *recorder) dropOldest() {
+	old := r.entries[0]
+	r.entries[0] = nil
+	r.entries = r.entries[1:]
+	delete(r.streams, old.seq)
+	r.bytes -= old.bytes
+	r.events -= old.events
+	r.droppedEntries++
 }
 
 func (r *recorder) clientFrame(seq uint64, payload []byte) {
@@ -657,7 +699,22 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 			step.WS = &ws
 		}
 		if e.cassette != nil && e.cassette.Response.Status != 0 {
-			doc.Cassettes = append(doc.Cassettes, *e.cassette)
+			found := false
+			for _, c := range doc.Cassettes {
+				if cassetteKeysOverlap(c.Request, e.cassette.Request) {
+					found = true
+					if (!reflect.DeepEqual(c.Response, e.cassette.Response) ||
+						(c.Request.Host == "") != (e.cassette.Request.Host == "") ||
+						(c.Request.BodySHA256 == "") != (e.cassette.Request.BodySHA256 == "")) && !doc.Incomplete {
+						doc.Incomplete = true
+						doc.IncompleteReason = "identical requests produced different responses"
+					}
+					break
+				}
+			}
+			if !found {
+				doc.Cassettes = append(doc.Cassettes, *e.cassette)
+			}
 		}
 		if !e.probe {
 			doc.Script = append(doc.Script, step)
@@ -666,6 +723,43 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 	if len(doc.Cassettes) != 0 {
 		doc.Version = 3
 		doc.IgnoreJSONPaths = slices.Clone(r.ignoreJSONPaths)
+		for i := range doc.Script {
+			step := &doc.Script[i]
+			for _, e := range entries {
+				if step.Seq != e.seq || e.demoScheme == "" {
+					continue
+				}
+				if step.HTTP != nil {
+					h := *step.HTTP
+					u, err := url.Parse(h.URL)
+					if err == nil {
+						h.Path, h.URL = u.RequestURI(), ""
+						if e.demoScheme == "https" {
+							h.Path, h.URL = "", "${DEMO_TLS}"+u.RequestURI()
+						}
+						step.HTTP = &h
+					}
+				}
+				if step.Stream != nil {
+					s := *step.Stream
+					u, err := url.Parse(s.URL)
+					if err == nil {
+						s.Path, s.URL = u.RequestURI(), ""
+						if e.demoScheme == "https" {
+							s.Path, s.URL = "", "${DEMO_TLS}"+u.RequestURI()
+						}
+						step.Stream = &s
+					}
+				}
+				break
+			}
+		}
+		for _, e := range entries {
+			if !e.intentional && (e.cassette == nil || e.cassette.Response.Status == 0) && !doc.Incomplete {
+				doc.Incomplete = true
+				doc.IncompleteReason = "recorded exchange has no replayable response"
+			}
+		}
 		if r.droppedEntries != 0 && !doc.Incomplete {
 			doc.Incomplete = true
 			doc.IncompleteReason = "recorded entries were evicted"
@@ -675,6 +769,24 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 		doc.IncompleteReason = "forwarded traffic requires explicit upstream authorization for replay"
 	}
 	return doc
+}
+
+func cassetteKeysOverlap(a, b tape.CassetteRequest) bool {
+	if !strings.EqualFold(a.Method, b.Method) || a.Path != b.Path ||
+		a.BodySHA256 != "" && b.BodySHA256 != "" && !strings.EqualFold(a.BodySHA256, b.BodySHA256) {
+		return false
+	}
+	if a.Host == "" || b.Host == "" || strings.EqualFold(a.Host, b.Host) {
+		return true
+	}
+	normalize := func(authority string) string {
+		host, port, err := net.SplitHostPort(authority)
+		if err == nil && (port == "80" || port == "443") {
+			return strings.ToLower(strings.Trim(host, "[]"))
+		}
+		return strings.ToLower(strings.Trim(authority, "[]"))
+	}
+	return normalize(a.Host) == normalize(b.Host)
 }
 
 func v2Rules(rules []fault.Rule) bool {

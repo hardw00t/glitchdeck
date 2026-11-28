@@ -39,14 +39,19 @@ var secretPatterns = []struct {
 
 // PrepareExport scans the tape without exposing secret values in errors.
 func PrepareExport(t Tape, redact bool) (Tape, error) {
-	_, _, err := scanValue(reflect.ValueOf(t), "$", false)
+	remaining := 32 << 20
+	if err := boundExport(reflect.ValueOf(t), &remaining, 0); err != nil {
+		return Tape{}, err
+	}
+	budget := 64 << 20
+	_, _, err := scanValue(reflect.ValueOf(t), "$", false, &budget)
 	if err == nil {
 		return t, nil
 	}
 	if !redact {
 		return Tape{}, err
 	}
-	v, changed, err := scanValue(reflect.ValueOf(t), "$", true)
+	v, changed, err := scanValue(reflect.ValueOf(t), "$", true, &budget)
 	if err != nil {
 		return Tape{}, err
 	}
@@ -58,11 +63,60 @@ func PrepareExport(t Tape, redact bool) (Tape, error) {
 		out.Redacted = true
 	}
 	if redact && changed {
-		if _, _, err := scanValue(reflect.ValueOf(out), "$", false); err != nil {
+		if _, _, err := scanValue(reflect.ValueOf(out), "$", false, &budget); err != nil {
 			return Tape{}, err
 		}
 	}
 	return out, nil
+}
+
+func boundExport(v reflect.Value, remaining *int, depth int) error {
+	if depth > 64 {
+		return unsupportedBody("$")
+	}
+	if !v.IsValid() {
+		return nil
+	}
+	*remaining--
+	if *remaining < 0 {
+		return unsupportedBody("$")
+	}
+	switch v.Kind() {
+	case reflect.String:
+		*remaining -= v.Len()
+		if *remaining < 0 {
+			return unsupportedBody("$")
+		}
+	case reflect.Interface, reflect.Pointer:
+		if !v.IsNil() {
+			return boundExport(v.Elem(), remaining, depth+1)
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if v.Type().Field(i).IsExported() {
+				if err := boundExport(v.Field(i), remaining, depth+1); err != nil {
+					return err
+				}
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if err := boundExport(v.Index(i), remaining, depth+1); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			if err := boundExport(iter.Key(), remaining, depth+1); err != nil {
+				return err
+			}
+			if err := boundExport(iter.Value(), remaining, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 var quotedString = regexp.MustCompile(`"(?:\\.|[^"\\])*"`)
@@ -74,6 +128,43 @@ func scanText(s, field string, redact bool) (string, bool, error) {
 func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error) {
 	if depth > 8 {
 		return "", false, &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
+	}
+	if depth == 0 && redact {
+		if _, _, err := scanTextDepth(s, field, false, 0); err == nil {
+			return s, false, nil
+		}
+	}
+	if depth == 0 && (strings.HasSuffix(field, ".url") || strings.HasSuffix(field, ".path") || strings.HasSuffix(field, ".target") || strings.HasSuffix(field, ".http_get") || strings.HasSuffix(field, ".location") || strings.HasSuffix(field, ".form")) {
+		prefix, query, changed := "", s, false
+		if !strings.HasSuffix(field, ".form") {
+			i := strings.IndexByte(s, '?')
+			if i < 0 {
+				return scanTextDepth(s, field+".component", redact, 1)
+			}
+			prefix, query = s[:i+1], s[i+1:]
+			clean, c, err := scanTextDepth(prefix, field+".component", redact, 1)
+			if err != nil {
+				return "", false, err
+			}
+			prefix, changed = clean, c
+		}
+		parts := strings.Split(query, "&")
+
+		for i, part := range parts {
+			pair := strings.SplitN(part, "=", 2)
+			for j, value := range pair {
+				clean, c, err := scanTextDepth(value, field+".form", redact, 1)
+				if err != nil {
+					return "", false, err
+				}
+				pair[j], changed = clean, changed || c
+			}
+			parts[i] = strings.Join(pair, "=")
+		}
+		if !changed {
+			return s, false, nil
+		}
+		return prefix + strings.Join(parts, "&"), true, nil
 	}
 	changed := false
 	var scanErr error
@@ -108,9 +199,14 @@ func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error
 	}
 	if strings.Contains(s, "%") || (strings.Contains(s, "+") && (query >= 0 || strings.HasSuffix(field, ".form") || strings.HasSuffix(field, ".location"))) {
 		var decoded strings.Builder
-		starts := make([]int, 0, len(s)+1)
+		var starts []int
+		if redact {
+			starts = make([]int, 0, len(s)+1)
+		}
 		for i := 0; i < len(s); {
-			starts = append(starts, i)
+			if redact {
+				starts = append(starts, i)
+			}
 			if s[i] == '%' && i+2 < len(s) {
 				hex := func(b byte) int {
 					if b >= '0' && b <= '9' {
@@ -138,7 +234,9 @@ func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error
 			}
 			i++
 		}
-		starts = append(starts, len(s))
+		if redact {
+			starts = append(starts, len(s))
+		}
 		d := decoded.String()
 		if d != s {
 			_, composed, err := scanTextDepth(d, field, redact, depth+1)
@@ -182,7 +280,7 @@ func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error
 	return s, changed, nil
 }
 
-func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool, error) {
+func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect.Value, bool, error) {
 	if !v.IsValid() {
 		return v, false, nil
 	}
@@ -205,7 +303,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 		if v.IsNil() {
 			return v, false, nil
 		}
-		x, c, err := scanValue(v.Elem(), field, redact)
+		x, c, err := scanValue(v.Elem(), field, redact, budget)
 		if err != nil {
 			return reflect.Value{}, false, err
 		}
@@ -219,7 +317,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 		if v.IsNil() {
 			return v, false, nil
 		}
-		x, c, err := scanValue(v.Elem(), field, redact)
+		x, c, err := scanValue(v.Elem(), field, redact, budget)
 		if err != nil {
 			return reflect.Value{}, false, err
 		}
@@ -284,7 +382,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 				if grpcEncoding != "" && grpcEncoding != "identity" {
 					return reflect.Value{}, false, &ExportBlockedError{Kind: "unsupported_encoding", Field: path}
 				}
-				s, c, err := scanBody(v.Field(i).String(), encoded, encoding, contentType, transfer, path, redact)
+				s, c, err := scanBodyBudget(v.Field(i).String(), encoded, encoding, contentType, transfer, path, redact, budget)
 				if err != nil {
 					return reflect.Value{}, false, err
 				}
@@ -301,7 +399,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 				changed = changed || c
 				continue
 			}
-			x, c, err := scanValue(v.Field(i), path, redact)
+			x, c, err := scanValue(v.Field(i), path, redact, budget)
 			if err != nil {
 				return reflect.Value{}, false, err
 			}
@@ -318,7 +416,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 			iter := headers.MapRange()
 			for iter.Next() {
 				key := strings.ToLower(iter.Key().String())
-				if key == "content-length" || key == "content-md5" || key == "content-digest" || key == "digest" || key == "etag" {
+				if key == "content-length" || key == "content-md5" || key == "content-digest" || key == "repr-digest" || key == "digest" || key == "etag" {
 					headers.SetMapIndex(iter.Key(), reflect.Value{})
 				}
 			}
@@ -334,7 +432,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 		}
 		changed := false
 		for i := 0; i < v.Len(); i++ {
-			x, c, err := scanValue(v.Index(i), fmt.Sprintf("%s[%d]", field, i), redact)
+			x, c, err := scanValue(v.Index(i), fmt.Sprintf("%s[%d]", field, i), redact, budget)
 			if err != nil {
 				return reflect.Value{}, false, err
 			}
@@ -355,7 +453,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 		changed := false
 		iter := v.MapRange()
 		for iter.Next() {
-			k, c, err := scanValue(iter.Key(), field, redact)
+			k, c, err := scanValue(iter.Key(), field, redact, budget)
 			if err != nil {
 				return reflect.Value{}, false, err
 			}
@@ -364,7 +462,7 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 			if strings.EqualFold(iter.Key().String(), "Location") {
 				valueField += ".location"
 			}
-			x, c, err := scanValue(iter.Value(), valueField, redact)
+			x, c, err := scanValue(iter.Value(), valueField, redact, budget)
 			if err != nil {
 				return reflect.Value{}, false, err
 			}
@@ -383,6 +481,11 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 }
 
 func scanBody(body string, encoded bool, encoding, contentType, transfer, field string, redact bool) (string, bool, error) {
+	budget := 64 << 20
+	return scanBodyBudget(body, encoded, encoding, contentType, transfer, field, redact, &budget)
+}
+
+func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int) (string, bool, error) {
 	blocked := func() (string, bool, error) {
 		return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
 	}
@@ -397,11 +500,18 @@ func scanBody(body string, encoded bool, encoding, contentType, transfer, field 
 	}
 	raw := []byte(body)
 	if encoded {
+		if base64.StdEncoding.DecodedLen(len(body)) > *budget+2 {
+			return blocked()
+		}
 		var err error
 		raw, err = base64.StdEncoding.DecodeString(body)
 		if err != nil {
 			return blocked()
 		}
+		if len(raw) > *budget {
+			return blocked()
+		}
+		*budget -= len(raw)
 	}
 	var reader io.ReadCloser
 	var err error
@@ -436,13 +546,18 @@ func scanBody(body string, encoded bool, encoding, contentType, transfer, field 
 		return blocked()
 	}
 	if reader != nil {
-		raw, err = io.ReadAll(io.LimitReader(reader, (4<<20)+1))
+		limit := 4 << 20
+		if *budget < limit {
+			limit = *budget
+		}
+		raw, err = io.ReadAll(io.LimitReader(reader, int64(limit)+1))
 		closeErr := reader.Close()
-		if err != nil || closeErr != nil || len(raw) > 4<<20 || source.Len() != 0 {
+		if err != nil || closeErr != nil || len(raw) > limit || source.Len() != 0 {
 			return blocked()
 		}
+		*budget -= len(raw)
 	}
-	clean, changed, err := scanBodyText(string(raw), contentType, field, redact)
+	clean, changed, err := scanContentBudget(string(raw), contentType, field, redact, 0, budget)
 	if err != nil {
 		return "", false, err
 	}
