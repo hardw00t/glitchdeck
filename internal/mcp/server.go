@@ -467,9 +467,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 			seq = s.p.Seq()
 			events = len(s.bus.History(4096))
 			if s.recording != nil {
-				if t, e := s.recording.Export("session"); e == nil {
-					steps = len(t.Script)
-				}
+				steps = s.recording.RecordedSteps()
 			}
 		}
 		s.stop()

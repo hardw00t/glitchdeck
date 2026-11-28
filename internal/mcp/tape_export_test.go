@@ -190,3 +190,24 @@ func TestTapeExportIncompleteOmittedBody(t *testing.T) {
 		t.Fatal("incomplete export was accepted for replay")
 	}
 }
+
+func TestFilteredBodyBlocksExportButCountsRecordedStep(t *testing.T) {
+	s, proxyURL := exportTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "Content-Disposition")
+		w.Header().Set("Content-Disposition", "attachment")
+		io.WriteString(w, "captured")
+	})
+	req, err := http.NewRequest("GET", proxyURL+"/data", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportTestRequest(t, req)
+	got, _ := s.call("tape_export", []byte(`{"name":"capture","redact_secrets":true}`))
+	if e, ok := got["error"].(map[string]string); !ok || e["code"] != "EXPORT_BLOCKED" {
+		t.Fatalf("export was not blocked: %v", got)
+	}
+	stopped, _ := s.call("proxy_stop", []byte("{}"))
+	if stopped["recorded_steps"] != 1 {
+		t.Fatalf("recorded step missing: %v", stopped)
+	}
+}

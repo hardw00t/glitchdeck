@@ -657,6 +657,19 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 	return r.tapeLocked(fallback)
 }
 
+// RecordedSteps counts retained script steps without attempting to export their contents.
+func (r *Recording) RecordedSteps() int {
+	r.rec.mu.Lock()
+	defer r.rec.mu.Unlock()
+	n := 0
+	for _, entry := range r.rec.entries {
+		if !entry.probe {
+			n++
+		}
+	}
+	return n
+}
+
 func (r *recorder) export(fallback fault.Config) (tape.Tape, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
