@@ -181,9 +181,14 @@ func testTape(args []string) int {
 	}
 	if *report != "" {
 		var inputs []*execrun.Destination
+		var missingInputs []string
 		for _, name := range files {
 			input, openErr := execrun.OpenDestination(name)
 			if openErr != nil {
+				if errors.Is(openErr, os.ErrNotExist) && errors.Is(inputErr, os.ErrNotExist) {
+					missingInputs = append(missingInputs, name)
+					continue
+				}
 				return fail("TAPE_IO", openErr)
 			}
 			defer input.Close()
@@ -203,6 +208,20 @@ func testTape(args []string) int {
 			}
 		}
 		reportSafe = func() error {
+			for _, name := range missingInputs {
+				input, err := execrun.OpenDestination(name)
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				if err != nil {
+					return errors.New("report destination must differ from the input tape")
+				}
+				same, err := output.Same(input, inputInfo)
+				input.Close()
+				if err != nil || same {
+					return errors.New("report destination must differ from the input tape")
+				}
+			}
 			for _, input := range inputs {
 				same, err := output.Same(input, inputInfo)
 				if err != nil || same {

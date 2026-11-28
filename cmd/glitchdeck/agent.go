@@ -209,10 +209,12 @@ func execCommand(args []string) int {
 		if *path != "" {
 			var err error
 			inputDestination, err = execrun.OpenDestination(*path)
-			if err != nil {
+			if err != nil && !(errors.Is(err, os.ErrNotExist) && errors.Is(inputErr, os.ErrNotExist)) {
 				return fail("TAPE_IO", err)
 			}
-			defer inputDestination.Close()
+			if inputDestination != nil {
+				defer inputDestination.Close()
+			}
 		}
 		destination, err := execrun.OpenDestination(*report)
 		if err != nil {
@@ -229,6 +231,15 @@ func execCommand(args []string) int {
 		reportSafe = func() error {
 			var alias bool
 			var err error
+			if inputDestination == nil && *path != "" && errors.Is(inputErr, os.ErrNotExist) {
+				current, openErr := execrun.OpenDestination(*path)
+				if openErr == nil {
+					defer current.Close()
+					alias, err = destination.Same(current, inputInfo)
+				} else if !errors.Is(openErr, os.ErrNotExist) {
+					err = openErr
+				}
+			}
 			if inputDestination != nil {
 				alias, err = destination.Same(inputDestination, inputInfo)
 			}

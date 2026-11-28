@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -58,10 +59,29 @@ func (d *Destination) Same(other *Destination, input ...os.FileInfo) (bool, erro
 	}
 	b, err = other.root.Stat(other.name)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		// Root.Stat deliberately refuses absolute symlinks. Read the link
-		// through the pinned parent; an absolute target has its own anchor.
-		if link, linkErr := other.root.Readlink(other.name); linkErr == nil && filepath.IsAbs(link) {
-			b, err = os.Stat(link)
+		// Resolve escaping links relative to the pinned parent on Linux.
+		if link, linkErr := other.root.Readlink(other.name); linkErr == nil {
+			if filepath.IsAbs(link) {
+				b, err = os.Stat(link)
+			} else if runtime.GOOS == "linux" {
+				parent, openErr := other.root.Open(".")
+				if openErr == nil {
+					b, err = os.Stat("/proc/self/fd/" + fmt.Sprint(parent.Fd()) + "/" + link)
+					parent.Close()
+				}
+			} else {
+				pinned, pinErr := other.root.Stat(".")
+				before, beforeErr := os.Stat(other.root.Name())
+				if pinErr == nil && beforeErr == nil && os.SameFile(pinned, before) {
+					b, err = os.Stat(other.root.Name() + string(os.PathSeparator) + link)
+					after, afterErr := os.Stat(other.root.Name())
+					if afterErr != nil || !os.SameFile(pinned, after) {
+						b, err = nil, fs.ErrInvalid
+					}
+				} else {
+					b, err = nil, fs.ErrInvalid
+				}
+			}
 		}
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return false, err
