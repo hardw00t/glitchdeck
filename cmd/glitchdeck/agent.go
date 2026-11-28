@@ -178,7 +178,7 @@ func execCommand(args []string) int {
 	if usageErr == nil {
 		recordRequested = o.Mode == "record"
 	}
-	legacyReport = o.Mode == "passthrough" &&
+	legacyReport = o.Mode == "passthrough" && o.TapeOut == "" &&
 		(usageErr == nil || !recordRequested && !requestsMode(f, options, "replay"))
 	if usageErr == nil && (*path == "" || f.NArg() != 0 || sep+1 == len(args) || o.Timeout <= 0 || o.Grace <= 0) {
 		usageErr = errors.New("expected --tape, positive timeout and grace, and -- <command>")
