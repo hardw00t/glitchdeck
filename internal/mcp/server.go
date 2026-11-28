@@ -674,6 +674,10 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		}
 		t, e := s.recording.Export(a.Name)
 		if e != nil {
+			var blocked *tape.ExportBlockedError
+			if errors.As(e, &blocked) {
+				return fail("EXPORT_BLOCKED", e.Error()), nil
+			}
 			return fail("INVALID_TAPE", e.Error()), nil
 		}
 		hasCassettes := len(t.Cassettes) != 0

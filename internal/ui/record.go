@@ -35,18 +35,19 @@ type recordingStatus struct {
 }
 
 type recorded struct {
-	seq           uint64
-	at            time.Time
-	http          *tape.HTTP
-	ws            *tape.WS
-	bytes, events int
-	done          bool
-	sse           bool
-	mitm          bool
-	cassette      *tape.Cassette
-	probe         bool
-	demoScheme    string
-	intentional   bool
+	seq                    uint64
+	at                     time.Time
+	http                   *tape.HTTP
+	ws                     *tape.WS
+	bytes, events          int
+	done                   bool
+	sse                    bool
+	mitm                   bool
+	cassette               *tape.Cassette
+	probe                  bool
+	demoScheme             string
+	intentional            bool
+	filteredRepresentation bool
 }
 
 type recordedChange struct {
@@ -132,9 +133,9 @@ func (r *Recording) Export(name string) (tape.Tape, error) {
 	if r.p != nil {
 		cfg = r.p.Config()
 	}
-	doc := r.rec.tape(cfg)
+	doc, err := r.rec.export(cfg)
 	doc.Name = name
-	return doc, nil
+	return doc, err
 }
 
 func (r *recorder) attach(p *proxy.Proxy) {
@@ -253,6 +254,9 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 			r.bytes += len(k) + len(headers[k])
 		}
 		e.cassette.Response = tape.NewCassetteResponse(res.Status, headers, res.Body, res.Truncated)
+		if res.FilteredRepresentation && len(res.Body) != 0 {
+			e.filteredRepresentation = true
+		}
 		size := len(e.cassette.Response.Body)
 		e.bytes += size
 		r.bytes += size
@@ -500,6 +504,7 @@ func (r *recorder) request(req proxy.Record) {
 		r.streams[req.Seq] = e
 	} else {
 		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body)}
+		e.filteredRepresentation = !req.AssertionProbe && req.FilteredRepresentation && len(req.Body) != 0
 		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host}}
 		if req.URL != "" {
 			e.http.Path = ""
@@ -649,6 +654,21 @@ func (r *recorder) tickerStalled() {
 func (r *recorder) tape(fallback fault.Config) tape.Tape {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.tapeLocked(fallback)
+}
+
+func (r *recorder) export(fallback fault.Config) (tape.Tape, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, entry := range r.entries {
+		if entry.filteredRepresentation {
+			return tape.Tape{}, &tape.ExportBlockedError{Kind: "unsupported_encoding", Field: "$.body"}
+		}
+	}
+	return r.tapeLocked(fallback), nil
+}
+
+func (r *recorder) tapeLocked(fallback fault.Config) tape.Tape {
 	entries := slices.Clone(r.entries)
 	slices.SortFunc(entries, func(a, b *recorded) int {
 		switch {

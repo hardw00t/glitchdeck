@@ -42,29 +42,31 @@ type Outcome struct {
 }
 
 type Record struct {
-	Seq                uint64
-	Method, Path       string
-	Header             http.Header
-	URL                string
-	Proto              string
-	Body               []byte
-	WebSocket          bool
-	SSE                bool
-	At                 time.Time
-	MITM               bool
-	UnrecordableBody   bool
-	BodyTruncated      bool
-	HasTrailers        bool
-	BodyCaptureStarted bool
-	AssertionProbe     bool
+	Seq                    uint64
+	Method, Path           string
+	Header                 http.Header
+	URL                    string
+	Proto                  string
+	Body                   []byte
+	WebSocket              bool
+	SSE                    bool
+	At                     time.Time
+	MITM                   bool
+	UnrecordableBody       bool
+	BodyTruncated          bool
+	HasTrailers            bool
+	BodyCaptureStarted     bool
+	FilteredRepresentation bool
+	AssertionProbe         bool
 }
 type ResponseRecord struct {
-	Seq         uint64
-	Status      int
-	Header      http.Header
-	Body        []byte
-	Truncated   bool
-	Intentional bool
+	Seq                    uint64
+	Status                 int
+	Header                 http.Header
+	Body                   []byte
+	Truncated              bool
+	Intentional            bool
+	FilteredRepresentation bool
 }
 
 type CassetteError struct {
@@ -923,7 +925,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		stripHop(headers)
 		rec := Record{Seq: seq, Method: recordMethod, Path: r.URL.RequestURI(), Header: headers, Body: captured,
 			WebSocket: ws, SSE: isSSE, At: start, Proto: recordProto, UnrecordableBody: missing, BodyTruncated: truncated,
-			BodyCaptureStarted: capturing, MITM: meta.MITM, HasTrailers: hasTrailers, AssertionProbe: r.Context().Value(probeKey{}) == true}
+			BodyCaptureStarted: capturing, MITM: meta.MITM, HasTrailers: hasTrailers, AssertionProbe: r.Context().Value(probeKey{}) == true, FilteredRepresentation: representationRemoved(r.Header, headers, false)}
 		if r.URL.IsAbs() {
 			rec.URL = r.URL.String()
 		} else if meta.MITM {
@@ -1287,6 +1289,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				responseRecord.Header = resp.Header.Clone()
 				stripHop(responseRecord.Header)
 				encoding := strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ", ")))
+				responseRecord.FilteredRepresentation = representationRemoved(resp.Header, responseRecord.Header, encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate")
 				if resp.StatusCode == http.StatusPartialContent && encoding != "" && encoding != "identity" {
 					responseRecord.Truncated = true
 				}
@@ -1413,6 +1416,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		responseRecord.Status = resp.StatusCode
 		responseRecord.Header = resp.Header.Clone()
 		stripHop(responseRecord.Header)
+		responseRecord.FilteredRepresentation = representationRemoved(resp.Header, responseRecord.Header, encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate")
 		if resp.StatusCode == http.StatusPartialContent && encoding != "" && encoding != "identity" {
 			responseRecord.Truncated = true
 		}
@@ -1762,6 +1766,18 @@ func inspectorHeaders(h http.Header) map[string]string {
 	}
 	return out
 }
+func representationRemoved(original, filtered http.Header, decoded bool) bool {
+	for _, key := range []string{"Content-Type", "Content-Encoding", "Content-Transfer-Encoding", "Content-Disposition"} {
+		if decoded && key == "Content-Encoding" {
+			continue
+		}
+		if len(original.Values(key)) != 0 && len(filtered.Values(key)) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func stripHop(h http.Header) {
 	for _, v := range h.Values("Connection") {
 		for _, k := range strings.Split(v, ",") {
