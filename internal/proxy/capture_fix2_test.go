@@ -165,7 +165,7 @@ func TestTimeoutRetryInvalidEncodingDoesNotChangeTransportOutcome(t *testing.T) 
 		t.Fatal(err)
 	}
 	stats := p.Stats()["dup"].Replays
-	if !got.Truncated || got.Header.Get("Repr-Digest") != "" || stats == nil || stats.OriginalOutcome != "" {
+	if got.Truncated || !got.UnscannableEncoding || got.Status != 200 || got.Header.Get("Repr-Digest") != "" || stats == nil || stats.OriginalOutcome != "" {
 		t.Fatalf("record=%+v replay=%+v", got, stats)
 	}
 }
@@ -220,5 +220,40 @@ func TestHTTP2SyntheticResponseIsIntentional(t *testing.T) {
 	p.ServeHTTP(httptest.NewRecorder(), req)
 	if len(order) != 2 || order[0] != "request" || order[1] != "response" || !got.Intentional || got.Status != 0 {
 		t.Fatalf("order=%v response=%+v", order, got)
+	}
+}
+
+func TestDiscardedEncodingCaptureLimit(t *testing.T) {
+	for _, size := range []int{maxBody, maxBody + 1} {
+		c := &responseCapture{ReadCloser: io.NopCloser(io.LimitReader(zeroReader{}, int64(size))), discard: true, discardLimit: true}
+		c.finish()
+		if c.truncated != (size > maxBody) || !c.seen || len(c.body) != 0 {
+			t.Fatalf("size=%d capture=%+v", size, c)
+		}
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+func TestTimeoutRetryInvalidEncodingAtWireLimit(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = io.CopyN(w, zeroReader{}, maxBody)
+	}))
+	defer up.Close()
+	target, _ := ParseExplicitTarget(up.URL)
+	p := New(target, fault.Config{Rules: []fault.Rule{{ID: "dup", Enabled: true, Fault: fault.Fault{Type: "dup-webhook", Params: map[string]any{"mode": "timeout_retry", "count": 2}}}}}, nil)
+	defer p.Close()
+	p.ShouldCaptureResponse = func(uint64) bool { return true }
+	var got ResponseRecord
+	p.OnResponse = func(r ResponseRecord) { got = r }
+	p.ServeHTTP(httptest.NewRecorder(), localCassetteRequest("POST", "/"))
+	if got.Status != 200 || got.Truncated || !got.UnscannableEncoding {
+		t.Fatalf("record=%+v", got)
 	}
 }

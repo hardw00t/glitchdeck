@@ -118,19 +118,25 @@ func (p *Proxy) cassetteResponse(r *http.Request) (*http.Response, error) {
 
 type responseCapture struct {
 	io.ReadCloser
-	body      []byte
-	truncated bool
-	failed    bool
-	err       error
-	eof       bool
-	reserve   func(int) int
-	discard   bool
-	seen      bool
+	body         []byte
+	truncated    bool
+	failed       bool
+	err          error
+	eof          bool
+	reserve      func(int) int
+	discard      bool
+	seen         bool
+	discardLimit bool
+	discarded    int
 }
 
 func (c *responseCapture) Read(b []byte) (int, error) {
 	n, err := c.ReadCloser.Read(b)
 	c.seen = c.seen || n > 0
+	if c.discardLimit && !c.truncated {
+		c.discarded += min(n, maxBody+1-c.discarded)
+		c.truncated = c.discarded > maxBody
+	}
 	take := 0
 	if !c.truncated && !c.discard {
 		take = min(n, maxBody-len(c.body))
@@ -155,7 +161,9 @@ func (c *responseCapture) Read(b []byte) (int, error) {
 func (c *responseCapture) finish() {
 	if !c.eof && !c.truncated && !c.failed {
 		var err error
-		if c.discard {
+		if c.discardLimit {
+			_, err = io.Copy(io.Discard, io.LimitReader(c, int64(maxBody+1-c.discarded)))
+		} else if c.discard {
 			_, err = io.Copy(io.Discard, c)
 		} else {
 			_, err = io.Copy(io.Discard, io.LimitReader(c, int64(maxBody-len(c.body)+1)))
@@ -1309,13 +1317,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					responseRecord.UnscannableEncoding = false
 					_, drainErr = io.Copy(io.Discard, resp.Body)
 				} else if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
-					n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+					n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody+1))
 					drainErr = err
 					responseRecord.UnscannableEncoding = n > 0
+					responseRecord.Truncated = responseRecord.Truncated || n > maxBody || err != nil
 					responseRecord.Header.Del("Content-Encoding")
 				} else {
 					responseRecord.Header.Del("Content-Encoding")
-					raw := &transportReader{Reader: resp.Body, remaining: maxBody}
+					raw := &transportReader{Reader: resp.Body, remaining: maxBody + 1}
 					var source io.ReadCloser = io.NopCloser(raw)
 					if encoding != "" && encoding != "identity" {
 						stripSSEIntegrity(responseRecord.Header)
@@ -1331,9 +1340,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					_ = source.Close()
 					responseRecord.Body = capture.body
 					responseRecord.UnscannableEncoding = responseRecord.UnscannableEncoding && capture.seen
-					if capture.failed && encoding != "" && encoding != "identity" && raw.err == nil && raw.remaining > 0 && !capture.truncated {
+					responseRecord.Truncated = responseRecord.Truncated || raw.remaining == 0
+					if capture.failed && encoding != "" && encoding != "identity" && raw.err == nil && !capture.truncated {
 						responseRecord.Body = nil
-						responseRecord.UnscannableEncoding = raw.remaining < maxBody
+						responseRecord.UnscannableEncoding = raw.remaining < maxBody+1
 					} else {
 						responseRecord.Truncated = responseRecord.Truncated || capture.truncated || capture.failed
 						if capture.failed {
@@ -1447,6 +1457,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			capture := &responseCapture{ReadCloser: resp.Body}
 			if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
 				capture.discard = true
+				capture.discardLimit = true
 				responseRecord.Header.Del("Content-Encoding")
 				responseRecord.Header.Del("Content-Length")
 			}
