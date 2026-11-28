@@ -2,6 +2,7 @@ package tape
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -19,12 +20,15 @@ func TestExportTextEncodingAllowlist(t *testing.T) {
 		ws                                bool
 	}{
 		{"IBM037 XML", ibm037, "application/xml", "base64", "$.cassettes[0].response.body", false},
+		{"IBM037 external XML entity", ibm037, "application/xml-external-parsed-entity", "base64", "$.cassettes[0].response.body", false},
 		{"UTF-7 frame", `<?xml version="1.0" encoding="UTF-7"?><x key="sk+AC0-ant-` + secret[7:] + `"/>`, "", "", "$.script[0].ws.messages[0]", true},
 		{"UTF-7 BOM", "+/v8-<x/>", "", "", "$.script[0].ws.messages[0]", true},
-		{"JSON charset", `{"safe":"not the declared encoding"}`, `application/json; charset=" IBM037 "`, "", "$.cassettes[0].response.body", false},
-		{"invalid UTF-8", "plain\x80text", "text/plain", "", "$.cassettes[0].response.body", false},
+		{"JSON charset", `{"key":"` + secret + `"}`, `application/json; charset=" IBM037 "`, "", "$.cassettes[0].response.body", false},
+		{"invalid UTF-8", "plain\x80" + secret, "text/plain", "", "$.cassettes[0].response.body", false},
 		{"malformed UTF-16", "\xff\xfe\x00\xd8", "text/plain", "", "$.cassettes[0].response.body", false},
 		{"unsupported XML declaration after BOM", "\xef\xbb\xbf" + `<?xml version="1.0" encoding="windows-1252"?><x/>`, "application/xml", "", "$.cassettes[0].response.body", false},
+		{"multipart text epilogue", "--x\r\n\r\nok\r\n--x--\r\n\x80", "multipart/mixed; boundary=x", "", "$.cassettes[0].response.body", false},
+		{"multipart base64 defaults to text", "--x\r\nContent-Transfer-Encoding: base64\r\n\r\ngA==\r\n--x--\r\n", "multipart/mixed; boundary=x", "", "$.cassettes[0].response.body", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in := Tape{Version: 3, Target: "demo"}
@@ -74,6 +78,7 @@ func TestExportAllowedTextEncodings(t *testing.T) {
 		order               binary.AppendByteOrder
 	}{
 		{"UTF-8 JSON", `application/json; charset=" UTF8 "`, `{"value":"%s"}`, nil},
+		{"XML example in UTF-8 JSON", "application/json", `{"xml":"<?xml version='1.0' encoding='windows-1252'?>","value":"%s"}`, nil},
 		{"UTF-8 XML", "application/xml; charset=ascii", `<?xml version="1.0" encoding="utf-8"?><x>%s</x>`, nil},
 		{"UTF-8 SSE", "text/event-stream", "data: %s\n\n", nil},
 		{"UTF-16LE JSON", "application/json; charset=utf-16le", `{"value":"%s"}`, binary.LittleEndian},
@@ -118,4 +123,39 @@ func TestExportPreservesBinaryBase64(t *testing.T) {
 	if err != nil || out.Cassettes[0].Response.Body != binaryBody || out.Cassettes[0].Response.BodyEncoding != "base64" {
 		t.Fatalf("binary body was rejected or changed: %v", err)
 	}
+}
+
+func TestExportEncodingContainerBoundaries(t *testing.T) {
+	secret := "sk-" + "ant-" + strings.Repeat("Z", 24)
+	t.Run("binary BOM cannot hide decoded octets", func(t *testing.T) {
+		in := Tape{Cassettes: []Cassette{{Response: NewCassetteResponse(200, map[string]string{"Content-Type": "application/octet-stream"}, []byte("\xff\xfe"+secret+"!"), false)}}}
+		for _, redact := range []bool{false, true} {
+			if _, err := PrepareExport(in, redact); err == nil {
+				t.Fatalf("redact=%v exported credential in binary data", redact)
+			}
+		}
+	})
+	t.Run("multipart binary part preserved", func(t *testing.T) {
+		raw := []byte("--x\r\nContent-Type: application/octet-stream\r\n\r\n\x80\x81\r\n--x--\r\n")
+		in := Tape{Cassettes: []Cassette{{Response: NewCassetteResponse(200, map[string]string{"Content-Type": "multipart/mixed; boundary=x"}, raw, false)}}}
+		out, err := PrepareExport(in, false)
+		if err != nil || out.Cassettes[0].Response.Body != in.Cassettes[0].Response.Body {
+			t.Fatalf("binary part was rejected or changed: %v", err)
+		}
+	})
+	t.Run("declared compression does not clear charset", func(t *testing.T) {
+		var compressed bytes.Buffer
+		w := gzip.NewWriter(&compressed)
+		_, _ = w.Write([]byte("ordinary"))
+		_ = w.Close()
+		in := Tape{Cassettes: []Cassette{{Response: NewCassetteResponse(200, map[string]string{"Content-Type": "application/gzip; charset=ibm037"}, compressed.Bytes(), false)}}}
+		var blocked *ExportBlockedError
+		if _, err := PrepareExport(in, false); !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+			t.Errorf("disallowed charset accepted inside gzip: %v", err)
+		}
+		out, err := PrepareExport(in, true)
+		if err != nil || !out.Redacted || out.Cassettes[0].Response.Body != "REDACTED" {
+			t.Fatalf("gzip body with a disallowed charset was not replaced: %v", err)
+		}
+	})
 }

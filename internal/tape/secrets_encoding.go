@@ -13,7 +13,7 @@ type utf16Order interface {
 	binary.AppendByteOrder
 }
 
-var xmlDeclaration = regexp.MustCompile(`(?i)<\?xml[\t\r\n ]+[^?]*\?>`)
+var xmlDeclaration = regexp.MustCompile(`(?i)^<\?xml[\t\r\n ]+[^?]*\?>`)
 var xmlEncoding = regexp.MustCompile(`(?i)[\t\r\n ]encoding[\t\r\n ]*=[\t\r\n ]*(?:"([^"]*)"|'([^']*)')`)
 
 func allowedTextEncoding(name string, order utf16Order) bool {
@@ -35,17 +35,16 @@ func allowedTextEncoding(name string, order utf16Order) bool {
 }
 
 func allowedXMLDeclarations(body string, order utf16Order) bool {
-	for strings.Contains(body, "<?") {
-		match := xmlDeclaration.FindStringIndex(body)
-		if match == nil {
-			break
-		}
-		if enc := xmlEncoding.FindStringSubmatch(body[match[0]:match[1]]); enc != nil && !allowedTextEncoding(enc[1]+enc[2], order) {
-			return false
-		}
-		body = body[match[1]:]
+	body = strings.TrimLeft(strings.TrimPrefix(strings.TrimLeft(body, " \t\r\n"), "\xef\xbb\xbf"), " \t\r\n")
+	if !strings.HasPrefix(body, "<?") {
+		return true
 	}
-	return true
+	match := xmlDeclaration.FindStringIndex(body)
+	if match == nil {
+		return true
+	}
+	enc := xmlEncoding.FindStringSubmatch(body[:match[1]])
+	return enc == nil || allowedTextEncoding(enc[1]+enc[2], order)
 }
 
 func textMedia(media string) bool {
@@ -53,13 +52,15 @@ func textMedia(media string) bool {
 		return true
 	}
 	switch media {
-	case "application/xml", "application/xml-dtd", "application/json", "application/json-seq", "application/x-ndjson", "application/x-www-form-urlencoded", "application/javascript", "application/yaml", "application/x-yaml":
+	case "application/xml", "application/xml-dtd", "application/xml-external-parsed-entity",
+		"application/json", "application/json-seq", "application/x-ndjson",
+		"application/x-www-form-urlencoded", "application/javascript", "application/yaml", "application/x-yaml":
 		return true
 	}
 	return false
 }
 
-func textScanView(body, media string, params map[string]string, binaryBody bool, field string, budget *int) (string, utf16Order, error) {
+func textScanView(body string, params map[string]string, field string, budget *int) (string, utf16Order, error) {
 	blocked := func() (string, utf16Order, error) {
 		return "", nil, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 	}
@@ -114,7 +115,7 @@ func textScanView(body, media string, params map[string]string, binaryBody bool,
 			text.WriteRune(u)
 		}
 		body = text.String()
-	} else if !strings.HasPrefix(media, "multipart/") && (!binaryBody || declared || textMedia(media)) && !utf8.ValidString(body) {
+	} else if !utf8.ValidString(body) {
 		return blocked()
 	}
 	if !allowedXMLDeclarations(body, order) {

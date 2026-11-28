@@ -335,6 +335,8 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 	} else if media == "application/zlib" || !declaredJSON && len(body) >= 2 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0 {
 		encoding = "deflate"
 	}
+	_, declaredCharset := params["charset"]
+	scanText := encoding == "" && (declaredCharset || textMedia(media) || !binaryBody && media != "application/octet-stream")
 	var order utf16Order
 	if encoding == "" {
 		switch media {
@@ -351,17 +353,19 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 			strings.HasPrefix(body, "Rar!\x1a\x07") || (len(body) >= 262 && body[257:262] == "ustar")) {
 			return "", false, unsupportedBody(field)
 		}
-		originalLen := len(body)
-		body, order, err = textScanView(body, media, params, binaryBody, field, budget)
-		if err != nil {
-			return "", false, err
-		}
-		if order != nil && redact {
-			defer func() {
-				if changed && err == nil {
-					out = encodeUTF16Body(out, order, originalLen)
-				}
-			}()
+		if scanText {
+			originalLen := len(body)
+			body, order, err = textScanView(body, params, field, budget)
+			if err != nil {
+				return "", false, err
+			}
+			if order != nil && redact {
+				defer func() {
+					if changed && err == nil {
+						out = encodeUTF16Body(out, order, originalLen)
+					}
+				}()
+			}
 		}
 	}
 	entityField := field
@@ -377,7 +381,7 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		}
 		*budget -= len(body)
 		stripped := strings.ReplaceAll(body, "\x00", "")
-		if encoding == "" && !allowedXMLDeclarations(stripped, order) {
+		if scanText && !allowedXMLDeclarations(stripped, order) {
 			return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 		}
 		if err := scanBodyEntities(stripped, entityField, false, budget); err != nil {
@@ -387,6 +391,9 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 			return "", false, err
 		}
 	}
+	if encoding == "" && !scanText && (strings.HasPrefix(body, "\xff\xfe") || strings.HasPrefix(body, "\xfe\xff") || strings.HasPrefix(body, "\x00\x00\xfe\xff")) {
+		return "", false, unsupportedBody(field)
+	}
 	if strings.HasPrefix(media, "message/") || media == "multipart/digest" {
 		return "", false, unsupportedBody(field)
 	}
@@ -394,6 +401,9 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		innerType := contentType
 		if media == "application/gzip" || media == "application/x-gzip" || media == "application/zlib" {
 			innerType = ""
+			if declaredCharset {
+				innerType = mime.FormatMediaType("text/plain", map[string]string{"charset": params["charset"]})
+			}
 		}
 		if _, _, err := scanBodyBudgetDepth(body, false, encoding, innerType, "", field, false, budget, depth+1, binaryBody); err != nil {
 			return "", false, err
@@ -436,8 +446,7 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 				}
 			}
 			var source io.Reader = p
-			partTransfer := strings.ToLower(strings.TrimSpace(p.Header.Get("Content-Transfer-Encoding")))
-			switch partTransfer {
+			switch strings.ToLower(strings.TrimSpace(p.Header.Get("Content-Transfer-Encoding"))) {
 			case "", "binary", "8bit", "7bit":
 			case "base64":
 				source = base64.NewDecoder(base64.StdEncoding, p)
@@ -456,10 +465,13 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 			}
 			*budget -= len(data)
 			ct := p.Header.Get("Content-Type")
+			if ct == "" {
+				ct = "text/plain"
+			}
 			if err = checkBodyEncoding(ct, "", field, budget); err != nil {
 				return "", false, err
 			}
-			if _, _, err = scanContentBudget(string(data), ct, field, false, depth+1, budget, partTransfer == "base64" || partTransfer == "binary"); err != nil {
+			if _, _, err = scanContentBudget(string(data), ct, field, false, depth+1, budget, true); err != nil {
 				return "", false, err
 			}
 		}

@@ -214,11 +214,12 @@ func TestTapeExportFitsBodyBudgets(t *testing.T) {
 }
 
 func TestEncodeExportBoundsBinaryAndUTF8Bodies(t *testing.T) {
-	for _, body := range []string{
-		strings.Repeat("界", 30000),
-		strings.Repeat("\x00\xff\"", 30000),
+	for _, tc := range []struct{ body, media string }{
+		{strings.Repeat("界", 30000), "text/plain"},
+		{strings.Repeat("\x00\xff\"", 30000), "application/octet-stream"},
 	} {
-		original := &tape.HTTP{Method: "POST", Path: "/", Body: body}
+		body := tc.body
+		original := &tape.HTTP{Method: "POST", Path: "/", Body: body, Headers: map[string]string{"Content-Type": tc.media}}
 		doc := tape.Tape{Version: 1, Script: []tape.Step{{HTTP: original}}}
 		data, err := encodeExport(&doc, 64<<10)
 		if err != nil {
