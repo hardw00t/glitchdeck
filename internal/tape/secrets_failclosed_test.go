@@ -77,3 +77,39 @@ func TestScannerFormReconstructionUsesSharedBudget(t *testing.T) {
 		t.Fatalf("redaction = %q, changed=%v, budget=%d, err=%v", out, changed, budget, err)
 	}
 }
+
+func TestScannerSSEAndHeaderAllocations(t *testing.T) {
+	sseBody := strings.Repeat("\n", 100000)
+	header := strings.Repeat(";", 100000)
+	for _, tc := range []struct {
+		name string
+		run  func()
+	}{
+		{"sse", func() {
+			_, _, _ = scanBodyText(sseBody, "text/event-stream", "$.body", false)
+		}},
+		{"header", func() {
+			budget := 64 << 20
+			_, _, _ = scanHeader("X-Test", header, "$.headers", false, &budget)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := testing.Benchmark(func(b *testing.B) {
+				for i := 0; i < b.N; i++ {
+					tc.run()
+				}
+			})
+			if got := result.AllocedBytesPerOp(); got > 2<<20 {
+				t.Fatalf("allocated %d bytes for separator-heavy input", got)
+			}
+		})
+	}
+}
+
+func TestScannerSSEBufferBudget(t *testing.T) {
+	body := strings.Repeat("\n", 1000)
+	budget := 1000
+	if _, _, err := scanContentBudget(body, "text/event-stream", "$.body", false, 0, &budget); err == nil {
+		t.Fatal("SSE buffers exceeded work budget")
+	}
+}

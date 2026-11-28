@@ -221,3 +221,87 @@ func TestScannerSSEPrivateKeyPayload(t *testing.T) {
 		t.Fatal("private key payload retained")
 	}
 }
+
+func TestScannerEscapedSSEPrivateKey(t *testing.T) {
+	body := "data: \"\\u002d----BEGIN PRIVATE\\u0020KEY-----\"\ndata: sensitive-payload\ndata: \"-----END PRIVATE\\u0020KEY-----\"\n\n"
+	out, _, err := scanBodyText(body, "text/event-stream", "$.body", true)
+	if err == nil && strings.Contains(out, "sensitive-payload") {
+		t.Fatal("escaped private key payload retained")
+	}
+}
+
+func TestScannerEscapedSSEPrivateKeyAfterOtherSecret(t *testing.T) {
+	body := "data: \"sk-ant-secret \\u002d----BEGIN PRIVATE\\u0020KEY-----\"\ndata: sensitive-payload\ndata: \"-----END PRIVATE\\u0020KEY-----\"\n\n"
+	out, _, err := scanBodyText(body, "text/event-stream", "$.body", true)
+	if err == nil && strings.Contains(out, "sensitive-payload") {
+		t.Fatal("escaped private key payload retained after another secret")
+	}
+}
+
+func TestScannerHeaderQueryAndSafeFields(t *testing.T) {
+	for _, name := range []string{"Link", "Refresh", "X-Custom"} {
+		in := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{name: "</?x=Bearer+eyJabc>"}}}}}
+		if _, err := PrepareExport(in, false); err == nil {
+			t.Fatalf("%s query was not scanned", name)
+		}
+		out, err := PrepareExport(in, true)
+		if err == nil && strings.Contains(out.Script[0].HTTP.Headers[name], "eyJabc") {
+			t.Fatalf("%s retained credential", name)
+		}
+	}
+	secret := "sk-ant-secret-name"
+	body := "--x\r\n" + secret + ": value\r\n\r\nok\r\n--x--\r\n"
+	_, _, err := scanBodyText(body, "multipart/form-data; boundary=x", "$.body", false)
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("unsafe diagnostic: %v", err)
+	}
+}
+
+func TestScannerRedactsDispositionFilename(t *testing.T) {
+	in := Tape{Script: []Step{{HTTP: &HTTP{Headers: map[string]string{"Content-Disposition": `attachment; filename="sk-ant-secret.txt"`}}}}}
+	out, err := PrepareExport(in, true)
+	if err != nil || strings.Contains(out.Script[0].HTTP.Headers["Content-Disposition"], "sk-ant-secret") {
+		t.Fatalf("filename not redacted: %v", err)
+	}
+}
+
+func TestScannerBlocksCompressedContainers(t *testing.T) {
+	for _, tc := range []struct{ ct, body string }{
+		{"application/zip", "anything"},
+		{"application/x-bzip2", "anything"}, {"application/x-xz", "anything"},
+		{"application/zstd", "anything"}, {"application/x-7z-compressed", "anything"},
+		{"application/octet-stream", "PK\x03\x04compressed"},
+	} {
+		_, _, err := scanBody(tc.body, false, "", tc.ct, "", "$.body", true)
+		var blocked *ExportBlockedError
+		if !errors.As(err, &blocked) || blocked.Kind != "unsupported_encoding" {
+			t.Fatalf("%s: expected unsupported encoding, got %v", tc.ct, err)
+		}
+	}
+}
+
+func TestScannerCompressedMediaAndMagic(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		newWriter func(io.Writer) io.WriteCloser
+		media     string
+	}{
+		{"gzip", func(w io.Writer) io.WriteCloser { return gzip.NewWriter(w) }, "application/gzip"},
+		{"zlib", func(w io.Writer) io.WriteCloser { return zlib.NewWriter(w) }, "application/zlib"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, payload := range []string{"ordinary", "sk-ant-secret"} {
+				var compressed bytes.Buffer
+				w := tc.newWriter(&compressed)
+				_, _ = io.WriteString(w, payload)
+				_ = w.Close()
+				for _, media := range []string{tc.media, "text/plain", "application/octet-stream"} {
+					_, _, err := scanBody(compressed.String(), false, "", media, "", "$.body", true)
+					if (err != nil) != (payload != "ordinary") {
+						t.Fatalf("%s payload %q: %v", media, payload, err)
+					}
+				}
+			}
+		})
+	}
+}

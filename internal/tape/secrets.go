@@ -220,6 +220,10 @@ func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string
 	changed := false
 	var scanErr error
 	if strings.Contains(s, `\`) {
+		if len(s) > *budget/4 {
+			return "", false, unsupportedBody(field)
+		}
+		*budget -= 4 * len(s)
 		inString, escaped, hasEscape := false, false, false
 		for i := range s {
 			if !inString {
@@ -266,6 +270,10 @@ func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string
 		query = strings.IndexByte(s, '?')
 	}
 	if strings.Contains(s, "%") || (strings.Contains(s, "+") && (query >= 0 || strings.HasSuffix(field, ".form") || strings.HasSuffix(field, ".location"))) {
+		if len(s) > *budget/20 {
+			return "", false, unsupportedBody(field)
+		}
+		*budget -= 20 * len(s)
 		var decoded strings.Builder
 		var starts []int
 		if redact {
@@ -315,19 +323,26 @@ func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string
 				return "", false, unsupportedBody(field)
 			}
 			for _, p := range secretPatterns {
-				matches := p.re.FindAllStringIndex(d, -1)
-				if len(matches) == 0 {
+				match := p.re.FindStringIndex(d)
+				if match == nil {
 					continue
 				}
 				if !redact || strings.Contains(d, `\`) {
 					return "", false, &ExportBlockedError{Kind: p.kind, Field: field}
 				}
+				if len(s) > *budget/2 {
+					return "", false, unsupportedBody(field)
+				}
+				*budget -= 2 * len(s)
 				var b strings.Builder
-				last := 0
-				for _, m := range matches {
-					b.WriteString(s[last:starts[m[0]]])
+				b.Grow(2 * len(s))
+				last, offset := 0, 0
+				for match != nil {
+					from, to := offset+match[0], offset+match[1]
+					b.WriteString(s[last:starts[from]])
 					b.WriteString("REDACTED")
-					last = starts[m[1]]
+					last, offset = starts[to], to
+					match = p.re.FindStringIndex(d[offset:])
 				}
 				b.WriteString(s[last:])
 				s = b.String()
@@ -409,7 +424,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 			if !f.IsExported() {
 				continue
 			}
-			name := strings.Split(f.Tag.Get("json"), ",")[0]
+			name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
 			if name == "" {
 				name = f.Name
 			}
@@ -567,10 +582,17 @@ func scanBody(body string, encoded bool, encoding, contentType, transfer, field 
 }
 
 func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int) (string, bool, error) {
+	return scanBodyBudgetDepth(body, encoded, encoding, contentType, transfer, field, redact, budget, 0)
+}
+
+func scanBodyBudgetDepth(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int, depth int) (string, bool, error) {
+	if depth > 8 {
+		return "", false, unsupportedBody(field)
+	}
 	blocked := func() (string, bool, error) {
 		return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
 	}
-	if err := checkBodyEncoding(contentType, transfer, field); err != nil {
+	if err := checkBodyEncoding(contentType, transfer, field, budget); err != nil {
 		return "", false, err
 	}
 	if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
@@ -579,6 +601,10 @@ func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, 
 	if body == "" {
 		return body, false, nil
 	}
+	if len(body) > *budget {
+		return blocked()
+	}
+	*budget -= len(body)
 	raw := []byte(body)
 	if encoded {
 		if base64.StdEncoding.DecodedLen(len(body)) > *budget+2 {
@@ -608,7 +634,7 @@ func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, 
 		}
 		if err == nil {
 			for _, metadata := range []string{g.Name, g.Comment, string(g.Extra)} {
-				if _, _, e := scanText(metadata, field, false); e != nil {
+				if _, _, e := scanTextDepth(metadata, field, false, 0, budget); e != nil {
 					g.Close()
 					return "", false, e
 				}
@@ -638,7 +664,7 @@ func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, 
 		}
 		*budget -= len(raw)
 	}
-	clean, changed, err := scanContentBudget(string(raw), contentType, field, redact, 0, budget)
+	clean, changed, err := scanContentBudget(string(raw), contentType, field, redact, depth, budget)
 	if err != nil {
 		return "", false, err
 	}
