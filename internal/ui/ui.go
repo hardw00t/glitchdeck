@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"sync"
@@ -60,6 +61,11 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	} else {
 		c.rec = &recorder{ignoreJSONPaths: slices.Clone(opts.IgnoreJSONPaths)}
 		c.rec.attach(p)
+	}
+	if demo, err := url.Parse(opts.DemoURL); err == nil && demo.Scheme == "http" {
+		c.rec.mu.Lock()
+		c.rec.demoHTTPAuthority = demo.Host
+		c.rec.mu.Unlock()
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {

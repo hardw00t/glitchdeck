@@ -3,8 +3,10 @@ package ui
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
@@ -180,5 +182,53 @@ func TestSyntheticIneligibleExchangeInMixedTape(t *testing.T) {
 	r.response(proxy.ResponseRecord{Seq: 2, Intentional: true})
 	if doc := r.tape(fault.Config{}); doc.Version != 3 || doc.Incomplete {
 		t.Fatalf("synthetic HTTP/2: %+v", doc)
+	}
+}
+
+func TestResponseCaptureSlots(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	for seq := uint64(1); seq <= 32; seq++ {
+		if !r.shouldCaptureResponse(seq) {
+			t.Fatalf("slot %d rejected", seq)
+		}
+	}
+	if r.shouldCaptureResponse(33) || !r.status().Incomplete {
+		t.Fatal("capture limit did not reject and mark incomplete")
+	}
+	r.response(proxy.ResponseRecord{Seq: 1})
+	if !r.shouldCaptureResponse(34) {
+		t.Fatal("completed capture did not release slot")
+	}
+	r.stop()
+	r.start(34, 0, fault.Config{})
+	if !r.shouldCaptureResponse(35) {
+		t.Fatal("stop did not release slots")
+	}
+}
+
+func TestCassetteKeyDoesNotRetainRedactedQuery(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	raw := "http://example.com/path?token=" + strings.Repeat("x", 4096)
+	r.request(proxy.Record{Seq: 1, Method: "GET", URL: raw})
+	key := r.entries[0].cassette.Request
+	start := uintptr(unsafe.Pointer(unsafe.StringData(raw)))
+	end := start + uintptr(len(raw))
+	for _, value := range []string{key.Host, key.Path} {
+		ptr := uintptr(unsafe.Pointer(unsafe.StringData(value)))
+		if ptr >= start && ptr < end {
+			t.Fatal("cassette key retains unredacted URL backing storage")
+		}
+	}
+}
+
+func TestComplexJSONRequestMarksRecordingIncomplete(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	body := "[" + strings.Repeat("0,", 32769) + "0]"
+	r.request(proxy.Record{Seq: 1, Method: "POST", Path: "/", Body: []byte(body)})
+	if !r.status().Incomplete {
+		t.Fatal("complex JSON request recorded as a wildcard")
 	}
 }

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/demo"
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
+	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
 
@@ -131,5 +134,59 @@ func TestDemoStreamDoesNotExposeProviderError(t *testing.T) {
 	got := c.readDemoStream(context.Background(), "error", streamInput{Flavor: "openai", MaxMS: 5000, WedgeAfterMS: 1000})
 	if got.Outcome != "error" || got.ClientError == "" || len(got.ClientError) > 256 || strings.Contains(got.ClientError, "secret-credential") {
 		t.Fatalf("unsafe error: %+v", got)
+	}
+}
+
+func TestDemoConsoleRecordsAbsoluteTargetForReplay(t *testing.T) {
+	upstream := httptest.NewServer(demo.New())
+	defer upstream.Close()
+	target, err := proxy.ParseTarget(upstream.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := telemetry.New()
+	p := proxy.New(target, fault.Config{Seed: 1}, bus)
+	defer p.Close()
+	p.SetOptions(proxy.Options{Demo: true})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	handler := New(p, bus, Options{Target: upstream.URL, DemoURL: upstream.URL})
+	start := httptest.NewRequest("POST", "/api/tape/record", nil)
+	start.RemoteAddr = "127.0.0.1:1234"
+	start.Host = "localhost"
+	handler.ServeHTTP(httptest.NewRecorder(), start)
+	go p.Serve(ln)
+	proxyURL := "http://" + ln.Addr().String()
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(parsed)}}
+	resp, err := client.Get(upstream.URL + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if err := p.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	export := httptest.NewRequest("GET", "/api/tape/export", nil)
+	export.RemoteAddr = "127.0.0.1:1234"
+	export.Host = "localhost"
+	handler.ServeHTTP(w, export)
+	doc, err := tape.Decode(strings.NewReader(w.Body.String()))
+	if err != nil {
+		t.Fatalf("export: %v: %s", err, w.Body.String())
+	}
+	if len(doc.Cassettes) != 1 || doc.Cassettes[0].Request.Host != "" {
+		t.Fatalf("demo cassette: %+v", doc.Cassettes)
+	}
+	if _, report, err := tape.RunReplay(context.Background(), doc, "", "", false); err != nil || report.CassetteError != nil {
+		t.Fatalf("replay: %+v, %v", report, err)
 	}
 }

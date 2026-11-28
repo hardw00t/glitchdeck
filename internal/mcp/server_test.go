@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -409,5 +410,39 @@ func TestDemoTriggerReportsTransportFailure(t *testing.T) {
 	result, _ := s.call("demo_trigger", []byte(`{"action":"checkout"}`))
 	if result["error"] == "" || result["error"] == nil {
 		t.Fatal(result)
+	}
+}
+
+func TestDemoRecordingAbsoluteTargetReplays(t *testing.T) {
+	s := NewServer(nil, nil, Options{})
+	result, paramErr := s.call("proxy_start", []byte(`{"target":"demo","record":true}`))
+	if paramErr != nil || s.recording == nil {
+		t.Fatalf("start: %v %v", result, paramErr)
+	}
+	defer s.stop()
+	proxyURL, err := url.Parse(s.proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := client.Get(s.target + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if err := s.p.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := s.recording.Export("demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc.Target = "demo"
+	if len(doc.Cassettes) != 1 || doc.Cassettes[0].Request.Host != "" {
+		t.Fatalf("demo cassette: %+v", doc.Cassettes)
+	}
+	if _, report, err := tape.RunReplay(context.Background(), doc, "", "", false); err != nil || report.CassetteError != nil {
+		t.Fatalf("replay: %+v, %v", report, err)
 	}
 }

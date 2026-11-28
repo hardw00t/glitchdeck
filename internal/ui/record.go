@@ -16,8 +16,10 @@ import (
 )
 
 const (
-	maxEntries     = 256
-	maxRecordBytes = 8 << 20
+	maxEntries = 256
+	// Bound concurrent capture pipes, decoders, and goroutines.
+	maxCaptureSlots = 32
+	maxRecordBytes  = 8 << 20
 )
 
 const pendingBodyReason = "recording ended with request bodies still in flight"
@@ -157,6 +159,10 @@ func (r *recorder) shouldCaptureResponse(seq uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.running || seq <= r.startSeq {
+		return false
+	}
+	if !r.pendingResponses[seq] && len(r.pendingResponses) >= maxCaptureSlots {
+		r.markIncomplete("response capture limit exceeded")
 		return false
 	}
 	r.pendingResponses[seq] = true
@@ -319,6 +325,7 @@ func (r *recorder) stop() recordingStatus {
 		if len(r.pendingResponses) != 0 {
 			r.markIncomplete("recording ended with responses still in flight")
 		}
+		clear(r.pendingResponses)
 	}
 	return r.snapshot()
 }
@@ -441,6 +448,7 @@ func (r *recorder) request(req proxy.Record) {
 			r.forwardWarning = true
 		}
 	}
+	req.Path, req.URL = redactQuery(req.Path), redactQuery(req.URL)
 	requestPath := req.Path
 	host := ""
 	demoScheme := ""
@@ -456,7 +464,6 @@ func (r *recorder) request(req proxy.Record) {
 	} else if u, err := url.ParseRequestURI(requestPath); err == nil {
 		requestPath = u.EscapedPath()
 	}
-	req.Path, req.URL = redactQuery(req.Path), redactQuery(req.URL)
 	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE, probe: req.AssertionProbe, demoScheme: demoScheme}
 	if req.WebSocket {
 		if req.MITM || req.URL != "" {
@@ -469,7 +476,11 @@ func (r *recorder) request(req proxy.Record) {
 		r.streams[req.Seq] = e
 	} else {
 		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body)}
-		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host, BodySHA256: tape.BodySHA256(req.Body, r.ignoreJSONPaths)}}
+		digest := tape.BodySHA256(req.Body, r.ignoreJSONPaths)
+		if digest == "" {
+			r.markIncomplete("request body exceeds JSON matching complexity")
+		}
+		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host, BodySHA256: digest}}
 		if req.URL != "" {
 			e.http.Path = ""
 		}

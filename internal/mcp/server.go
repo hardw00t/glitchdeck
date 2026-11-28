@@ -452,6 +452,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		if a.Record {
 			s.recording = ui.NewRecorder()
 			s.recording.SetCassetteMetadata(target, ignoreJSONPaths)
+			if s.isDemo {
+				s.recording.SetDemoHTTPAuthority(u.Host)
+			}
 			s.recording.Start(s.p)
 		}
 		go s.p.Serve(l)
