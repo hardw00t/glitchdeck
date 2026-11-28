@@ -11,9 +11,9 @@ import (
 
 type replayListenerOriginKey struct{}
 
-// WithReplayListenerOrigin marks a request received directly by a replay target listener.
-func WithReplayListenerOrigin(r *http.Request) *http.Request {
-	return r.WithContext(context.WithValue(r.Context(), replayListenerOriginKey{}, true))
+// WithReplayListenerOrigin records a verified physical replay endpoint.
+func WithReplayListenerOrigin(r *http.Request, origin string) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), replayListenerOriginKey{}, origin))
 }
 
 func filterReplayLocation(r *http.Request, header http.Header) {
@@ -31,10 +31,21 @@ func filterReplayLocation(r *http.Request, header http.Header) {
 	if err != nil || raw == "" || dest.User != nil || dest.Opaque != "" || strings.HasPrefix(raw, "///") {
 		return
 	}
-	direct := r.Context().Value(replayListenerOriginKey{}) == true
+	origin, direct := r.Context().Value(replayListenerOriginKey{}).(string)
 	scheme := "http"
-	if direct && r.TLS != nil {
-		scheme = "https"
+	if direct {
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return
+		}
+		host, port, err := net.SplitHostPort(u.Host)
+		ip := net.ParseIP(host)
+		n, portErr := strconv.ParseUint(port, 10, 16)
+		if err != nil || ip == nil || !ip.IsLoopback() || portErr != nil || n == 0 {
+			return
+		}
+		local = &net.TCPAddr{IP: ip, Port: int(n)}
+		scheme = u.Scheme
 	}
 	if !dest.IsAbs() {
 		if !direct && (r.URL.IsAbs() || r.TLS != nil) {

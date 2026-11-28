@@ -28,6 +28,7 @@ import (
 
 	"github.com/hardw00t/glitchdeck/internal/demo"
 	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/localweb"
 	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
@@ -285,7 +286,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 	}
 	var demoHandler http.Handler
 	if replay && target == "demo" {
-		target = "http://demo.glitchdeck.invalid"
+		target = "http://127.0.0.1"
 	}
 	if !replay && target == "demo" {
 		al, e := net.Listen("tcp", "127.0.0.1:0")
@@ -348,9 +349,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 	if replay {
 		opts.CassetteUpstream = t.CassetteUpstream()
 		opts.RewriteRequest = func(r *http.Request) {
-			if demoTLSPhysical != "" && r.URL.Host == demoTLSPhysical {
-				r.URL.Host, r.Host = "localhost", "localhost"
-			} else if targetPhysical != "" && r.URL.Host == targetPhysical {
+			local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+			direct := local != nil && (local.String() == targetPhysical || local.String() == demoTLSPhysical)
+			if demoTLSPhysical != "" && (r.URL.Scheme == "https" && r.URL.Host == demoTLSPhysical || direct && local.String() == demoTLSPhysical) {
+				*r = *proxy.WithReplayListenerOrigin(r, "https://"+demoTLSPhysical)
+				r.URL.Scheme, r.URL.Host, r.Host = "https", "localhost", "localhost"
+			} else if targetPhysical != "" && (r.URL.Scheme == parsed.Scheme && r.URL.Host == targetPhysical || direct && local.String() == targetPhysical) {
+				*r = *proxy.WithReplayListenerOrigin(r, parsed.Scheme+"://"+targetPhysical)
 				r.URL.Scheme, r.URL.Host, r.Host = parsed.Scheme, parsed.Host, parsed.Host
 			}
 		}
@@ -494,6 +499,14 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		proxyURL = "http://glitchdeck:" + opts.ProxyAuth + "@" + listenerAddr
 	}
 	p.SetOptions(opts)
+	authorizeReplayListener := func(w http.ResponseWriter, r *http.Request) bool {
+		bind, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if bind == nil || !localweb.Allowed(r, bind.String()) {
+			http.Error(w, "untrusted proxy host or origin", http.StatusForbidden)
+			return false
+		}
+		return true
+	}
 	childTarget := target
 	if replay && parsed != nil {
 		physical, listenErr := net.Listen("tcp", "127.0.0.1:0")
@@ -502,8 +515,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		}
 		defer physical.Close()
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r = proxy.WithReplayListenerOrigin(r)
-			r.URL.Scheme, r.URL.Host, r.Host = parsed.Scheme, parsed.Host, parsed.Host
+			if !authorizeReplayListener(w, r) {
+				return
+			}
+			r = proxy.WithReplayListenerOrigin(r, parsed.Scheme+"://"+targetPhysical)
 			p.ServeHTTP(w, r)
 		})
 		server := &http.Server{Handler: handler}
@@ -533,8 +548,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 			return finish(3, "CA_ERROR", certErr)
 		}
 		server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r = proxy.WithReplayListenerOrigin(r)
-			r.URL.Scheme, r.URL.Host, r.Host = "https", "localhost", "localhost"
+			if !authorizeReplayListener(w, r) {
+				return
+			}
+			r = proxy.WithReplayListenerOrigin(r, "https://"+demoTLSPhysical)
 			p.ServeHTTP(w, r)
 		}), TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}}
 		defer server.Close()
