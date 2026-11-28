@@ -102,3 +102,39 @@ func TestPassthroughExecChildCreatesReportDirectory(t *testing.T) {
 		t.Fatalf("exit=%d output=%s report=%s err=%v", code, out, data, err)
 	}
 }
+
+func TestReplayParseErrorDoesNotReplaceInput(t *testing.T) {
+	for _, command := range []string{"exec", "test"} {
+		t.Run(command, func(t *testing.T) {
+			input := filepath.Join(t.TempDir(), "input")
+			const original = "version: 2\ntarget: demo\n"
+			if err := os.WriteFile(input, []byte(original), 0600); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"test", "--json", "--report", input, "--unknown", "--mode", "replay", input}
+			if command == "exec" {
+				args = []string{"exec", "--json", "--tape", input, "--report", input, "--unknown", "--mode", "replay", "--", "true"}
+			}
+			code, _ := launchOutput(t, args...)
+			if data, err := os.ReadFile(input); code != 2 || err != nil || string(data) != original {
+				t.Fatalf("exit=%d input=%q err=%v", code, data, err)
+			}
+		})
+	}
+}
+
+func TestExecEffectivePassthroughModeRefreshesReport(t *testing.T) {
+	dir := t.TempDir()
+	input, report := filepath.Join(dir, "missing"), filepath.Join(dir, "report")
+	if err := os.WriteFile(report, []byte(`{"ok":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	code, _ := launchOutput(t, "exec", "--tape", input, "--report", report, "--mode", "record", "--mode", "passthrough", "--", "true")
+	data, err := os.ReadFile(report)
+	var got struct {
+		ExitCode int `json:"exit_code"`
+	}
+	if code != 2 || err != nil || json.Unmarshal(data, &got) != nil || got.ExitCode != 2 {
+		t.Fatalf("exit=%d report=%s err=%v", code, data, err)
+	}
+}

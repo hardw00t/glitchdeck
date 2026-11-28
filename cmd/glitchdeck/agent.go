@@ -78,14 +78,7 @@ func execCommand(args []string) int {
 	if sep >= 0 {
 		options = args[:sep]
 	}
-	recordRequested := false
-	for i, arg := range options {
-		if arg == "--mode=record" || arg == "-mode=record" ||
-			(arg == "--mode" || arg == "-mode") && i+1 < len(options) && options[i+1] == "record" {
-			recordRequested = true
-			break
-		}
-	}
+	recordRequested := requestsMode(f, options, "record")
 	if wantJSON || recordRequested {
 		f.SetOutput(io.Discard)
 	}
@@ -94,8 +87,8 @@ func execCommand(args []string) int {
 	}
 	var reportDestination *execrun.Destination
 	var reportSafe func() error
+	var legacyReport bool
 	emit := func(e execrun.Envelope) int {
-		legacyReport := !recordRequested && o.Mode == "passthrough" && o.TapeOut == ""
 		if *report != "" && (legacyReport || reportDestination != nil) {
 			var err error
 			if legacyReport {
@@ -182,6 +175,11 @@ func execCommand(args []string) int {
 		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
 	}
 	usageErr := f.Parse(args[:sep])
+	if usageErr == nil {
+		recordRequested = o.Mode == "record"
+	}
+	legacyReport = o.Mode == "passthrough" &&
+		(usageErr == nil || !recordRequested && !requestsMode(f, options, "replay"))
 	if usageErr == nil && (*path == "" || f.NArg() != 0 || sep+1 == len(args) || o.Timeout <= 0 || o.Grace <= 0) {
 		usageErr = errors.New("expected --tape, positive timeout and grace, and -- <command>")
 	}

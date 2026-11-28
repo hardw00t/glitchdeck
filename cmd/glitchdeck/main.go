@@ -100,6 +100,31 @@ func showCommandHelp(f *flag.FlagSet, args []string, usage string) bool {
 	return false
 }
 
+func requestsMode(f *flag.FlagSet, args []string, mode string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			continue
+		}
+		name, value, assigned := strings.Cut(strings.TrimPrefix(arg[1:], "-"), "=")
+		if !assigned {
+			if option := f.Lookup(name); option != nil && i+1 < len(args) {
+				if b, ok := option.Value.(interface{ IsBoolFlag() bool }); !ok || !b.IsBoolFlag() {
+					i++
+					value = args[i]
+				}
+			}
+		}
+		if name == "mode" && value == mode {
+			return true
+		}
+	}
+	return false
+}
+
 func testTape(args []string) int {
 	f := flag.NewFlagSet("test", flag.ContinueOnError)
 	wantJSON := cli.JSONRequested(args)
@@ -126,6 +151,7 @@ func testTape(args []string) int {
 	var runReport tape.RunReport
 	var reportDestination *execrun.Destination
 	var reportSafe func() error
+	var legacyReport bool
 	writeReport := func(e execrun.Envelope) error {
 		if *mode == "passthrough" {
 			return execrun.WriteReport(*report, e)
@@ -146,7 +172,7 @@ func testTape(args []string) int {
 		if runReport.CassetteError != nil && runReport.CassetteError != err {
 			e.Diff = append(e.Diff, runReport.CassetteError.Error())
 		}
-		if *report != "" && (*mode == "passthrough" || reportDestination != nil) {
+		if *report != "" && (legacyReport || reportDestination != nil) {
 			if err := writeReport(e); err != nil {
 				fmt.Fprintln(os.Stderr, err)
 			}
@@ -165,6 +191,7 @@ func testTape(args []string) int {
 		return 2
 	}
 	usageErr := f.Parse(flags)
+	legacyReport = *mode == "passthrough" && (usageErr == nil || !requestsMode(f, flags, "replay"))
 	if usageErr == nil && (filename == "" || *timeout <= 0) {
 		usageErr = errors.New(testUsage)
 	}
