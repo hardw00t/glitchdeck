@@ -11,6 +11,7 @@ import (
 	"io"
 	"mime"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -175,6 +176,7 @@ func TestScannerExportWorkLimit(t *testing.T) {
 }
 
 func TestScannerCompressedExpansionLimit(t *testing.T) {
+	t.Parallel()
 	var compressed bytes.Buffer
 	w := gzip.NewWriter(&compressed)
 	_, _ = w.Write(bytes.Repeat([]byte("x"), 4<<20))
@@ -184,11 +186,19 @@ func TestScannerCompressedExpansionLimit(t *testing.T) {
 	if _, err := PrepareExport(Tape{Cassettes: []Cassette{{Response: response}}}, false); err != nil {
 		t.Fatalf("valid 4 MiB gzip: %v", err)
 	}
-	in := Tape{Cassettes: make([]Cassette, 17)}
-	for i := range in.Cassettes {
-		in.Cassettes[i].Response = response
+	compressed.Reset()
+	w = gzip.NewWriter(&compressed)
+	_, _ = w.Write(bytes.Repeat([]byte("x"), 1024))
+	_ = w.Close()
+	response.Body = base64.StdEncoding.EncodeToString(compressed.Bytes())
+	one := Cassette{Response: response}
+	const work = 1 << 20
+	budget := work
+	if _, _, err := scanValue(reflect.ValueOf(Tape{Cassettes: []Cassette{one}}), "$", false, &budget); err != nil {
+		t.Fatalf("one compressed body: %v", err)
 	}
-	if _, err := PrepareExport(in, false); err == nil {
+	budget = 2*(work-budget) - 1
+	if _, _, err := scanValue(reflect.ValueOf(Tape{Cassettes: []Cassette{one, one}}), "$", false, &budget); err == nil {
 		t.Fatal("accepted excessive aggregate expansion")
 	}
 }

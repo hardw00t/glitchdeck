@@ -173,21 +173,25 @@ func legacyLargeInput(raw []byte, partial bool) bool {
 }
 
 func Decode(r io.Reader) (Tape, error) {
+	return decode(r, maxTapeInput, 64<<20)
+}
+
+func decode(r io.Reader, cassetteLimit, rawLimit int) (Tape, error) {
 	var t Tape
-	raw, err := io.ReadAll(io.LimitReader(r, maxTapeInput+1))
+	raw, err := io.ReadAll(io.LimitReader(r, int64(cassetteLimit)+1))
 	if err != nil {
 		return t, err
 	}
-	if len(raw) > maxTapeInput {
+	if len(raw) > cassetteLimit {
 		if !legacyLargeInput(raw, true) {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
-		rest, err := io.ReadAll(io.LimitReader(r, (64<<20)-int64(len(raw))+1))
+		rest, err := io.ReadAll(io.LimitReader(r, int64(rawLimit-len(raw))+1))
 		if err != nil {
 			return t, err
 		}
 		raw = append(raw, rest...)
-		if len(raw) > 64<<20 {
+		if len(raw) > rawLimit {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
 		if !legacyLargeInput(raw, false) {
@@ -207,7 +211,7 @@ func Decode(r io.Reader) (Tape, error) {
 			_ = node.Decode(&version)
 		}
 		if version == 3 {
-			if len(raw) > maxTapeInput {
+			if len(raw) > cassetteLimit {
 				return t, fmt.Errorf("tape exceeds input limit")
 			}
 			if len(yamlItems(yamlField(doc.Content[0], "cassettes"))) > maxCassettes {
@@ -220,7 +224,7 @@ func Decode(r io.Reader) (Tape, error) {
 	if err := d.Decode(&t); err != nil {
 		return t, err
 	}
-	if len(raw) > maxTapeInput && t.Version == 3 {
+	if len(raw) > cassetteLimit && t.Version == 3 {
 		return t, fmt.Errorf("tape exceeds input limit")
 	}
 	var extra any
