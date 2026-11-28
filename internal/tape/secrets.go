@@ -654,6 +654,9 @@ func scanBodyBudgetDepth(body string, encoded bool, encoding, contentType, trans
 	*budget -= len(body)
 	raw := []byte(body)
 	if encoded {
+		if _, _, err := scanTextDepth(body, field, false, 0, budget); err != nil {
+			return "", false, err
+		}
 		if base64.StdEncoding.DecodedLen(len(body)) > *budget+2 {
 			return blocked()
 		}

@@ -8,8 +8,119 @@ import (
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 )
+
+var bodyEntity = regexp.MustCompile(`&(?:amp|lt|gt|quot|apos|#[0-9]+|#[xX][0-9a-fA-F]+);`)
+
+func decodeBodyEntity(entity string) string {
+	switch entity {
+	case "&amp;":
+		return "&"
+	case "&lt;":
+		return "<"
+	case "&gt;":
+		return ">"
+	case "&quot;":
+		return `"`
+	case "&apos;":
+		return "'"
+	}
+	digits, base := entity[2:len(entity)-1], 10
+	if digits[0] == 'x' || digits[0] == 'X' {
+		digits, base = digits[1:], 16
+	}
+	n, err := strconv.ParseUint(digits, base, 32)
+	if err != nil || !(n >= 1 && n <= 0xd7ff || n >= 0xe000 && n <= 0xfffd || n >= 0x10000 && n <= 0x10ffff) {
+		return entity
+	}
+	return string(rune(n))
+}
+
+func checkDerived(raw, decoded, field string, redact bool, budget *int, decode func(string) (string, error)) error {
+	_, _, originalErr := scanTextDepth(decoded, field, false, 0, budget)
+	if originalErr == nil || !redact {
+		return originalErr
+	}
+	cleanRaw, _, err := scanTextDepth(raw, field, true, 0, budget)
+	if err != nil {
+		return err
+	}
+	cleanDecoded, _, err := scanTextDepth(decoded, field, true, 0, budget)
+	if err != nil {
+		return err
+	}
+	// Rewriting the original must remove exactly the same matches in the decoded view.
+	if len(cleanRaw) > *budget {
+		return unsupportedBody(field)
+	}
+	*budget -= len(cleanRaw)
+	derivedClean, err := decode(cleanRaw)
+	if err != nil || derivedClean != cleanDecoded {
+		return originalErr
+	}
+	return nil
+}
+
+func scanBodyEntities(body, field string, redact bool, budget *int) error {
+	if !strings.Contains(body, "&") {
+		return nil
+	}
+	if len(body) > *budget/2 {
+		return unsupportedBody(field)
+	}
+	*budget -= 2 * len(body)
+	decode := func(s string) (string, error) {
+		return bodyEntity.ReplaceAllStringFunc(s, decodeBodyEntity), nil
+	}
+	decoded, _ := decode(body)
+	if decoded != body {
+		return checkDerived(body, decoded, field, redact, budget, decode)
+	}
+	return nil
+}
+
+func decodeHeaderPairs(value string) (string, error) {
+	var decoded strings.Builder
+	decoded.Grow(len(value))
+	inQuote, escapedQuote := false, false
+	for i := 0; i < len(value); i++ {
+		if value[i] == '\\' {
+			i++
+			if i == len(value) || value[i] < 0x20 && value[i] != '\t' || value[i] == 0x7f {
+				return "", unsupportedBody("")
+			}
+			escapedQuote = escapedQuote || inQuote
+		} else if value[i] == '"' {
+			inQuote = !inQuote
+			escapedQuote = false
+		}
+		decoded.WriteByte(value[i])
+	}
+	if inQuote && escapedQuote {
+		return "", unsupportedBody("")
+	}
+	return decoded.String(), nil
+}
+
+func checkHeaderPairs(raw, decoded, field string, redact bool, budget *int) error {
+	return checkDerived(raw, decoded, field, redact, budget, func(clean string) (string, error) {
+		for a, b := raw, clean; ; {
+			_, afterA, hasA := strings.Cut(a, `\`)
+			_, afterB, hasB := strings.Cut(b, `\`)
+			if !hasA && !hasB {
+				break
+			}
+			if afterA == "" || afterB == "" || afterA[0] != afterB[0] {
+				return "", unsupportedBody(field)
+			}
+			a, b = afterA[1:], afterB[1:]
+		}
+		return decodeHeaderPairs(clean)
+	})
+}
 
 func unsupportedBody(field string) error {
 	return &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
@@ -87,35 +198,32 @@ func scanHeader(name, value, field string, redact bool, budget *int) (string, bo
 			return "", false, unsupportedBody(field)
 		}
 		*budget -= 2 * len(value)
-		for i := 0; i < len(value); i++ {
-			if value[i] != '"' {
+		decoded, err := decodeHeaderPairs(value)
+		if err != nil {
+			return "", false, unsupportedBody(field)
+		}
+		for _, suffix := range [...]string{"", ".location", ".form"} {
+			if err := checkHeaderPairs(value, decoded, field+suffix, redact, budget); err != nil {
+				return "", false, err
+			}
+		}
+		for rest := value; rest != ""; {
+			match := quotedString.FindStringIndex(rest)
+			if match == nil {
+				break
+			}
+			part := rest[match[0]:match[1]]
+			rest = rest[match[1]:]
+			if !strings.Contains(part, `\`) {
 				continue
 			}
-			var decoded strings.Builder
-			escaped, closed := false, false
-			for i++; i < len(value); i++ {
-				if value[i] == '"' {
-					closed = true
-					break
-				}
-				if value[i] == '\\' {
-					escaped = true
-					i++
-					if i == len(value) || value[i] < 0x20 && value[i] != '\t' || value[i] == 0x7f {
-						return "", false, unsupportedBody(field)
-					}
-				}
-				decoded.WriteByte(value[i])
-			}
-			if !closed && escaped {
+			inner := part[1 : len(part)-1]
+			decoded, err := decodeHeaderPairs(inner)
+			if err != nil {
 				return "", false, unsupportedBody(field)
 			}
-			if escaped {
-				for _, suffix := range [...]string{"", ".location", ".form"} {
-					if _, _, err := scanTextDepth(decoded.String(), field+suffix, false, 0, budget); err != nil {
-						return "", false, err
-					}
-				}
+			if err := checkHeaderPairs(inner, decoded, field, redact, budget); err != nil {
+				return "", false, err
 			}
 		}
 	}
@@ -212,12 +320,27 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 	if depth > 8 || len(body) > 4<<20 {
 		return "", false, unsupportedBody(field)
 	}
+	if len(contentType) > *budget/32 {
+		return "", false, unsupportedBody(field)
+	}
+	*budget -= 32 * len(contentType)
+	media, params, _ := mime.ParseMediaType(contentType)
+	entityField := field
+	if media == "application/x-www-form-urlencoded" {
+		entityField += ".form"
+	}
+	if err := scanBodyEntities(body, entityField, redact, budget); err != nil {
+		return "", false, err
+	}
 	if strings.ContainsRune(body, 0) {
 		if len(body) > *budget {
 			return "", false, unsupportedBody(field)
 		}
 		*budget -= len(body)
 		stripped := strings.ReplaceAll(body, "\x00", "")
+		if err := scanBodyEntities(stripped, entityField, false, budget); err != nil {
+			return "", false, err
+		}
 		if _, _, err := scanTextDepth(stripped, field, false, 0, budget); err != nil {
 			return "", false, err
 		}
@@ -225,11 +348,6 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 	if strings.HasPrefix(body, "\xff\xfe") || strings.HasPrefix(body, "\xfe\xff") || strings.HasPrefix(body, "\x00\x00\xfe\xff") {
 		return "", false, unsupportedBody(field)
 	}
-	if len(contentType) > *budget/32 {
-		return "", false, unsupportedBody(field)
-	}
-	*budget -= 32 * len(contentType)
-	media, params, _ := mime.ParseMediaType(contentType)
 	if strings.HasPrefix(media, "message/") || media == "multipart/digest" {
 		return "", false, unsupportedBody(field)
 	}
@@ -241,7 +359,11 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		encoding = "deflate"
 	}
 	if encoding != "" {
-		if _, _, err := scanBodyBudgetDepth(body, false, encoding, "", "", field, false, budget, depth+1); err != nil {
+		innerType := contentType
+		if media == "application/gzip" || media == "application/x-gzip" || media == "application/zlib" {
+			innerType = ""
+		}
+		if _, _, err := scanBodyBudgetDepth(body, false, encoding, innerType, "", field, false, budget, depth+1); err != nil {
 			return "", false, err
 		}
 		return body, false, nil
@@ -250,12 +372,13 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 	case "application/zip", "application/x-zip-compressed", "application/x-bzip2", "application/x-bzip",
 		"application/x-xz", "application/zstd", "application/x-zstd",
 		"application/x-7z-compressed", "application/x-tar", "application/x-rar-compressed",
-		"application/vnd.rar":
+		"application/vnd.rar", "application/x-compress", "application/compress", "application/x-lz4", "application/lz4":
 		return "", false, unsupportedBody(field)
 	}
 	if !declaredJSON && (strings.HasPrefix(body, "PK\x03\x04") || strings.HasPrefix(body, "PK\x05\x06") || strings.HasPrefix(body, "PK\x07\x08") ||
 		strings.HasPrefix(body, "BZh") || strings.HasPrefix(body, "\xfd7zXZ\x00") ||
 		strings.HasPrefix(body, "\x28\xb5\x2f\xfd") || strings.HasPrefix(body, "7z\xbc\xaf\x27\x1c") ||
+		strings.HasPrefix(body, "\x1f\x9d") || strings.HasPrefix(body, "\x04\x22\x4d\x18") ||
 		strings.HasPrefix(body, "Rar!\x1a\x07") || (len(body) >= 262 && body[257:262] == "ustar")) {
 		return "", false, unsupportedBody(field)
 	}
