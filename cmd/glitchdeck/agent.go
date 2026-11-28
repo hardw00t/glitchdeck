@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"os"
 	"runtime"
@@ -153,6 +154,10 @@ func execCommand(args []string) int {
 			}
 			message := "invalid record options"
 			switch code {
+			case "USAGE_ERROR":
+				if errors.Is(err, execrun.ErrMissingRecordOutput) {
+					message = execrun.ErrMissingRecordOutput.Error()
+				}
 			case "TAPE_IO":
 				message = "could not access a tape or report destination"
 			case "TAPE_INVALID":
@@ -236,6 +241,7 @@ func execCommand(args []string) int {
 		}
 	}
 	t, err := tape.Decode(file)
+	_ = file.Close()
 	if err != nil {
 		return fail("TAPE_INVALID", err)
 	}
@@ -245,6 +251,13 @@ func execCommand(args []string) int {
 		}
 	})
 	o.Command, o.TapePath, o.JSON, o.UpstreamAllow, o.TLSPassthrough = args[sep+1:], *path, *asJSON, allow, passthrough
+	if o.Mode == "record" {
+		// The standard HTTP transport may log wire bytes on idle connections.
+		logger := log.Default()
+		previous := logger.Writer()
+		logger.SetOutput(io.Discard)
+		defer logger.SetOutput(previous)
+	}
 	return emit(execrun.Run(context.Background(), t, o))
 }
 

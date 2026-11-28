@@ -182,9 +182,6 @@ func (r *recorder) reserveRequestBytes(seq uint64, n int) int {
 		return 0
 	}
 	for len(r.entries) > 0 && n > maxRecordBytes-r.bytes-r.reservedResponseBytes {
-		if r.pendingResponses[r.entries[0].seq] {
-			break
-		}
 		r.dropOldest()
 	}
 	allowed := min(n, max(0, maxRecordBytes-r.bytes-r.reservedResponseBytes))
@@ -202,6 +199,10 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 		return
 	}
 	delete(r.pendingResponses, res.Seq)
+	if res.Truncated {
+		r.bodyTruncated = true
+		r.markIncomplete("recorded response body was truncated")
+	}
 	if res.Status == 0 {
 		if res.Intentional {
 			for _, e := range r.entries {
@@ -238,13 +239,10 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 		size := len(e.cassette.Response.Body)
 		e.bytes += size
 		r.bytes += size
-		if res.Truncated {
-			r.bodyTruncated = true
-			r.markIncomplete("recorded response body was truncated")
-		}
 		r.trim()
 		return
 	}
+	r.markIncomplete("recorded exchange was evicted")
 }
 
 func (r *recorder) markSSE(seq uint64) {
@@ -554,6 +552,9 @@ func (r *recorder) trim() {
 
 func (r *recorder) dropOldest() {
 	old := r.entries[0]
+	if old.cassette != nil && old.cassette.Response.Status != 0 {
+		r.markIncomplete("recorded entries were evicted")
+	}
 	r.entries[0] = nil
 	r.entries = r.entries[1:]
 	delete(r.streams, old.seq)
@@ -704,10 +705,11 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 				if cassetteKeysOverlap(c.Request, e.cassette.Request) {
 					found = true
 					if (!reflect.DeepEqual(c.Response, e.cassette.Response) ||
-						(c.Request.Host == "") != (e.cassette.Request.Host == "") ||
+						!tape.SameAuthority(c.Request.Host, e.cassette.Request.Host, "http") ||
+						!tape.SameAuthority(c.Request.Host, e.cassette.Request.Host, "https") ||
 						(c.Request.BodySHA256 == "") != (e.cassette.Request.BodySHA256 == "")) && !doc.Incomplete {
 						doc.Incomplete = true
-						doc.IncompleteReason = "identical requests produced different responses"
+						doc.IncompleteReason = "overlapping cassette keys are not interchangeable"
 					}
 					break
 				}
@@ -779,14 +781,7 @@ func cassetteKeysOverlap(a, b tape.CassetteRequest) bool {
 	if a.Host == "" || b.Host == "" || strings.EqualFold(a.Host, b.Host) {
 		return true
 	}
-	normalize := func(authority string) string {
-		host, port, err := net.SplitHostPort(authority)
-		if err == nil && (port == "80" || port == "443") {
-			return strings.ToLower(strings.Trim(host, "[]"))
-		}
-		return strings.ToLower(strings.Trim(authority, "[]"))
-	}
-	return normalize(a.Host) == normalize(b.Host)
+	return tape.SameAuthority(a.Host, b.Host, "http") || tape.SameAuthority(a.Host, b.Host, "https")
 }
 
 func v2Rules(rules []fault.Rule) bool {

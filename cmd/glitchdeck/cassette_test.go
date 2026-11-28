@@ -142,13 +142,17 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 		if code != 0 || report.Exec == nil || report.Summary.FaultsTriggered != 1 {
 			t.Fatalf("exit %d, report %+v", code, report)
 		}
-		if report.Exec.StdoutTail != "" && (strings.Count(report.Exec.StdoutTail, "data: ") != 3 || strings.Contains(report.Exec.StdoutTail, "four") || strings.Contains(report.Exec.StdoutTail, "[DONE]")) {
+	}
+	checkDeliveredCut := func(code int, report execrun.Envelope) {
+		t.Helper()
+		checkCut(code, report)
+		if strings.Count(report.Exec.StdoutTail, "data: ") != 3 || strings.Contains(report.Exec.StdoutTail, "four") || strings.Contains(report.Exec.StdoutTail, "[DONE]") {
 			t.Fatalf("unexpected child stream %q", report.Exec.StdoutTail)
 		}
 	}
 	t.Setenv("GD_CASSETTE_TEST_PATH", "/plain,/v1/chat/completions")
 	original := writeInput(rule)
-	if code, report := invoke(input, "--mode", "record"); code != 2 || !strings.Contains(fmt.Sprint(report.Error), "USAGE_ERROR") {
+	if code, report := invoke(input, "--mode", "record"); code != 2 || !strings.Contains(fmt.Sprint(report.Error), "USAGE_ERROR") || !strings.Contains(fmt.Sprint(report.Error), "--mode record requires --tape-out") {
 		t.Fatalf("missing --tape-out: exit %d, error %v", code, report.Error)
 	}
 	checkCut(invoke(input, "--mode", "record", "--tape-out", output))
@@ -182,14 +186,14 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 		t.Fatalf("ambiguous replay: exit %d, error %v", code, report.Error)
 	}
 	t.Setenv("GD_CASSETTE_TEST_PATH", "/plain,/v1/chat/completions")
-	checkCut(invoke(output, "--mode", "replay"))
+	checkDeliveredCut(invoke(output, "--mode", "replay"))
 	if delta := accepts.Load() - before; delta != 0 {
 		t.Fatalf("replay reached the upstream: %d accepts", delta)
 	}
 	if code, _ := launchOutput(t, "test", "--mode", "replay", "--json", output); code != 0 || accepts.Load() != before {
 		t.Fatalf("test replay: exit %d, upstream accepts %d", code, accepts.Load()-before)
 	}
-	checkCut(invoke(output))
+	checkDeliveredCut(invoke(output))
 	if accepts.Load() <= before {
 		t.Fatal("default mode did not reach the upstream")
 	}
@@ -222,12 +226,13 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 	reportPath := filepath.Join(dir, "report.json")
 	code, stdout := launchOutput(t, "exec", "--tape", input, "--json", "--report", reportPath, "--mode", "record", "--tape-out", output, "--", os.Args[0], "-test.run=^TestExecHybridCassette$")
 	reportBytes, err := os.ReadFile(reportPath)
-	if err != nil || code != 2 || !strings.Contains(stdout, "EXPORT_BLOCKED") || strings.Contains(stdout, secret) || bytes.Contains(reportBytes, []byte(secret)) || strings.Contains(stdout, dir) || bytes.Contains(reportBytes, []byte(dir)) {
+	if err != nil || code != 2 || !strings.Contains(stdout, "EXPORT_BLOCKED") || strings.Contains(stdout, secret) || bytes.Contains(reportBytes, []byte(secret)) || strings.Contains(stdout, dir) || bytes.Contains(reportBytes, []byte(dir)) ||
+		!strings.Contains(stdout, "secret_kind=anthropic") || !strings.Contains(stdout, "field=$.") || !bytes.Contains(reportBytes, []byte("secret_kind=anthropic")) || !bytes.Contains(reportBytes, []byte("field=$.")) {
 		t.Fatalf("blocked output leaked or failed: exit %d, stdout %q, report %q, err %v", code, stdout, reportBytes, err)
 	}
 	code, stdout = launchOutput(t, "exec", "--tape", input, "--mode", "record", "--tape-out", output, "--", os.Args[0], "-test.run=^TestExecHybridCassette$")
-	if code != 2 || strings.Contains(stdout, secret) {
-		t.Fatalf("blocked non-JSON output leaked: exit %d, stdout %q", code, stdout)
+	if code != 2 || strings.Count(stdout, secret) != 1 {
+		t.Fatalf("record did not pass through the child output: exit %d, stdout %q", code, stdout)
 	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatal("blocked export wrote a file")

@@ -156,11 +156,14 @@ func Decode(r io.Reader) (Tape, error) {
 		if leadingV3(raw) {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
-		rest, err := io.ReadAll(r)
+		rest, err := io.ReadAll(io.LimitReader(r, (64<<20)-int64(len(raw))+1))
 		if err != nil {
 			return t, err
 		}
 		raw = append(raw, rest...)
+		if len(raw) > 64<<20 {
+			return t, fmt.Errorf("tape exceeds input limit")
+		}
 	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
@@ -879,20 +882,25 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 					if len(via) >= 10 || next.URL.Scheme != "http" || next.URL.Host != listener.Addr().String() || next.URL.User != nil {
 						return http.ErrUseLastResponse
 					}
-					if stepIndex+1 < len(t.Script) {
-						hop := t.Script[stepIndex+1].HTTP
-						if hop != nil {
-							method := hop.Method
-							if method == "" {
-								method = http.MethodGet
-							}
-							hopURL := serverURL + hop.Path
-							if hop.URL != "" {
-								hopURL = strings.ReplaceAll(hop.URL, "${DEMO_TLS}", demoTLS)
-							}
-							if method == next.Method && hopURL == next.URL.String() {
-								return http.ErrUseLastResponse
-							}
+					for _, step := range t.Script[stepIndex+1:] {
+						var method, path, rawURL string
+						switch {
+						case step.HTTP != nil:
+							method, path, rawURL = step.HTTP.Method, step.HTTP.Path, step.HTTP.URL
+						case step.Stream != nil:
+							method, path, rawURL = step.Stream.Method, step.Stream.Path, step.Stream.URL
+						default:
+							continue
+						}
+						if method == "" {
+							method = http.MethodGet
+						}
+						hopURL := serverURL + path
+						if rawURL != "" {
+							hopURL = strings.ReplaceAll(rawURL, "${DEMO_TLS}", demoTLS)
+						}
+						if method == next.Method && hopURL == next.URL.String() {
+							return http.ErrUseLastResponse
 						}
 					}
 					return nil

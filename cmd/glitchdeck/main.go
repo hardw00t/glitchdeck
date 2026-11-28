@@ -209,6 +209,7 @@ func testTape(args []string) int {
 		return fail("TAPE_IO", inputErr)
 	}
 	t, err := tape.Decode(file)
+	_ = file.Close()
 	if err != nil {
 		return fail("TAPE_INVALID", err)
 	}

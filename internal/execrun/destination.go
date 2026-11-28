@@ -50,12 +50,22 @@ func (d *Destination) Same(other *Destination, input ...os.FileInfo) (bool, erro
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false, err
 	}
-	if len(input) != 0 {
-		return a != nil && input[0] != nil && os.SameFile(a, input[0]), nil
+	if a == nil {
+		return false, nil
+	}
+	if len(input) != 0 && input[0] != nil && os.SameFile(a, input[0]) {
+		return true, nil
 	}
 	b, err = other.root.Stat(other.name)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return false, err
+		// Root.Stat deliberately refuses absolute symlinks. Read the link
+		// through the pinned parent; an absolute target has its own anchor.
+		if link, linkErr := other.root.Readlink(other.name); linkErr == nil && filepath.IsAbs(link) {
+			b, err = os.Stat(link)
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return false, err
+		}
 	}
 	return a != nil && b != nil && os.SameFile(a, b), nil
 }

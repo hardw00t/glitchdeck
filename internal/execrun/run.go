@@ -182,6 +182,7 @@ type helperReport struct {
 }
 
 func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
+	var safeRecordMessage string
 	if o.Mode == "record" {
 		defer func() {
 			result.Tape, result.Target = "", nil
@@ -192,7 +193,11 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 				result.Exec = &Exec{ExitCode: result.Exec.ExitCode, TimedOut: result.Exec.TimedOut, StdoutBytes: result.Exec.StdoutBytes, StderrBytes: result.Exec.StderrBytes}
 			}
 			if detail, ok := result.Error.(map[string]string); ok {
-				result.Error = map[string]string{"code": detail["code"], "message": detail["code"]}
+				message := detail["code"]
+				if safeRecordMessage != "" {
+					message = safeRecordMessage
+				}
+				result.Error = map[string]string{"code": detail["code"], "message": message}
 			}
 		}()
 	}
@@ -238,6 +243,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		return e
 	}
 	if err := o.ValidateMode(); err != nil {
+		if o.Mode == "record" && o.TapeOut == "" {
+			safeRecordMessage = "--mode record requires --tape-out"
+		}
 		return finish(2, "USAGE_ERROR", err)
 	}
 	if o.Mode == "record" {
@@ -338,20 +346,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 	opts.SuppressStderr = o.DetachStdio || o.Mode == "record"
 	var demoTLSPhysical, targetPhysical string
 	if replay {
-		upstream := t.CassetteUpstream()
-		opts.CassetteUpstream = func(r *http.Request) (*http.Response, error) {
+		opts.CassetteUpstream = t.CassetteUpstream()
+		opts.RewriteRequest = func(r *http.Request) {
 			if demoTLSPhysical != "" && r.URL.Host == demoTLSPhysical {
-				r = r.Clone(r.Context())
-				u := *r.URL
-				u.Host = "localhost"
-				r.URL, r.Host = &u, u.Host
+				r.URL.Host, r.Host = "localhost", "localhost"
 			} else if targetPhysical != "" && r.URL.Host == targetPhysical {
-				r = r.Clone(r.Context())
-				u := *r.URL
-				u.Scheme, u.Host = parsed.Scheme, parsed.Host
-				r.URL, r.Host = &u, u.Host
+				r.URL.Scheme, r.URL.Host, r.Host = parsed.Scheme, parsed.Host, parsed.Host
 			}
-			return upstream(r)
 		}
 	}
 	for i, pattern := range opts.TLSPassthrough {
@@ -501,10 +502,8 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		}
 		defer physical.Close()
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r = proxy.WithReplayListenerOrigin(r)
 			r.URL.Scheme, r.URL.Host, r.Host = parsed.Scheme, parsed.Host, parsed.Host
-			if opts.ProxyAuth != "" {
-				r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("glitchdeck:"+opts.ProxyAuth)))
-			}
 			p.ServeHTTP(w, r)
 		})
 		server := &http.Server{Handler: handler}
@@ -534,10 +533,8 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 			return finish(3, "CA_ERROR", certErr)
 		}
 		server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r.URL.Scheme, r.URL.Host = "https", demoTLSPhysical
-			if opts.ProxyAuth != "" {
-				r.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("glitchdeck:"+opts.ProxyAuth)))
-			}
+			r = proxy.WithReplayListenerOrigin(r)
+			r.URL.Scheme, r.URL.Host, r.Host = "https", "localhost", "localhost"
 			p.ServeHTTP(w, r)
 		}), TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}}
 		defer server.Close()
@@ -625,18 +622,32 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 	cmd := exec.CommandContext(childCtx, o.Command[0], o.Command[1:]...)
 	cmd.Dir = o.Dir
 	if o.DetachStdio {
-		cmd.Env = append(cmd.Environ(), env...)
+		cmd.Env = cmd.Environ()
 	} else {
-		cmd.Env = append(os.Environ(), env...)
+		cmd.Env = os.Environ()
 		cmd.Stdin = os.Stdin
 	}
+	if replay {
+		cmd.Env = slices.DeleteFunc(cmd.Env, func(entry string) bool {
+			name, _, _ := strings.Cut(entry, "=")
+			const prefix = "GLITCHDECK_"
+			return len(name) >= len(prefix) && strings.EqualFold(name[:len(prefix)], prefix)
+		})
+	}
+	cmd.Env = append(cmd.Env, env...)
 	limit := o.TailBytes
 	if limit <= 0 {
 		limit = 4096
 	}
 	stdout := tail{limit: limit, boundUTF8: o.DetachStdio}
 	stderr := stdout
-	if o.JSON || o.ProxyAuth || o.DetachStdio || o.Mode == "record" {
+	if o.Mode == "record" && !o.DetachStdio {
+		cmd.Stdout = &stdout
+		if !o.JSON {
+			cmd.Stdout = io.MultiWriter(os.Stdout, &stdout)
+		}
+		cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
+	} else if o.JSON || o.ProxyAuth || o.DetachStdio {
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 	} else {
@@ -833,6 +844,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) (result Envelope) {
 		if err := writeRecording(recording, t, o); err != nil {
 			var blocked *tape.ExportBlockedError
 			if errors.As(err, &blocked) {
+				safeRecordMessage = blocked.Error()
 				e = NewEnvelope("exec", "", "")
 				e.Target = nil
 				return finish(2, "EXPORT_BLOCKED", blocked)

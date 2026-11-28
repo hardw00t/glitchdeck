@@ -224,7 +224,8 @@ func uniqueJSONValue(d *json.Decoder) bool {
 	return err == nil
 }
 
-func sameAuthority(a, b, scheme string) bool {
+// SameAuthority reports whether two authorities match for a request scheme.
+func SameAuthority(a, b, scheme string) bool {
 	normalize := func(authority string) string {
 		host, port, err := net.SplitHostPort(authority)
 		if err == nil && (scheme == "https" && port == "443" || scheme == "http" && port == "80") {
@@ -273,7 +274,7 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 			scheme = "http"
 		}
 		matches := func(c Cassette) bool {
-			return strings.EqualFold(c.Request.Method, req.Method) && c.Request.Path == path && (c.Request.Host == "" || sameAuthority(c.Request.Host, req.Host, strings.ToLower(scheme)))
+			return strings.EqualFold(c.Request.Method, req.Method) && c.Request.Path == path && (c.Request.Host == "" || SameAuthority(c.Request.Host, req.Host, strings.ToLower(scheme)))
 		}
 		miss := func() (*http.Response, error) { return nil, &proxy.CassetteError{Kind: "cassette_miss"} }
 		index, count := -1, 0

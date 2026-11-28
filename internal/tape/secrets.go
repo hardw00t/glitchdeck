@@ -122,15 +122,16 @@ func boundExport(v reflect.Value, remaining *int, depth int) error {
 var quotedString = regexp.MustCompile(`"(?:\\.|[^"\\])*"`)
 
 func scanText(s, field string, redact bool) (string, bool, error) {
-	return scanTextDepth(s, field, redact, 0)
+	budget := 64 << 20
+	return scanTextDepth(s, field, redact, 0, &budget)
 }
 
-func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error) {
+func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string, bool, error) {
 	if depth > 8 {
 		return "", false, &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
 	}
 	if depth == 0 && redact {
-		if _, _, err := scanTextDepth(s, field, false, 0); err == nil {
+		if _, _, err := scanTextDepth(s, field, false, 0, budget); err == nil {
 			return s, false, nil
 		}
 	}
@@ -139,36 +140,103 @@ func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error
 		if !strings.HasSuffix(field, ".form") {
 			i := strings.IndexByte(s, '?')
 			if i < 0 {
-				return scanTextDepth(s, field+".component", redact, 1)
+				return scanTextDepth(s, field+".component", redact, 1, budget)
 			}
 			prefix, query = s[:i+1], s[i+1:]
-			clean, c, err := scanTextDepth(prefix, field+".component", redact, 1)
+			clean, c, err := scanTextDepth(prefix, field+".component", redact, 1, budget)
 			if err != nil {
 				return "", false, err
 			}
 			prefix, changed = clean, c
 		}
-		parts := strings.Split(query, "&")
-
-		for i, part := range parts {
-			pair := strings.SplitN(part, "=", 2)
-			for j, value := range pair {
-				clean, c, err := scanTextDepth(value, field+".form", redact, 1)
+		var rebuilt strings.Builder
+		offset := 0
+		rebuilding := false
+		componentField := field + ".form"
+		for {
+			part, rest, more := strings.Cut(query[offset:], "&")
+			key, value, hasValue := strings.Cut(part, "=")
+			cleanKey, keyChanged, err := scanTextDepth(key, componentField, redact, 1, budget)
+			if err != nil {
+				return "", false, err
+			}
+			cleanValue, valueChanged := value, false
+			if hasValue {
+				cleanValue, valueChanged, err = scanTextDepth(value, componentField, redact, 1, budget)
 				if err != nil {
 					return "", false, err
 				}
-				pair[j], changed = clean, changed || c
 			}
-			parts[i] = strings.Join(pair, "=")
+			if rebuilding || keyChanged || valueChanged {
+				size := rebuilt.Len() + len(cleanKey) + len(cleanValue)
+				if !rebuilding {
+					size += offset
+				}
+				if hasValue {
+					size++
+				}
+				if more {
+					size++
+				}
+				if size > 2*len(query) {
+					return "", false, unsupportedBody(field)
+				}
+			}
+			if keyChanged || valueChanged {
+				if !rebuilding {
+					if len(query) > *budget/2 {
+						return "", false, unsupportedBody(field)
+					}
+					*budget -= 2 * len(query)
+					rebuilt.Grow(2 * len(query))
+					rebuilt.WriteString(query[:offset])
+					rebuilding = true
+				}
+				rebuilt.WriteString(cleanKey)
+				if hasValue {
+					rebuilt.WriteByte('=')
+					rebuilt.WriteString(cleanValue)
+				}
+				changed = true
+			} else if rebuilding {
+				rebuilt.WriteString(part)
+			}
+			offset = len(query) - len(rest)
+			if !more {
+				break
+			}
+			if rebuilding {
+				rebuilt.WriteByte('&')
+			}
 		}
 		if !changed {
 			return s, false, nil
 		}
-		return prefix + strings.Join(parts, "&"), true, nil
+		if !rebuilding {
+			return prefix + query, true, nil
+		}
+		return prefix + rebuilt.String(), true, nil
 	}
 	changed := false
 	var scanErr error
 	if strings.Contains(s, `\`) {
+		inString, escaped, hasEscape := false, false, false
+		for i := range s {
+			if !inString {
+				if s[i] == '"' {
+					inString, hasEscape = true, false
+				}
+			} else if escaped {
+				escaped = false
+			} else if s[i] == '\\' {
+				escaped, hasEscape = true, true
+			} else if s[i] == '"' {
+				inString = false
+			}
+		}
+		if inString && hasEscape {
+			return "", false, unsupportedBody(field)
+		}
 		s = quotedString.ReplaceAllStringFunc(s, func(part string) string {
 			if scanErr != nil || !strings.Contains(part, `\`) {
 				return part
@@ -177,7 +245,7 @@ func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error
 			if json.Unmarshal([]byte(part), &value) != nil {
 				return part
 			}
-			clean, c, err := scanTextDepth(value, field, redact, depth+1)
+			clean, c, err := scanTextDepth(value, field, redact, depth+1, budget)
 			if err != nil {
 				scanErr = err
 				return part
@@ -239,7 +307,7 @@ func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error
 		}
 		d := decoded.String()
 		if d != s {
-			_, composed, err := scanTextDepth(d, field, redact, depth+1)
+			_, composed, err := scanTextDepth(d, field, redact, depth+1, budget)
 			if err != nil {
 				return "", false, err
 			}
@@ -263,7 +331,7 @@ func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error
 				}
 				b.WriteString(s[last:])
 				s = b.String()
-				clean, _, err := scanTextDepth(s, field, true, depth+1)
+				clean, _, err := scanTextDepth(s, field, true, depth+1, budget)
 				return clean, true, err
 			}
 		}
@@ -289,7 +357,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 	}
 	switch v.Kind() {
 	case reflect.String:
-		s, c, err := scanText(v.String(), field, redact)
+		s, c, err := scanTextDepth(v.String(), field, redact, 0, budget)
 		if err != nil {
 			return reflect.Value{}, false, err
 		}
@@ -458,11 +526,24 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 				return reflect.Value{}, false, err
 			}
 			changed = changed || c
-			valueField := field
-			if strings.EqualFold(iter.Key().String(), "Location") {
-				valueField += ".location"
+			var x reflect.Value
+			if strings.HasSuffix(field, ".headers") && iter.Value().Kind() == reflect.String {
+				var clean string
+				clean, c, err = scanHeader(iter.Key().String(), iter.Value().String(), field, redact, budget)
+				if err == nil {
+					x = iter.Value()
+					if redact && c {
+						x = reflect.New(iter.Value().Type()).Elem()
+						x.SetString(clean)
+					}
+				}
+			} else {
+				valueField := field
+				if strings.EqualFold(iter.Key().String(), "Location") {
+					valueField += ".location"
+				}
+				x, c, err = scanValue(iter.Value(), valueField, redact, budget)
 			}
-			x, c, err := scanValue(iter.Value(), valueField, redact, budget)
 			if err != nil {
 				return reflect.Value{}, false, err
 			}

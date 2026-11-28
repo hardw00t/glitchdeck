@@ -1,12 +1,20 @@
 package proxy
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 )
+
+type replayListenerOriginKey struct{}
+
+// WithReplayListenerOrigin marks a request received directly by a replay target listener.
+func WithReplayListenerOrigin(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), replayListenerOriginKey{}, true))
+}
 
 func filterReplayLocation(r *http.Request, header http.Header) {
 	locations := header.Values("Location")
@@ -23,15 +31,20 @@ func filterReplayLocation(r *http.Request, header http.Header) {
 	if err != nil || raw == "" || dest.User != nil || dest.Opaque != "" || strings.HasPrefix(raw, "///") {
 		return
 	}
+	direct := r.Context().Value(replayListenerOriginKey{}) == true
+	scheme := "http"
+	if direct && r.TLS != nil {
+		scheme = "https"
+	}
 	if !dest.IsAbs() {
-		if r.URL.IsAbs() || r.TLS != nil {
+		if !direct && (r.URL.IsAbs() || r.TLS != nil) {
 			return
 		}
 		base := *r.URL
-		base.Scheme, base.Host = "http", local.String()
+		base.Scheme, base.Host = scheme, local.String()
 		dest = base.ResolveReference(dest)
 	}
-	if dest.Scheme != "http" || !local.IP.Equal(net.ParseIP(dest.Hostname())) || upstreamPort(dest.Scheme, dest.Port()) != strconv.Itoa(local.Port) {
+	if dest.Scheme != scheme || !local.IP.Equal(net.ParseIP(dest.Hostname())) || upstreamPort(dest.Scheme, dest.Port()) != strconv.Itoa(local.Port) {
 		return
 	}
 	// Advertise the checked numeric listener, not the original authority or reference.

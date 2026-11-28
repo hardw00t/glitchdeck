@@ -159,13 +159,21 @@ func (c *responseCapture) finish() {
 
 type transportReader struct {
 	io.Reader
-	err error
+	err       error
+	remaining int64
 }
 
 func (r *transportReader) Read(p []byte) (int, error) {
+	within := r.remaining > 0
+	if within && int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
 	n, err := r.Reader.Read(p)
-	if err != nil && err != io.EOF {
-		r.err = err
+	if within {
+		r.remaining -= int64(n)
+		if err != nil && err != io.EOF {
+			r.err = err
+		}
 	}
 	return n, err
 }
@@ -682,6 +690,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.connect(w, r)
 		return
 	}
+	if p.options.RewriteRequest != nil {
+		p.options.RewriteRequest(r)
+	}
 	start := time.Now()
 	scheme, host := r.URL.Scheme, r.URL.Host
 	if r.URL.IsAbs() {
@@ -1008,16 +1019,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	capture := hasBody && p.OnRequest != nil && (p.ShouldCaptureBody == nil || p.ShouldCaptureBody(seq))
 	capturing = capture && p.ShouldCaptureBody != nil
 	buffered := kind == "dup-webhook" && fault.Int(params, "count", 2) > 1
-	if capturing && buffered && p.ReserveRequestBytes != nil && r.ContentLength >= 0 {
-		reservation := int(min(int64(maxBody), r.ContentLength))
-		preReserved = p.ReserveRequestBytes(seq, reservation)
-	}
 
 	if buffered && hasBody {
 		var err error
 		var reader io.Reader = io.LimitReader(r.Body, maxBody+1)
 		var reservation *reservationReader
-		if capturing && p.ReserveRequestBytes != nil && r.ContentLength < 0 {
+		if capturing && p.ReserveRequestBytes != nil {
 			reservation = &reservationReader{Reader: reader, reserve: func(n int) int { return p.ReserveRequestBytes(seq, n) }}
 			reader = reservation
 		}
@@ -1064,7 +1071,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if capturing && p.ReserveRequestBytes != nil {
 				b.reserve = func(n int) int { return p.ReserveRequestBytes(seq, n) }
 			}
-			_, readErr := io.Copy(io.Discard, b)
+			_, readErr := io.Copy(io.Discard, io.LimitReader(b, maxBody+1))
 			recorded, missing, truncated = b.body, readErr != nil, b.truncated
 			hasTrailers = hasTrailers || len(incoming.Trailer) != 0
 		}
@@ -1268,7 +1275,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					_, drainErr = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
 				} else {
 					responseRecord.Header.Del("Content-Encoding")
-					raw := &transportReader{Reader: io.LimitReader(resp.Body, maxBody)}
+					raw := &transportReader{Reader: resp.Body, remaining: maxBody}
 					var source io.ReadCloser = io.NopCloser(raw)
 					if encoding != "" && encoding != "identity" {
 						stripSSEIntegrity(responseRecord.Header)
@@ -1279,7 +1286,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						capture.reserve = func(n int) int { return p.ReserveResponseBytes(seq, n) }
 					}
 					capture.finish()
-					_, _ = io.Copy(io.Discard, raw)
+					_, _ = io.Copy(io.Discard, io.LimitReader(raw, raw.remaining))
 					drainErr = raw.err
 					_ = source.Close()
 					responseRecord.Body = capture.body
@@ -1370,6 +1377,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	bodyless := r.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified || resp.StatusCode == http.StatusNoContent || resp.StatusCode < 200
 	decodedResponse := false
+	var decoder *sseDecoder
 	if _, ok := resp.Body.(*sseDecoder); ok {
 		decodedResponse = true
 	}
@@ -1424,6 +1432,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				defer timer.Stop()
 				if lookahead.wait != nil {
 					lookahead.wait()
+				}
+				if responseAsync && decoder != nil {
+					_ = decoder.Close()
 				}
 				capture.finish()
 				responseRecord.Body = capture.body
@@ -1498,8 +1509,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			switch encoding {
 			case "gzip", "x-gzip", "deflate":
 				// Keep upstream flushes visible to clients; io.ReadAll would buffer the stream.
-				decoder := &sseDecoder{source: resp.Body, encoding: encoding}
-				defer decoder.Close()
+				decoder = &sseDecoder{source: resp.Body, encoding: encoding}
 				resp.Body = decoder
 				decodedResponse = true
 				resp.Header.Del("Content-Encoding")
@@ -1588,7 +1598,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if result.err == nil && (result.end == "eof" || result.end == "done") {
+		if lookahead.wait == nil && result.err == nil && (result.end == "eof" || result.end == "done") {
 			if decodedResponse {
 				stripSSEIntegrity(resp.Trailer)
 			}

@@ -2,6 +2,7 @@ package execrun
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -9,11 +10,13 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/ui"
 )
 
+var ErrMissingRecordOutput = errors.New("--mode record requires --tape-out")
+
 func (o Options) ValidateMode() error {
 	switch o.Mode {
 	case "record":
 		if o.TapeOut == "" {
-			return fmt.Errorf("--mode record requires --tape-out")
+			return ErrMissingRecordOutput
 		}
 		if o.InsecureUpstream {
 			return fmt.Errorf("--mode record requires upstream TLS verification")

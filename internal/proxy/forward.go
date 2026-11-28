@@ -40,6 +40,7 @@ type Options struct {
 	AllowLoopbackEgress  bool
 	SuppressStderr       bool
 	CassetteUpstream     func(*http.Request) (*http.Response, error)
+	RewriteRequest       func(*http.Request)
 }
 
 type RuleStats struct {

@@ -6,12 +6,42 @@ import (
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
-	"strconv"
 	"strings"
 )
 
 func unsupportedBody(field string) error {
 	return &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
+}
+
+func scanHeader(name, value, field string, redact bool, budget *int) (string, bool, error) {
+	field += "." + strings.ToLower(name)
+	if _, _, err := scanText(name, field, false); err != nil {
+		return "", false, err
+	}
+	if strings.Contains(value, "=?") {
+		return "", false, unsupportedBody(field)
+	}
+	for _, segment := range strings.Split(value, ";")[1:] {
+		key, _, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if ok && strings.Contains(key, "*") {
+			return "", false, unsupportedBody(field)
+		}
+	}
+	if strings.EqualFold(name, "Content-Disposition") || strings.EqualFold(name, "Content-Type") {
+		_, params, err := mime.ParseMediaType(value)
+		if err != nil {
+			return "", false, unsupportedBody(field)
+		}
+		for _, param := range params {
+			if _, _, err := scanText(param, field, false); err != nil {
+				return "", false, err
+			}
+		}
+	}
+	if strings.EqualFold(name, "Location") || strings.EqualFold(name, "Content-Location") {
+		field += ".location"
+	}
+	return scanTextDepth(value, field, redact, 0, budget)
 }
 
 func checkBodyEncoding(contentType, transfer, field string) error {
@@ -40,7 +70,7 @@ func checkBodyEncoding(contentType, transfer, field string) error {
 	if charset != "" && charset != "utf-8" && charset != "us-ascii" {
 		return unsupportedBody(field)
 	}
-	if strings.HasPrefix(media, "application/grpc") {
+	if strings.HasPrefix(media, "application/grpc") || strings.HasPrefix(media, "message/") || media == "multipart/digest" {
 		return unsupportedBody(field)
 	}
 	return nil
@@ -59,6 +89,9 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		return "", false, unsupportedBody(field)
 	}
 	media, params, _ := mime.ParseMediaType(contentType)
+	if strings.HasPrefix(media, "message/") || media == "multipart/digest" {
+		return "", false, unsupportedBody(field)
+	}
 	if media == "application/gzip" || media == "application/x-gzip" {
 		if _, _, err := scanBodyBudget(body, false, "gzip", "", "", field, false, budget); err != nil {
 			return "", false, err
@@ -85,44 +118,12 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 				}
 			}
 			for k, values := range p.Header {
+				if (strings.EqualFold(k, "Content-Disposition") || strings.EqualFold(k, "Content-Type")) && len(values) != 1 {
+					return "", false, unsupportedBody(field)
+				}
 				for _, v := range values {
-					if _, _, err = scanText(k+": "+v, field, false); err != nil {
+					if _, _, err = scanHeader(k, v, field, false, budget); err != nil {
 						return "", false, err
-					}
-					if strings.EqualFold(k, "Content-Disposition") || strings.EqualFold(k, "Content-Type") {
-						if len(values) != 1 {
-							return "", false, unsupportedBody(field)
-						}
-						_, parsed, err := mime.ParseMediaType(values[0])
-						if err != nil {
-							return "", false, unsupportedBody(field)
-						}
-						next := map[string]int{}
-						for _, segment := range strings.Split(values[0], ";")[1:] {
-							name, _, ok := strings.Cut(strings.TrimSpace(segment), "=")
-							if !ok {
-								return "", false, unsupportedBody(field)
-							}
-							if i := strings.IndexByte(name, '*'); i >= 0 {
-								suffix := strings.TrimSuffix(name[i+1:], "*")
-								if suffix != "" {
-									index, e := strconv.Atoi(suffix)
-									base := strings.ToLower(name[:i])
-									if e != nil || index != next[base] {
-										return "", false, unsupportedBody(field)
-									}
-									next[base]++
-								}
-								if _, ok := parsed[strings.ToLower(name[:i])]; !ok {
-									return "", false, unsupportedBody(field)
-								}
-							}
-						}
-						for _, value := range parsed {
-							if _, _, err := scanText(value, field, false); err != nil {
-								return "", false, err
-							}
-						}
 					}
 				}
 			}
@@ -154,13 +155,34 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 			}
 		}
 		// Preserve MIME bytes only after checking the decoded parts.
-		return scanText(body, field, redact)
+		return scanTextDepth(body, field, redact, 0, budget)
 	}
 	if media == "application/x-www-form-urlencoded" {
 		field += ".form"
 	}
 	if media == "text/event-stream" {
+		if strings.Contains(body, "PRIVATE KEY-----") {
+			return "", false, &ExportBlockedError{Kind: "private_key", Field: field}
+		}
 		normalized := strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n")
+		var values strings.Builder
+		for _, line := range strings.Split(normalized, "\n") {
+			_, value, ok := strings.Cut(line, ":")
+			if ok {
+				values.WriteString(strings.TrimPrefix(value, " "))
+			} else {
+				values.WriteString(line)
+			}
+			values.WriteByte('\n')
+		}
+		joined := values.String()
+		for _, pattern := range secretPatterns {
+			for _, match := range pattern.re.FindAllStringIndex(joined, -1) {
+				if strings.Contains(joined[match[0]:match[1]], "\n") {
+					return "", false, &ExportBlockedError{Kind: pattern.kind, Field: field}
+				}
+			}
+		}
 		lines := strings.Split(normalized, "\n")
 		changed := false
 		var data, original []string
@@ -215,5 +237,5 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		}
 		return body, false, nil
 	}
-	return scanText(body, field, redact)
+	return scanTextDepth(body, field, redact, 0, budget)
 }

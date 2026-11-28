@@ -60,6 +60,29 @@ func TestRecordedRedirectHopRunsOnce(t *testing.T) {
 	}
 }
 
+func TestNonadjacentRecordedSSERedirectHopRunsOnce(t *testing.T) {
+	doc := tape.Tape{Version: 3, Target: "demo",
+		Script: []tape.Step{
+			{HTTP: &tape.HTTP{Path: "/start"}},
+			{HTTP: &tape.HTTP{Path: "/other"}},
+			{Name: "stream", Stream: &tape.Stream{Path: "/end"}},
+		},
+		Cassettes: []tape.Cassette{
+			{Request: tape.CassetteRequest{Method: "GET", Path: "/start"}, Response: tape.CassetteResponse{Status: 302, Headers: map[string]string{"Location": "/end"}}},
+			{Request: tape.CassetteRequest{Method: "GET", Path: "/other"}, Response: tape.CassetteResponse{Status: 200}},
+			{Request: tape.CassetteRequest{Method: "GET", Path: "/end"}, Response: tape.CassetteResponse{Status: 200, Headers: map[string]string{"Content-Type": "text/event-stream"}, Body: "data: [DONE]\n\n"}},
+		},
+		Rules: []fault.Rule{{ID: "destination", Enabled: true, Match: fault.Match{PathPrefix: "/end"}, Fault: fault.Fault{Type: "latency-wave"}}},
+	}
+	_, report, err := tape.RunReplay(context.Background(), doc, "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.RequestsTotal != 3 || len(report.AppliedFaults) != 1 {
+		t.Fatalf("requests=%d faults=%v", report.RequestsTotal, report.AppliedFaults)
+	}
+}
+
 func TestUnrecordedLocalRedirectStillFollows(t *testing.T) {
 	doc := tape.Tape{Version: 3, Target: "demo",
 		Script: []tape.Step{{HTTP: &tape.HTTP{Path: "/start"}}},

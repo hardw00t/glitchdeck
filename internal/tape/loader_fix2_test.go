@@ -34,6 +34,16 @@ func TestLeadingV3StopsReadingAtLimit(t *testing.T) {
 	}
 }
 
+func TestReorderedV3StopsReadingAtRawLimit(t *testing.T) {
+	r := &countingReader{r: io.MultiReader(strings.NewReader("name: reordered\nversion: 3\npadding: "), strings.NewReader(strings.Repeat("x", 65<<20)))}
+	if _, err := Decode(r); err == nil {
+		t.Fatal("oversized reordered v3 accepted")
+	}
+	if r.n > (64<<20)+1 {
+		t.Fatalf("read %d bytes, exceeding the raw input bound", r.n)
+	}
+}
+
 func TestLegacyLargeInputAndV3Limit(t *testing.T) {
 	padding := strings.Repeat("x", maxTapeInput)
 	for _, version := range []int{1, 2, 3} {

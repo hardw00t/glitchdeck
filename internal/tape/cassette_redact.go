@@ -26,7 +26,7 @@ func cassetteStepRequest(s Step, ignore []string) (cassetteStepKey, bool) {
 	if address != "" {
 		path = address
 	}
-	u, err := url.Parse(path)
+	u, err := url.Parse(strings.ReplaceAll(path, "${DEMO_TLS}", "https://localhost"))
 	if err != nil {
 		return cassetteStepKey{}, false
 	}
@@ -63,7 +63,7 @@ func syncRedactedCassetteRequests(before Tape, after *Tape) error {
 		found := false
 		for _, step := range keys {
 			key, ok := step.before, step.beforeOK
-			if !ok || key.method != old.method || key.path != old.path || key.digest != old.digest || old.host != "" && key.host != old.host {
+			if !ok || key.method != old.method || key.path != old.path || key.digest != old.digest || old.host != "" && key.host != "" && !overlappingAuthorities(key.host, old.host) {
 				continue
 			}
 			candidate, ok := step.after, step.afterOK
@@ -72,6 +72,8 @@ func syncRedactedCassetteRequests(before Tape, after *Tape) error {
 			}
 			if old.host == "" {
 				candidate.host = ""
+			} else if candidate.host == "" {
+				candidate.host = old.host
 			}
 			if found && candidate != next {
 				return blocked()
@@ -86,7 +88,7 @@ func syncRedactedCassetteRequests(before Tape, after *Tape) error {
 		}
 	}
 	overlap := func(x, y cassetteStepKey) bool {
-		return x.method == y.method && x.path == y.path && x.digest == y.digest && (x.host == "" || y.host == "" || x.host == y.host)
+		return x.method == y.method && x.path == y.path && x.digest == y.digest && (x.host == "" || y.host == "" || overlappingAuthorities(x.host, y.host))
 	}
 	for i := range updated {
 		for j := range i {
@@ -101,4 +103,8 @@ func syncRedactedCassetteRequests(before Tape, after *Tape) error {
 		after.Cassettes[i].Request = updated[i]
 	}
 	return nil
+}
+
+func overlappingAuthorities(a, b string) bool {
+	return SameAuthority(a, b, "http") || SameAuthority(a, b, "https")
 }
