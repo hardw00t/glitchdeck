@@ -51,7 +51,7 @@ func (d *Destination) Same(other *Destination, input ...os.FileInfo) (bool, erro
 		return false, err
 	}
 	if len(input) != 0 {
-		return a != nil && os.SameFile(a, input[0]), nil
+		return a != nil && input[0] != nil && os.SameFile(a, input[0]), nil
 	}
 	b, err = other.root.Stat(other.name)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {

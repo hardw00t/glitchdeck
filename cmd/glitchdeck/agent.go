@@ -182,12 +182,12 @@ func execCommand(args []string) int {
 	if err := o.ValidateMode(); err != nil {
 		return fail("USAGE_ERROR", err)
 	}
-	file, err := os.Open(*path)
-	if err != nil {
-		return fail("TAPE_IO", err)
+	file, inputErr := os.Open(*path)
+	if file != nil {
+		defer file.Close()
 	}
-	defer file.Close()
 	if o.TapeOut != "" {
+		var err error
 		o.TapeDestination, err = execrun.OpenDestination(o.TapeOut)
 		if err != nil {
 			return fail("OUTPUT_IO", err)
@@ -205,9 +205,12 @@ func execCommand(args []string) int {
 			return fail("OUTPUT_IO", err)
 		}
 		defer destination.Close()
-		inputInfo, err := file.Stat()
-		if err != nil {
-			return fail("TAPE_IO", err)
+		var inputInfo os.FileInfo
+		if file != nil {
+			inputInfo, err = file.Stat()
+			if err != nil {
+				return fail("TAPE_IO", err)
+			}
 		}
 		reportSafe = func() error {
 			alias, err := destination.Same(inputDestination, inputInfo)
@@ -223,6 +226,9 @@ func execCommand(args []string) int {
 			return fail("USAGE_ERROR", err)
 		}
 		reportDestination = destination
+	}
+	if inputErr != nil {
+		return fail("TAPE_IO", inputErr)
 	}
 	for i, pattern := range passthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {

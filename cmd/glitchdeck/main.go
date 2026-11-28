@@ -170,11 +170,10 @@ func testTape(args []string) int {
 	if *mode != "passthrough" && *mode != "replay" {
 		return fail("USAGE", errors.New("test mode must be passthrough or replay"))
 	}
-	file, err := os.Open(filename)
-	if err != nil {
-		return fail("TAPE_IO", err)
+	file, inputErr := os.Open(filename)
+	if file != nil {
+		defer file.Close()
 	}
-	defer file.Close()
 	if *report != "" {
 		input, openErr := execrun.OpenDestination(filename)
 		if openErr != nil {
@@ -186,9 +185,13 @@ func testTape(args []string) int {
 			return fail("TAPE_IO", openErr)
 		}
 		defer output.Close()
-		inputInfo, err := file.Stat()
-		if err != nil {
-			return fail("TAPE_IO", err)
+		var inputInfo os.FileInfo
+		if file != nil {
+			var err error
+			inputInfo, err = file.Stat()
+			if err != nil {
+				return fail("TAPE_IO", err)
+			}
 		}
 		reportSafe = func() error {
 			same, err := output.Same(input, inputInfo)
@@ -201,6 +204,9 @@ func testTape(args []string) int {
 			return fail("USAGE", err)
 		}
 		reportDestination = output
+	}
+	if inputErr != nil {
+		return fail("TAPE_IO", inputErr)
 	}
 	t, err := tape.Decode(file)
 	if err != nil {
