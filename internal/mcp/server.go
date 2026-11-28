@@ -942,7 +942,7 @@ func encodeExport(t *tape.Tape, limit int) (string, error) {
 		value        string
 		truncated    *bool
 		wasTruncated bool
-		base64       bool
+		encoding     *string
 		compressed   bool
 		cassette     int
 	}
@@ -972,7 +972,11 @@ func encodeExport(t *tape.Tape, limit int) (string, error) {
 	for i := range t.Cassettes {
 		response := &t.Cassettes[i].Response
 		if response.Body != "" {
-			bodies = append(bodies, capturedBody{target: &response.Body, value: response.Body, truncated: &response.Truncated, wasTruncated: response.Truncated, base64: response.BodyEncoding == "base64", compressed: compressedBody(response.Headers), cassette: i + 1})
+			body := capturedBody{target: &response.Body, value: response.Body, truncated: &response.Truncated, wasTruncated: response.Truncated, compressed: compressedBody(response.Headers), cassette: i + 1}
+			if response.BodyEncoding == "base64" {
+				body.encoding = &response.BodyEncoding
+			}
+			bodies = append(bodies, body)
 			total += len(response.Body)
 		}
 	}
@@ -995,8 +999,12 @@ func encodeExport(t *tape.Tape, limit int) (string, error) {
 			if bodies[i].compressed && keep < len(bodies[i].value) {
 				keep = 0
 			}
-			if bodies[i].base64 && keep < len(bodies[i].value) {
+			if bodies[i].encoding != nil {
 				keep -= keep % 4
+				*bodies[i].encoding = ""
+				if keep != 0 {
+					*bodies[i].encoding = "base64"
+				}
 			}
 			*bodies[i].target = bodies[i].value[:keep]
 			if bodies[i].truncated != nil {

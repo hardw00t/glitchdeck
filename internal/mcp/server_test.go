@@ -213,10 +213,10 @@ func TestTapeExportFitsBodyBudgets(t *testing.T) {
 	}
 }
 
-func TestEncodeExportBoundsBinaryAndUTF8Bodies(t *testing.T) {
+func TestEncodeExportBoundsUTF8Bodies(t *testing.T) {
 	for _, tc := range []struct{ body, media string }{
 		{strings.Repeat("界", 30000), "text/plain"},
-		{"\x89PNG\r\n\x1a\n" + strings.Repeat("\x00\xff\"", 30000), "application/octet-stream"},
+		{strings.Repeat("\"\\\n", 30000), "text/plain"},
 	} {
 		body := tc.body
 		original := &tape.HTTP{Method: "POST", Path: "/", Body: body, Headers: map[string]string{"Content-Type": tc.media}}

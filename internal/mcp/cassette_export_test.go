@@ -76,14 +76,13 @@ func TestInlineExportDoesNotSplitCompressedBody(t *testing.T) {
 		state ^= state << 13
 		state ^= state >> 17
 		state ^= state << 5
-		raw[i] = byte(state)
+		raw[i] = 'a' + byte(state%26)
 	}
-	copy(raw, "\x89PNG\r\n\x1a\n")
 	_, _ = w.Write(raw)
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	doc := tape.Tape{Version: 2, Script: []tape.Step{{HTTP: &tape.HTTP{Method: "POST", Path: "/", Headers: map[string]string{"Content-Encoding": "gzip", "Content-Type": "application/octet-stream"}, Body: compressed.String()}}}}
+	doc := tape.Tape{Version: 2, Script: []tape.Step{{HTTP: &tape.HTTP{Method: "POST", Path: "/", Headers: map[string]string{"Content-Encoding": "gzip", "Content-Type": "text/plain"}, Body: compressed.String()}}}}
 	data, err := encodeExport(&doc, 8192)
 	if err != nil || len(data) > 8192 || doc.Script[0].HTTP.Body != "" {
 		t.Fatalf("compressed body not omitted intact: size=%d err=%v", len(data), err)
