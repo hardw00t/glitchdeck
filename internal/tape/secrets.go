@@ -6,10 +6,10 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"reflect"
 	"regexp"
 	"strings"
@@ -409,6 +409,10 @@ func scanTextDepth(s, field string, redact bool, depth int, budget *int) (string
 }
 
 func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect.Value, bool, error) {
+	return scanValueFiltered(v, field, redact, budget, false)
+}
+
+func scanValueFiltered(v reflect.Value, field string, redact bool, budget *int, omitBodyHeaders bool) (reflect.Value, bool, error) {
 	if !v.IsValid() {
 		return v, false, nil
 	}
@@ -465,7 +469,22 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 		base64Body := false
 		bodyChanged := false
 		replaceBody := false
-		for i := 0; i < v.NumField(); i++ {
+		bodyType := v.Type().Name()
+		hasBody := bodyType == "HTTP" || bodyType == "Stream" || bodyType == "CassetteResponse"
+		bodyIndex := -1
+		if hasBody {
+			f, _ := v.Type().FieldByName("Body")
+			bodyIndex = f.Index[0]
+		}
+		for i := range v.NumField() {
+			switch i {
+			case 0:
+				if hasBody {
+					i = bodyIndex
+				}
+			case bodyIndex:
+				i = 0
+			}
 			f := v.Type().Field(i)
 			if !f.IsExported() {
 				continue
@@ -478,7 +497,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 				continue
 			}
 			path := field + "." + name
-			if f.Name == "Messages" && v.Type().Name() == "WS" {
+			if f.Name == "Messages" && bodyType == "WS" {
 				messages := v.Field(i)
 				if redact && !messages.IsNil() {
 					out.Field(i).Set(reflect.MakeSlice(messages.Type(), messages.Len(), messages.Len()))
@@ -506,13 +525,18 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 				}
 				continue
 			}
-			encoded := f.Name == "MessageB64" || (f.Name == "Body" && v.Type().Name() == "CassetteResponse" && v.FieldByName("BodyEncoding").String() == "base64")
-			body := f.Name == "Body" && (v.Type().Name() == "HTTP" || v.Type().Name() == "Stream" || v.Type().Name() == "CassetteResponse")
+			body := f.Name == "Body" && hasBody
+			bodyEncoding := ""
+			if body && bodyType == "CassetteResponse" {
+				bodyEncoding = v.FieldByName("BodyEncoding").String()
+			}
+			encoded := f.Name == "MessageB64" || bodyEncoding == "base64"
 			if encoded || body {
-				if body && v.Field(i).String() == "" && !v.FieldByName("UnscannableEncoding").Bool() {
+				if body && v.Field(i).String() == "" && bodyEncoding == "" && !v.FieldByName("UnscannableEncoding").Bool() {
 					continue
 				}
 				encoding, contentType, transfer, grpcEncoding, httpTransfer := "", "", "", "", ""
+				ambiguous := false
 				if body {
 					headers := v.FieldByName("Headers")
 					iter := headers.MapRange()
@@ -522,7 +546,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 						switch key {
 						case "content-encoding", "content-type", "content-transfer-encoding", "grpc-encoding", "transfer-encoding":
 							if seen[key] {
-								return reflect.Value{}, false, &ExportBlockedError{Kind: "unsupported_encoding", Field: path}
+								ambiguous = true
 							}
 							seen[key] = true
 							value := strings.TrimSpace(iter.Value().String())
@@ -531,6 +555,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 								encoding = strings.ToLower(value)
 							case "content-type":
 								contentType = value
+								ambiguous = ambiguous || value == ""
 							case "content-transfer-encoding":
 								transfer = strings.ToLower(value)
 							case "grpc-encoding":
@@ -541,17 +566,17 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 						}
 					}
 				}
-				unscannable := body && (v.FieldByName("UnscannableEncoding").Bool() ||
+				unscannable := body && (ambiguous || v.FieldByName("UnscannableEncoding").Bool() ||
 					grpcEncoding != "" && grpcEncoding != "identity" ||
 					httpTransfer != "" && httpTransfer != "identity" ||
-					encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate")
+					bodyEncoding != "" && bodyEncoding != "base64")
 				var s string
 				var c bool
 				var err error
 				if unscannable {
 					err = &ExportBlockedError{Kind: "unscannable_encoding", Field: path}
 				} else {
-					s, c, err = scanBodyBudget(v.Field(i).String(), encoded, encoding, contentType, transfer, path, redact, budget)
+					s, c, err = scanStoredExportBody(v.Field(i).String(), encoded, bodyEncoding == "base64", encoding, contentType, transfer, path, redact, budget)
 				}
 				if blocked, ok := err.(*ExportBlockedError); ok && redact && (blocked.Kind == "unscannable_encoding" || blocked.Kind == "unscannable_xml_entity") {
 					s, c, err = "REDACTED", true, nil
@@ -576,7 +601,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 				changed = changed || c
 				continue
 			}
-			x, c, err := scanValue(v.Field(i), path, redact, budget)
+			x, c, err := scanValueFiltered(v.Field(i), path, redact, budget, replaceBody && f.Name == "Headers")
 			if err != nil {
 				return reflect.Value{}, false, err
 			}
@@ -605,7 +630,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 			iter := headers.MapRange()
 			for iter.Next() {
 				key := strings.ToLower(iter.Key().String())
-				if key == "content-length" || key == "content-md5" || key == "content-digest" || key == "repr-digest" || key == "digest" || key == "etag" || replaceBody && (key == "content-type" || key == "content-encoding" || key == "grpc-encoding" || key == "transfer-encoding" || key == "content-transfer-encoding" || key == "content-range") {
+				if key == "content-length" || key == "content-md5" || key == "content-digest" || key == "repr-digest" || key == "digest" || key == "etag" {
 					headers.SetMapIndex(iter.Key(), reflect.Value{})
 				}
 			}
@@ -642,6 +667,12 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 		changed := false
 		iter := v.MapRange()
 		for iter.Next() {
+			if omitBodyHeaders {
+				switch strings.ToLower(iter.Key().String()) {
+				case "content-type", "content-encoding", "grpc-encoding", "transfer-encoding", "content-transfer-encoding", "content-range":
+					continue
+				}
+			}
 			k, c, err := scanValue(iter.Key(), field, redact, budget)
 			if err != nil {
 				return reflect.Value{}, false, err
@@ -688,149 +719,143 @@ func scanBody(body string, encoded bool, encoding, contentType, transfer, field 
 }
 
 func scanBodyBudget(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int) (string, bool, error) {
-	return scanBodyBudgetDepth(body, encoded, encoding, contentType, transfer, field, redact, budget, 0, encoded)
+	return scanStoredExportBody(body, encoded, false, encoding, contentType, transfer, field, redact, budget)
 }
 
-func scanBodyBudgetDepth(body string, encoded bool, encoding, contentType, transfer, field string, redact bool, budget *int, depth int, binaryBody bool) (string, bool, error) {
-	if depth > 8 {
-		return "", false, unsupportedBody(field)
-	}
-	blocked := func() (string, bool, error) {
+func scanStoredExportBody(body string, encoded, cassetteBase64 bool, encoding, contentType, transfer, field string, redact bool, budget *int) (string, bool, error) {
+	if len(body) > *budget {
 		return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
 	}
-	if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
-		return "", false, &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
-	}
-	if body == "" {
-		if err := checkBodyEncoding(contentType, transfer, field, budget); err != nil {
-			return "", false, err
-		}
-		return body, false, nil
-	}
-	if len(body) > *budget {
-		return blocked()
-	}
 	*budget -= len(body)
-	raw := []byte(body)
+	raw := body
+	if encoded {
+		if base64.StdEncoding.DecodedLen(len(body)) > *budget+2 {
+			return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
+		}
+		bytes, err := base64.StdEncoding.DecodeString(body)
+		if err != nil {
+			return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
+		}
+		if len(bytes) > *budget {
+			return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
+		}
+		*budget -= len(bytes)
+		raw = string(bytes)
+	}
+	clean, changed, err := scanExportBodyPayload(raw, contentType, encoding, transfer, "", field, redact, 0, budget, cassetteBase64)
+	if err != nil {
+		return "", false, err
+	}
 	if encoded {
 		if _, _, err := scanTextDepth(body, field, false, 0, budget); err != nil {
 			return "", false, err
 		}
-		if base64.StdEncoding.DecodedLen(len(body)) > *budget+2 {
-			return blocked()
+		if changed {
+			return base64.StdEncoding.EncodeToString([]byte(clean)), true, nil
 		}
-		var err error
-		raw, err = base64.StdEncoding.DecodeString(body)
-		if err != nil {
-			return blocked()
+	}
+	if changed {
+		return clean, true, nil
+	}
+	return body, false, nil
+}
+
+func scanExportBodyBytes(body, contentType, encoding, transfer, inheritedCharset, field string, redact bool, depth int, budget *int) (string, bool, error) {
+	return scanExportBodyPayload(body, contentType, encoding, transfer, inheritedCharset, field, redact, depth, budget, false)
+}
+
+func scanExportBodyPayload(body, contentType, encoding, transfer, inheritedCharset, field string, redact bool, depth int, budget *int, storedBase64 bool) (string, bool, error) {
+	if depth > 8 || len(body) > maxCassetteBody {
+		return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
+	}
+	class, err := classifyExportBody(body, contentType, encoding, transfer, inheritedCharset, field, budget, storedBase64)
+	if err != nil {
+		return "", false, err
+	}
+	if class.kind != exportCompressed {
+		return scanClassifiedBody(class, body, field, redact, depth, budget)
+	}
+	explicitEncoding := encoding != "" && encoding != "identity"
+	if !explicitEncoding {
+		switch class.media {
+		case "application/gzip", "application/x-gzip", "application/zlib":
+			contentType = ""
+			if charset, ok := class.params["charset"]; ok {
+				contentType = mime.FormatMediaType("text/plain", map[string]string{"charset": charset})
+			}
 		}
-		if len(raw) > *budget {
-			return blocked()
-		}
-		*budget -= len(raw)
+	}
+	return scanCompressedExportBody(body, contentType, class.compression, inheritedCharset, field, redact && explicitEncoding, depth, budget)
+}
+
+func scanCompressedExportBody(body, contentType, encoding, inheritedCharset, field string, redact bool, depth int, budget *int) (string, bool, error) {
+	blocked := func() (string, bool, error) {
+		return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 	}
 	var reader io.ReadCloser
+	var header gzip.Header
 	var err error
-	source := bytes.NewReader(raw)
+	source := strings.NewReader(body)
 	rawDeflate := false
 	switch encoding {
-	case "", "identity":
 	case "gzip", "x-gzip":
 		var g *gzip.Reader
 		g, err = gzip.NewReader(source)
 		if err == nil {
 			g.Multistream(false)
-		}
-		if err == nil {
-			for _, metadata := range []string{g.Name, g.Comment, string(g.Extra)} {
-				if _, _, e := scanTextDepth(metadata, field, false, 0, budget); e != nil {
-					g.Close()
-					return "", false, e
-				}
-			}
-			reader = g
+			header, reader = g.Header, g
 		}
 	case "deflate":
-		if len(raw) >= 2 && raw[0]&15 == 8 && raw[0]>>4 <= 7 && (int(raw[0])*256+int(raw[1]))%31 == 0 {
+		if len(body) >= 2 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0 {
 			reader, err = zlib.NewReader(source)
 		} else {
 			rawDeflate = true
 			reader = flate.NewReader(source)
 		}
+	default:
+		return blocked()
 	}
 	if err != nil {
-		return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
+		return blocked()
 	}
-	if reader != nil {
-		limit := 4 << 20
-		if *budget < limit {
-			limit = *budget
-		}
-		raw, err = io.ReadAll(io.LimitReader(reader, int64(limit)+1))
-		closeErr := reader.Close()
-		if len(raw) > limit {
-			return blocked()
-		}
-		if err != nil || closeErr != nil || source.Len() != 0 {
-			return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
-		}
-		*budget -= len(raw)
+	limit := min(maxCassetteBody, *budget)
+	raw, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
+	closeErr := reader.Close()
+	if len(raw) > limit {
+		return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
 	}
-	frame := raw
-	compressedFrame := false
-	for len(frame) >= 5 && frame[0] <= 1 {
-		size := uint64(binary.BigEndian.Uint32(frame[1:5]))
-		if size > uint64(len(frame)-5) {
-			break
-		}
-		compressedFrame = compressedFrame || frame[0] == 1
-		frame = frame[5+int(size):]
+	if err != nil || closeErr != nil || source.Len() != 0 {
+		return blocked()
 	}
-	knownGRPC := strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "application/grpc") || strings.HasSuffix(field, ".message_b64")
-	if compressedFrame || knownGRPC && len(raw) >= 5 && raw[0] == 1 {
-		return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
-	}
-	if err := checkBodyEncoding(contentType, transfer, field, budget); err != nil {
-		if xmlErr := scanBodyEntities(string(raw), field, false, budget); xmlErr != nil {
-			if blocked, ok := xmlErr.(*ExportBlockedError); ok && blocked.Kind == "unscannable_xml_entity" {
-				return "", false, xmlErr
-			}
-		}
-		return "", false, err
-	}
-	clean, changed, err := scanContentBudget(string(raw), contentType, field, redact, depth, budget, binaryBody)
+	*budget -= len(raw)
+	clean, changed, err := scanExportBodyBytes(string(raw), contentType, "", "", inheritedCharset, field, redact, depth+1, budget)
 	if err != nil {
 		return "", false, err
+	}
+	for _, value := range [...]string{header.Name, header.Comment, string(header.Extra)} {
+		if _, _, err := scanTextDepth(value, field, false, 0, budget); err != nil {
+			return "", false, err
+		}
 	}
 	if !changed {
 		return body, false, nil
 	}
-	raw = []byte(clean)
-	if encoding != "" && encoding != "identity" {
-		var output bytes.Buffer
-		var writer io.WriteCloser
-		if encoding == "deflate" {
-			if rawDeflate {
-				writer, err = flate.NewWriter(&output, flate.DefaultCompression)
-				if err != nil {
-					return blocked()
-				}
-			} else {
-				writer = zlib.NewWriter(&output)
-			}
-		} else {
-			writer = gzip.NewWriter(&output)
-		}
-		if _, err := writer.Write(raw); err != nil {
+	var output bytes.Buffer
+	var writer io.WriteCloser
+	if rawDeflate {
+		writer, err = flate.NewWriter(&output, flate.DefaultCompression)
+		if err != nil {
 			return blocked()
 		}
-		if err := writer.Close(); err != nil {
-			return blocked()
-		}
-		raw = output.Bytes()
+	} else if encoding == "deflate" {
+		writer = zlib.NewWriter(&output)
+	} else {
+		writer = gzip.NewWriter(&output)
 	}
-	if encoded {
-		return base64.StdEncoding.EncodeToString(raw), true, nil
+	_, err = io.WriteString(writer, clean)
+	closeErr = writer.Close()
+	if err != nil || closeErr != nil {
+		return blocked()
 	}
-	return string(raw), true, nil
+	return output.String(), true, nil
 }

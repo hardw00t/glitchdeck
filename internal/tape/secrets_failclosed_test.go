@@ -112,7 +112,7 @@ func TestScannerSSEAndHeaderAllocations(t *testing.T) {
 func TestScannerSSEBufferBudget(t *testing.T) {
 	body := strings.Repeat("\n", 1000)
 	budget := 1000
-	if _, _, err := scanContentBudget(body, "text/event-stream", "$.body", false, 0, &budget, false); err == nil {
+	if _, _, err := scanExportBodyBytes(body, "text/event-stream", "", "", "", "$.body", false, 0, &budget); err == nil {
 		t.Fatal("SSE buffers exceeded work budget")
 	}
 }

@@ -1,12 +1,8 @@
 package tape
 
 import (
-	"encoding/base64"
 	"encoding/json"
-	"io"
 	"mime"
-	"mime/multipart"
-	"mime/quotedprintable"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -280,93 +276,23 @@ func scanHeader(name, value, field string, redact bool, budget *int) (string, bo
 	return clean, changed || c || urlChanged || queryChanged, err
 }
 
-func checkBodyEncoding(contentType, transfer, field string, budget *int) error {
-	if transfer != "" && transfer != "binary" && transfer != "8bit" && transfer != "7bit" {
-		return unsupportedBody(field)
-	}
-	if contentType == "" {
-		return nil
-	}
-	if len(contentType) > *budget/32 {
-		return unsupportedBody(field)
-	}
-	*budget -= 32 * len(contentType)
-	media, params, err := mime.ParseMediaType(contentType)
-	if err != nil {
-		return unsupportedBody(field)
-	}
-	for rest := contentType; strings.Contains(rest, ";"); {
-		_, rest, _ = strings.Cut(rest, ";")
-		segment, _, _ := strings.Cut(rest, ";")
-		name, _, ok := strings.Cut(strings.TrimSpace(segment), "=")
-		if !ok || strings.Contains(name, "*") {
-			return unsupportedBody(field)
-		}
-	}
-	for _, value := range params {
-		if _, _, err := scanTextDepth(value, field, false, 0, budget); err != nil {
-			return err
-		}
-	}
-	if strings.HasPrefix(media, "application/grpc") || strings.HasPrefix(media, "message/") || media == "multipart/digest" {
-		return unsupportedBody(field)
-	}
-	return nil
-}
-
 func scanBodyText(body, contentType, field string, redact bool) (string, bool, error) {
-	budget := 64 << 20
-	return scanContentBudget(body, contentType, field, redact, 0, &budget, false)
+	return scanBody(body, false, "", contentType, "", field, redact)
 }
 
-func scanContentBudget(body, contentType, field string, redact bool, depth int, budget *int, binaryBody bool) (out string, changed bool, err error) {
-	if depth > 8 || len(body) > 4<<20 {
-		return "", false, unsupportedBody(field)
-	}
-	if len(contentType) > *budget/32 {
-		return "", false, unsupportedBody(field)
-	}
-	*budget -= 32 * len(contentType)
-	media, params, _ := mime.ParseMediaType(contentType)
-	declaredJSON := (media == "application/json" || strings.HasSuffix(media, "+json")) && json.Valid([]byte(body))
-	encoding := ""
-	if media == "application/gzip" || media == "application/x-gzip" || !declaredJSON && strings.HasPrefix(body, "\x1f\x8b") {
-		encoding = "gzip"
-	} else if media == "application/zlib" || !declaredJSON && len(body) >= 2 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0 {
-		encoding = "deflate"
-	}
-	_, declaredCharset := params["charset"]
-	scanText := encoding == "" && (declaredCharset || textMedia(media) || !binaryBody && media != "application/octet-stream")
-	var order utf16Order
-	if encoding == "" {
-		switch media {
-		case "application/zip", "application/x-zip-compressed", "application/x-bzip2", "application/x-bzip",
-			"application/x-xz", "application/zstd", "application/x-zstd",
-			"application/x-7z-compressed", "application/x-tar", "application/x-rar-compressed",
-			"application/vnd.rar", "application/x-compress", "application/compress", "application/x-lz4", "application/lz4":
-			return "", false, unsupportedBody(field)
+func scanClassifiedBody(class exportBodyClass, original, field string, redact bool, depth int, budget *int) (out string, changed bool, err error) {
+	body, media := class.text, class.media
+	if class.kind == exportMultipart {
+		if err := scanExportMultipart(body, media, class.params["boundary"], field, depth, budget); err != nil {
+			return "", false, err
 		}
-		if !declaredJSON && (strings.HasPrefix(body, "PK\x03\x04") || strings.HasPrefix(body, "PK\x05\x06") || strings.HasPrefix(body, "PK\x07\x08") ||
-			strings.HasPrefix(body, "BZh") || strings.HasPrefix(body, "\xfd7zXZ\x00") ||
-			strings.HasPrefix(body, "\x28\xb5\x2f\xfd") || strings.HasPrefix(body, "7z\xbc\xaf\x27\x1c") ||
-			strings.HasPrefix(body, "\x1f\x9d") || strings.HasPrefix(body, "\x04\x22\x4d\x18") ||
-			strings.HasPrefix(body, "Rar!\x1a\x07") || (len(body) >= 262 && body[257:262] == "ustar")) {
-			return "", false, unsupportedBody(field)
-		}
-		if scanText {
-			originalLen := len(body)
-			body, order, err = textScanView(body, params, field, budget)
-			if err != nil {
-				return "", false, err
+	}
+	if class.order != nil && redact {
+		defer func() {
+			if changed && err == nil {
+				out = encodeUTF16Body(out, class.order, len(original))
 			}
-			if order != nil && redact {
-				defer func() {
-					if changed && err == nil {
-						out = encodeUTF16Body(out, order, originalLen)
-					}
-				}()
-			}
-		}
+		}()
 	}
 	entityField := field
 	if media == "application/x-www-form-urlencoded" {
@@ -381,102 +307,12 @@ func scanContentBudget(body, contentType, field string, redact bool, depth int, 
 		}
 		*budget -= len(body)
 		stripped := strings.ReplaceAll(body, "\x00", "")
-		if scanText && !allowedXMLDeclarations(stripped, order) {
-			return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
-		}
 		if err := scanBodyEntities(stripped, entityField, false, budget); err != nil {
 			return "", false, err
 		}
 		if _, _, err := scanTextDepth(stripped, field, false, 0, budget); err != nil {
 			return "", false, err
 		}
-	}
-	if encoding == "" && !scanText && (strings.HasPrefix(body, "\xff\xfe") || strings.HasPrefix(body, "\xfe\xff") || strings.HasPrefix(body, "\x00\x00\xfe\xff")) {
-		return "", false, unsupportedBody(field)
-	}
-	if strings.HasPrefix(media, "message/") || media == "multipart/digest" {
-		return "", false, unsupportedBody(field)
-	}
-	if encoding != "" {
-		innerType := contentType
-		if media == "application/gzip" || media == "application/x-gzip" || media == "application/zlib" {
-			innerType = ""
-			if declaredCharset {
-				innerType = mime.FormatMediaType("text/plain", map[string]string{"charset": params["charset"]})
-			}
-		}
-		if _, _, err := scanBodyBudgetDepth(body, false, encoding, innerType, "", field, false, budget, depth+1, binaryBody); err != nil {
-			return "", false, err
-		}
-		return body, false, nil
-	}
-	if strings.HasPrefix(media, "multipart/") {
-		if len(body) > *budget/32 {
-			return "", false, unsupportedBody(field)
-		}
-		*budget -= 32 * len(body)
-		if params["boundary"] == "" {
-			return "", false, unsupportedBody(field)
-		}
-		r := multipart.NewReader(strings.NewReader(body), params["boundary"])
-		for {
-			p, err := r.NextRawPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return "", false, unsupportedBody(field)
-			}
-			for _, name := range []string{"Content-Encoding", "Grpc-Encoding"} {
-				enc := strings.TrimSpace(strings.ToLower(p.Header.Get(name)))
-				if enc != "" && enc != "identity" {
-					return "", false, unsupportedBody(field)
-				}
-			}
-			for k, values := range p.Header {
-				if (strings.EqualFold(k, "Content-Disposition") || strings.EqualFold(k, "Content-Type") ||
-					strings.EqualFold(k, "Content-Transfer-Encoding") || strings.EqualFold(k, "Content-Encoding") ||
-					strings.EqualFold(k, "Grpc-Encoding")) && len(values) != 1 {
-					return "", false, unsupportedBody(field)
-				}
-				for _, v := range values {
-					if _, _, err = scanHeader(k, v, field+".part.headers", false, budget); err != nil {
-						return "", false, err
-					}
-				}
-			}
-			var source io.Reader = p
-			switch strings.ToLower(strings.TrimSpace(p.Header.Get("Content-Transfer-Encoding"))) {
-			case "", "binary", "8bit", "7bit":
-			case "base64":
-				source = base64.NewDecoder(base64.StdEncoding, p)
-			case "quoted-printable":
-				source = quotedprintable.NewReader(p)
-			default:
-				return "", false, unsupportedBody(field)
-			}
-			limit := 4 << 20
-			if *budget < limit {
-				limit = *budget
-			}
-			data, err := io.ReadAll(io.LimitReader(source, int64(limit)+1))
-			if err != nil || len(data) > limit {
-				return "", false, unsupportedBody(field)
-			}
-			*budget -= len(data)
-			ct := p.Header.Get("Content-Type")
-			if ct == "" {
-				ct = "text/plain"
-			}
-			if err = checkBodyEncoding(ct, "", field, budget); err != nil {
-				return "", false, err
-			}
-			if _, _, err = scanContentBudget(string(data), ct, field, false, depth+1, budget, true); err != nil {
-				return "", false, err
-			}
-		}
-		// Preserve MIME bytes only after checking the decoded parts.
-		return scanTextDepth(body, field, redact, 0, budget)
 	}
 	if media == "application/x-www-form-urlencoded" {
 		field += ".form"

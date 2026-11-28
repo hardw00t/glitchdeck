@@ -78,6 +78,7 @@ func TestInlineExportDoesNotSplitCompressedBody(t *testing.T) {
 		state ^= state << 5
 		raw[i] = byte(state)
 	}
+	copy(raw, "\x89PNG\r\n\x1a\n")
 	_, _ = w.Write(raw)
 	if err := w.Close(); err != nil {
 		t.Fatal(err)

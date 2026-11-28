@@ -40,12 +40,19 @@ func TestFix7EncodedRepresentations(t *testing.T) {
 			}
 			in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Headers: headers, Body: tc.body, BodyEncoding: tc.bodyEncoding}}}}
 			for _, redact := range []bool{false, true} {
-				_, err := PrepareExport(in, redact)
+				out, err := PrepareExport(in, redact)
+				unscannable := strings.HasPrefix(tc.name, "compress") || tc.name == "nul entity" || tc.name == "stored base64"
+				if unscannable && redact {
+					if err != nil || out.Cassettes[0].Response.Body != "REDACTED" || !out.Redacted {
+						t.Errorf("expected whole-body replacement, got %v", err)
+					}
+					continue
+				}
 				var blocked *ExportBlockedError
 				if !errors.As(err, &blocked) || strings.Contains(err.Error(), secret) {
 					t.Errorf("redact=%v: expected safe block, got %v", redact, err)
 				}
-				if strings.HasPrefix(tc.name, "compress") && blocked != nil && blocked.Kind != "unsupported_encoding" {
+				if unscannable && blocked != nil && blocked.Kind != "unscannable_encoding" {
 					t.Errorf("redact=%v: kind %s", redact, blocked.Kind)
 				}
 			}
@@ -96,7 +103,12 @@ func TestFix7DerivedOverlapAndContainers(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			in := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Body: tc.body, Headers: map[string]string{"Content-Type": tc.media, "Server": tc.header}}}}}
 			for _, redact := range []bool{false, true} {
-				if _, err := PrepareExport(in, redact); err == nil {
+				out, err := PrepareExport(in, redact)
+				if redact && strings.HasPrefix(tc.name, "lz4 ") {
+					if err != nil || out.Cassettes[0].Response.Body != "REDACTED" || !out.Redacted {
+						t.Errorf("expected whole-body replacement, got %v", err)
+					}
+				} else if err == nil {
 					t.Errorf("redact=%v: expected block", redact)
 				}
 			}

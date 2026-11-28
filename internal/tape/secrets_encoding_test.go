@@ -115,7 +115,7 @@ func TestExportAllowedTextEncodings(t *testing.T) {
 }
 
 func TestExportPreservesBinaryBase64(t *testing.T) {
-	const binaryBody = "gIGCgw=="
+	const binaryBody = "iVBORw0KGgo="
 	input := Tape{Cassettes: []Cassette{{Response: CassetteResponse{
 		Status: 200, Body: binaryBody, BodyEncoding: "base64", Headers: map[string]string{"Content-Type": "application/octet-stream"},
 	}}}}
@@ -129,14 +129,16 @@ func TestExportEncodingContainerBoundaries(t *testing.T) {
 	secret := "sk-" + "ant-" + strings.Repeat("Z", 24)
 	t.Run("binary BOM cannot hide decoded octets", func(t *testing.T) {
 		in := Tape{Cassettes: []Cassette{{Response: NewCassetteResponse(200, map[string]string{"Content-Type": "application/octet-stream"}, []byte("\xff\xfe"+secret+"!"), false)}}}
-		for _, redact := range []bool{false, true} {
-			if _, err := PrepareExport(in, redact); err == nil {
-				t.Fatalf("redact=%v exported credential in binary data", redact)
-			}
+		if _, err := PrepareExport(in, false); err == nil {
+			t.Fatal("exported credential in binary data")
+		}
+		out, err := PrepareExport(in, true)
+		if err != nil || out.Cassettes[0].Response.Body != "REDACTED" {
+			t.Fatalf("unrecognised binary body was not replaced: %v", err)
 		}
 	})
 	t.Run("multipart binary part preserved", func(t *testing.T) {
-		raw := []byte("--x\r\nContent-Type: application/octet-stream\r\n\r\n\x80\x81\r\n--x--\r\n")
+		raw := []byte("--x\r\nContent-Type: application/octet-stream\r\n\r\n\x89PNG\r\n\x1a\n\r\n--x--\r\n")
 		in := Tape{Cassettes: []Cassette{{Response: NewCassetteResponse(200, map[string]string{"Content-Type": "multipart/mixed; boundary=x"}, raw, false)}}}
 		out, err := PrepareExport(in, false)
 		if err != nil || out.Cassettes[0].Response.Body != in.Cassettes[0].Response.Body {

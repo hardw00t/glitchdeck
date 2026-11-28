@@ -2,6 +2,8 @@ package tape
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"mime"
 	"regexp"
 	"strings"
 	"unicode/utf16"
@@ -47,15 +49,212 @@ func allowedXMLDeclarations(body string, order utf16Order) bool {
 	return enc == nil || allowedTextEncoding(enc[1]+enc[2], order)
 }
 
+type exportBodyKind uint8
+
+const (
+	exportCleanText exportBodyKind = iota
+	exportKnownBinary
+	exportCompressed
+	exportMultipart
+)
+
+type exportBodyClass struct {
+	kind        exportBodyKind
+	text        string
+	order       utf16Order
+	media       string
+	params      map[string]string
+	compression string
+}
+
 func textMedia(media string) bool {
-	if strings.HasPrefix(media, "text/") || strings.HasSuffix(media, "+xml") || strings.HasSuffix(media, "+json") {
+	if media == "" || strings.HasPrefix(media, "text/") || strings.HasSuffix(media, "+xml") || strings.HasSuffix(media, "+json") {
 		return true
 	}
 	switch media {
 	case "application/xml", "application/xml-dtd", "application/xml-external-parsed-entity",
 		"application/json", "application/json-seq", "application/x-ndjson",
-		"application/x-www-form-urlencoded", "application/javascript", "application/yaml", "application/x-yaml":
+		"application/x-www-form-urlencoded", "application/javascript", "application/yaml", "application/x-yaml",
+		"application/sql", "application/x-sql", "application/graphql":
 		return true
+	}
+	return false
+}
+
+func classifyExportBody(body, contentType, encoding, transfer, inheritedCharset, field string, budget *int, storedBase64 bool) (exportBodyClass, error) {
+	blocked := func() (exportBodyClass, error) {
+		return exportBodyClass{}, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
+	}
+	result := exportBodyClass{text: body}
+	if transfer = strings.ToLower(strings.TrimSpace(transfer)); transfer != "" && transfer != "binary" && transfer != "7bit" && transfer != "8bit" {
+		return blocked()
+	}
+	if contentType != "" {
+		if len(contentType) > *budget/32 {
+			return exportBodyClass{}, unsupportedBody(field)
+		}
+		*budget -= len(contentType) * 32
+		var err error
+		result.media, result.params, err = mime.ParseMediaType(contentType)
+		if err != nil {
+			return blocked()
+		}
+	}
+	if inheritedCharset != "" && textMedia(result.media) {
+		if _, ok := result.params["charset"]; !ok {
+			if result.params == nil {
+				result.params = make(map[string]string, 1)
+			}
+			result.params["charset"] = inheritedCharset
+		}
+	}
+	charset, charsetDeclared := result.params["charset"]
+	charset = strings.ToLower(strings.TrimSpace(charset))
+	if len(charset) >= 2 && (charset[0] == '\'' || charset[0] == '"') && charset[len(charset)-1] == charset[0] {
+		charset = strings.TrimSpace(charset[1 : len(charset)-1])
+	}
+	if charsetDeclared {
+		switch charset {
+		case "utf-8", "utf8", "us-ascii", "ascii", "utf-16", "utf-16le", "utf-16be":
+		default:
+			return blocked()
+		}
+		result.params["charset"] = charset
+	}
+	encoding = strings.ToLower(strings.TrimSpace(encoding))
+	switch encoding {
+	case "", "identity":
+		encoding = ""
+	case "gzip", "x-gzip":
+		encoding = "gzip"
+	case "deflate":
+	default:
+		return blocked()
+	}
+	declaredJSON := (result.media == "application/json" || strings.HasSuffix(result.media, "+json")) && json.Valid([]byte(body))
+	if encoding == "" {
+		switch {
+		case result.media == "application/gzip" || result.media == "application/x-gzip":
+			encoding = "gzip"
+		case result.media == "application/zlib":
+			encoding = "deflate"
+		case !declaredJSON && strings.HasPrefix(body, "\x1f\x8b"):
+			encoding = "gzip"
+		case !declaredJSON && len(body) >= 2 && body[0]&15 == 8 && body[0]>>4 <= 7 && (int(body[0])*256+int(body[1]))%31 == 0:
+			encoding = "deflate"
+		}
+	}
+	if encoding != "" {
+		result.kind, result.compression = exportCompressed, encoding
+		return result, nil
+	}
+	frame := body
+	compressedFrame := false
+	for len(frame) >= 5 && frame[0] <= 1 {
+		size := uint64(binary.BigEndian.Uint32([]byte(frame[1:5])))
+		if size > uint64(len(frame)-5) {
+			break
+		}
+		compressedFrame = compressedFrame || frame[0] == 1
+		frame = frame[5+int(size):]
+	}
+	knownGRPC := strings.HasPrefix(result.media, "application/grpc") || strings.HasSuffix(field, ".message_b64")
+	if compressedFrame || knownGRPC && len(body) >= 5 && body[0] == 1 {
+		return blocked()
+	}
+	switch result.media {
+	case "application/x-bzip2", "application/x-bzip",
+		"application/x-xz", "application/zstd", "application/x-zstd", "application/x-7z-compressed",
+		"application/x-tar", "application/x-rar-compressed", "application/vnd.rar",
+		"application/x-compress", "application/compress", "application/x-lz4", "application/lz4":
+		return blocked()
+	}
+	if !declaredJSON && (strings.HasPrefix(body, "BZh") ||
+		strings.HasPrefix(body, "\xfd7zXZ\x00") || strings.HasPrefix(body, "\x28\xb5\x2f\xfd") ||
+		strings.HasPrefix(body, "7z\xbc\xaf\x27\x1c") || strings.HasPrefix(body, "\x1f\x9d") ||
+		strings.HasPrefix(body, "\x04\x22\x4d\x18") || strings.HasPrefix(body, "Rar!\x1a\x07") ||
+		len(body) >= 262 && body[257:262] == "ustar") {
+		return blocked()
+	}
+	if strings.HasPrefix(result.media, "multipart/") {
+		if result.media == "multipart/digest" || charsetDeclared {
+			return blocked()
+		}
+		result.kind = exportMultipart
+		return result, nil
+	}
+	if textMedia(result.media) {
+		var err error
+		result.text, result.order, err = textScanView(body, result.params, field, budget)
+		if err != nil {
+			return exportBodyClass{}, err
+		}
+		if storedBase64 && result.order == nil {
+			if err := scanBodyEntities(result.text, field, false, budget); err != nil {
+				if e, ok := err.(*ExportBlockedError); ok && e.Kind == "unscannable_xml_entity" {
+					return exportBodyClass{}, err
+				}
+			}
+			return blocked()
+		}
+		result.kind = exportCleanText
+		return result, nil
+	}
+	if charsetDeclared {
+		return blocked()
+	}
+	if knownBinarySignature(body, result.media) {
+		result.kind = exportKnownBinary
+		return result, nil
+	}
+	return blocked()
+}
+
+func knownBinarySignature(body, media string) bool {
+	octet := media == "application/octet-stream"
+	match := func(types ...string) bool {
+		if octet {
+			return true
+		}
+		for _, typ := range types {
+			if media == typ {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case strings.HasPrefix(body, "\x89PNG\r\n\x1a\n"):
+		return match("image/png")
+	case strings.HasPrefix(body, "\xff\xd8\xff"):
+		return match("image/jpeg")
+	case strings.HasPrefix(body, "GIF87a"), strings.HasPrefix(body, "GIF89a"):
+		return match("image/gif")
+	case len(body) >= 12 && body[:4] == "RIFF" && body[8:12] == "WEBP":
+		return match("image/webp")
+	case strings.HasPrefix(body, "PK\x03\x04") && len(body) >= 30,
+		strings.HasPrefix(body, "PK\x05\x06") && len(body) >= 22:
+		return octet
+	case strings.HasPrefix(body, "%PDF-"):
+		return octet
+	case strings.HasPrefix(body, "wOFF"):
+		return match("font/woff")
+	case strings.HasPrefix(body, "wOF2"):
+		return match("font/woff2")
+	case strings.HasPrefix(body, "\x00\x01\x00\x00"):
+		return match("font/ttf")
+	case strings.HasPrefix(body, "OTTO"):
+		return match("font/otf")
+	case len(body) >= 10 && strings.HasPrefix(body, "ID3"):
+		return match("audio/mpeg")
+	case len(body) >= 12 && body[4:8] == "ftyp":
+		return match("video/mp4", "audio/mp4")
+	case strings.HasPrefix(body, "OggS"):
+		return match("audio/ogg", "video/ogg")
+	case len(body) >= 12 && body[:4] == "RIFF" && body[8:12] == "WAVE":
+		return match("audio/wav", "audio/x-wav")
+	case strings.HasPrefix(body, "\x1a\x45\xdf\xa3"):
+		return match("video/webm", "audio/webm")
 	}
 	return false
 }
@@ -115,10 +314,20 @@ func textScanView(body string, params map[string]string, field string, budget *i
 			text.WriteRune(u)
 		}
 		body = text.String()
-	} else if !utf8.ValidString(body) {
+	} else if strings.ContainsRune(body, 0) || !utf8.ValidString(body) {
 		return blocked()
 	}
-	if !allowedXMLDeclarations(body, order) {
+	if declared && (strings.EqualFold(charset, "ascii") || strings.EqualFold(charset, "us-ascii")) {
+		for _, r := range body {
+			if r >= utf8.RuneSelf {
+				return blocked()
+			}
+		}
+	}
+	if view := strings.TrimPrefix(body, "\xef\xbb\xbf"); len(view) >= 4 && strings.HasPrefix(view, "+/v") && strings.ContainsRune("89+/", rune(view[3])) {
+		return blocked()
+	}
+	if strings.ContainsRune(body, 0) || !allowedXMLDeclarations(body, order) {
 		return blocked()
 	}
 	return body, order, nil

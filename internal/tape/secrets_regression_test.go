@@ -284,8 +284,8 @@ func TestScannerBlocksCompressedContainers(t *testing.T) {
 	} {
 		_, _, err := scanBody(tc.body, false, "", tc.ct, "", "$.body", true)
 		var blocked *ExportBlockedError
-		if !errors.As(err, &blocked) || blocked.Kind != "unsupported_encoding" {
-			t.Fatalf("%s: expected unsupported encoding, got %v", tc.ct, err)
+		if !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+			t.Fatalf("%s: expected unscannable encoding, got %v", tc.ct, err)
 		}
 	}
 }
@@ -307,7 +307,7 @@ func TestScannerCompressedMediaAndMagic(t *testing.T) {
 				_ = w.Close()
 				for _, media := range []string{tc.media, "text/plain", "application/octet-stream"} {
 					_, _, err := scanBody(compressed.String(), false, "", media, "", "$.body", true)
-					if (err != nil) != (payload != "ordinary") {
+					if (err != nil) != (payload != "ordinary" || media == "application/octet-stream") {
 						t.Fatalf("%s payload %q: %v", media, payload, err)
 					}
 				}
