@@ -202,8 +202,12 @@ func TestResponseCaptureSlots(t *testing.T) {
 	}
 	r.stop()
 	r.start(34, 0, fault.Config{})
-	if !r.shouldCaptureResponse(35) {
-		t.Fatal("stop did not release slots")
+	if r.shouldCaptureResponse(35) {
+		t.Fatal("restart released a capture that is still running")
+	}
+	r.response(proxy.ResponseRecord{Seq: 2})
+	if !r.shouldCaptureResponse(36) {
+		t.Fatal("completion from previous recording did not release capture slot")
 	}
 }
 

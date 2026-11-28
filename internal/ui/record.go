@@ -172,7 +172,7 @@ func (r *recorder) shouldCaptureResponse(seq uint64) bool {
 func (r *recorder) reserveResponseBytes(seq uint64, n int) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.running || !r.pendingResponses[seq] || n <= 0 {
+	if !r.running || seq <= r.startSeq || !r.pendingResponses[seq] || n <= 0 {
 		return 0
 	}
 	allowed := min(n, max(0, maxRecordBytes-r.bytes-r.reservedResponseBytes))
@@ -201,10 +201,11 @@ func (r *recorder) response(res proxy.ResponseRecord) {
 	defer r.mu.Unlock()
 	r.reservedResponseBytes -= r.responseReservations[res.Seq]
 	delete(r.responseReservations, res.Seq)
-	if !r.running || !r.pendingResponses[res.Seq] && !res.Intentional {
+	pending := r.pendingResponses[res.Seq]
+	delete(r.pendingResponses, res.Seq)
+	if !r.running || res.Seq <= r.startSeq || !pending && !res.Intentional {
 		return
 	}
-	delete(r.pendingResponses, res.Seq)
 	if res.Truncated {
 		r.bodyTruncated = true
 		r.markIncomplete("recorded response body was truncated")
@@ -275,7 +276,6 @@ func (r *recorder) clear() {
 	r.incompleteReason = ""
 	r.lastFrame = time.Time{}
 	r.bodyTruncated, r.droppedEntries, r.pendingBodies = false, 0, 0
-	r.pendingResponses = nil
 	if r.responseReservations == nil {
 		r.responseReservations = make(map[uint64]int)
 	}
@@ -289,6 +289,7 @@ func (r *recorder) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.clear()
+	clear(r.pendingResponses)
 }
 
 func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config, usedBurst ...bool) recordingStatus {
@@ -303,7 +304,9 @@ func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config, usedBu
 			r.markIncomplete("initial configuration exceeded the recording byte budget")
 		}
 		r.streams = make(map[uint64]*recorded)
-		r.pendingResponses = make(map[uint64]bool)
+		if r.pendingResponses == nil {
+			r.pendingResponses = make(map[uint64]bool)
+		}
 		if activeStreams != 0 {
 			r.markIncomplete("WebSocket, blind or passthrough CONNECT tunnel already open when recording started")
 		}
@@ -322,12 +325,20 @@ func (r *recorder) stop() recordingStatus {
 		if r.pendingBodies != 0 {
 			r.markIncomplete(pendingBodyReason)
 		}
-		if len(r.pendingResponses) != 0 {
+		if r.hasPendingResponse() {
 			r.markIncomplete("recording ended with responses still in flight")
 		}
-		clear(r.pendingResponses)
 	}
 	return r.snapshot()
+}
+
+func (r *recorder) hasPendingResponse() bool {
+	for seq := range r.pendingResponses {
+		if seq > r.startSeq {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *recorder) status() recordingStatus {
@@ -343,7 +354,7 @@ func (r *recorder) snapshot() recordingStatus {
 	}
 	return recordingStatus{
 		Recording: r.running, ElapsedMS: end.Sub(r.started).Milliseconds(), Events: r.events,
-		Incomplete: r.incompleteReason != "" || len(r.pendingResponses) != 0, IncompleteReason: r.incompleteReason,
+		Incomplete: r.incompleteReason != "" || r.hasPendingResponse(), IncompleteReason: r.incompleteReason,
 		Truncated: r.bodyTruncated || r.droppedEntries != 0, DroppedEntries: r.droppedEntries,
 	}
 }
@@ -644,7 +655,7 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 	if reason == "" && r.pendingBodies != 0 {
 		reason = pendingBodyReason
 	}
-	if reason == "" && len(r.pendingResponses) != 0 {
+	if reason == "" && r.hasPendingResponse() {
 		reason = "recording ended with responses still in flight"
 	}
 	doc := tape.Tape{
