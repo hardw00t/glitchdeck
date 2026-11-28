@@ -1,12 +1,17 @@
 package tape
 
 import (
+	"encoding"
 	"encoding/json"
 	"fmt"
 	"maps"
 	"mime"
 	"reflect"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"gopkg.in/yaml.v3"
 )
 
 var exportStructuralFields = map[reflect.Type]map[string]bool{
@@ -23,8 +28,8 @@ func replaceUnscannable(err error) bool {
 	return ok && (e.Kind == "unscannable_encoding" || e.Kind == "unscannable_xml_entity")
 }
 
-func scanExportScalar(value, field string, storedBase64, redact bool, budget *int) (string, bool, error) {
-	if value == "" || storedBase64 && value == redactedBase64 {
+func scanExportScalar(value, field string, storedBase64, redact, generatedMarkers bool, budget *int) (string, bool, error) {
+	if value == "" || storedBase64 && generatedMarkers && value == redactedBase64 {
 		return value, false, nil
 	}
 	clean, changed, err := scanStoredExportBody(value, storedBase64, "", "", "", field, redact, budget)
@@ -37,13 +42,20 @@ func scanExportScalar(value, field string, storedBase64, redact bool, budget *in
 	return clean, changed, err
 }
 
-func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect.Value, bool, error) {
+func scanValue(v reflect.Value, field string, redact, generatedMarkers bool, budget *int) (reflect.Value, bool, error) {
 	if !v.IsValid() {
 		return v, false, nil
 	}
+	typ := v.Type()
+	if typ == reflect.TypeFor[yaml.Node]() || typ.NumMethod() != 0 &&
+		(typ.Implements(reflect.TypeFor[encoding.TextMarshaler]()) ||
+			typ.Implements(reflect.TypeFor[yaml.Marshaler]()) ||
+			typ.Implements(reflect.TypeFor[json.Marshaler]())) {
+		return v, false, unsupportedExportValue(field)
+	}
 	switch v.Kind() {
 	case reflect.String:
-		s, changed, err := scanExportScalar(v.String(), field, base64Field(field), redact, budget)
+		s, changed, err := scanExportScalar(v.String(), field, base64Field(field), redact, generatedMarkers, budget)
 		if err != nil || !changed {
 			return v, false, err
 		}
@@ -57,7 +69,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 		if v.IsNil() {
 			return v, false, nil
 		}
-		x, changed, err := scanValue(v.Elem(), field, redact, budget)
+		x, changed, err := scanValue(v.Elem(), field, redact, generatedMarkers, budget)
 		if err != nil || !changed {
 			return v, false, err
 		}
@@ -76,7 +88,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 		out.Elem().Set(x)
 		return out, true, nil
 	case reflect.Struct:
-		return scanExportStruct(v, field, redact, budget)
+		return scanExportStruct(v, field, redact, generatedMarkers, budget)
 	case reflect.Slice, reflect.Array:
 		if v.Kind() == reflect.Slice && v.IsNil() {
 			return v, false, nil
@@ -91,7 +103,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 					raw[i] = byte(v.Index(i).Uint())
 				}
 			}
-			s, changed, err := scanExportScalar(string(raw), field, base64Field(field), redact, budget)
+			s, changed, err := scanExportScalar(string(raw), field, base64Field(field), redact, generatedMarkers, budget)
 			if err != nil || !changed {
 				return v, false, err
 			}
@@ -107,7 +119,7 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 		out, changed := v, false
 		for i := range v.Len() {
 			path := fmt.Sprintf("%s[%d]", field, i)
-			x, c, err := scanValue(v.Index(i), path, redact, budget)
+			x, c, err := scanValue(v.Index(i), path, redact, generatedMarkers, budget)
 			if err != nil {
 				return v, false, err
 			}
@@ -130,9 +142,18 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 		}
 		return out, changed, nil
 	case reflect.Map:
-		return scanExportMap(v, field, redact, false, budget)
+		return scanExportMap(v, field, redact, generatedMarkers, false, budget)
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64:
+		return v, false, nil
+	default:
+		return v, false, unsupportedExportValue(field)
 	}
-	return v, false, nil
+}
+
+func unsupportedExportValue(field string) error {
+	return &ExportBlockedError{Kind: "unsupported_export_value", Field: field}
 }
 
 func base64Field(field string) bool {
@@ -142,7 +163,7 @@ func base64Field(field string) bool {
 	return strings.HasSuffix(name, "b64") || strings.HasSuffix(name, "base64")
 }
 
-func scanExportStruct(v reflect.Value, field string, redact bool, budget *int) (reflect.Value, bool, error) {
+func scanExportStruct(v reflect.Value, field string, redact, generatedMarkers bool, budget *int) (reflect.Value, bool, error) {
 	typ := v.Type()
 	out, changed := v, false
 	set := func(i int, x reflect.Value) {
@@ -164,9 +185,10 @@ func scanExportStruct(v reflect.Value, field string, redact bool, budget *int) (
 		if cassette {
 			encoding = v.FieldByName("BodyEncoding").String()
 		}
+		headerField, _ := typ.FieldByName("Headers")
+		headers := v.Field(headerField.Index[0]).Interface().(map[string]string)
 		flagged := v.FieldByName("UnscannableEncoding").Bool()
 		if value != "" || encoding != "" || flagged {
-			headers := v.FieldByName("Headers").Interface().(map[string]string)
 			clean, c, err := scanExportHTTPBody(value, encoding, headers, flagged, field+".body", redact, budget)
 			if redact && replaceUnscannable(err) {
 				clean, c, err, replaced = "REDACTED", true, nil, true
@@ -178,12 +200,26 @@ func scanExportStruct(v reflect.Value, field string, redact bool, budget *int) (
 				set(bodyIndex, reflect.ValueOf(clean))
 				bodyChanged = true
 			}
+		} else if !cassette {
+			next := headers
+			for name, value := range headers {
+				if strings.EqualFold(name, "Content-Encoding") && !strings.EqualFold(strings.TrimSpace(value), "identity") {
+					if !changed {
+						next = maps.Clone(headers)
+						set(headerField.Index[0], reflect.ValueOf(next))
+					}
+					delete(next, name)
+				}
+			}
 		}
 	}
 	for i := range v.NumField() {
 		f := typ.Field(i)
-		if i == bodyIndex || !f.IsExported() {
+		if i == bodyIndex || typ == reflect.TypeFor[Tape]() && f.Name == "exportGeneratedMarkers" {
 			continue
+		}
+		if !f.IsExported() {
+			return v, false, unsupportedExportValue(field)
 		}
 		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
 		if name == "-" {
@@ -202,14 +238,17 @@ func scanExportStruct(v reflect.Value, field string, redact bool, budget *int) (
 		switch {
 		case exportStructuralFields[typ][f.Name]:
 			var clean string
+			if !utf8.ValidString(value.String()) || strings.ContainsFunc(value.String(), unicode.IsControl) {
+				return v, false, &ExportBlockedError{Kind: "unscannable_encoding", Field: path}
+			}
 			clean, c, err = scanTextDepth(value.String(), path, redact, 0, budget)
 			x = reflect.ValueOf(clean)
 		case bodyIndex >= 0 && f.Name == "Headers":
-			x, c, err = scanExportMap(value, path, redact, replaced, budget)
+			x, c, err = scanExportMap(out.Field(i), path, redact, generatedMarkers, replaced, budget)
 		case typ == reflect.TypeFor[WS]() && f.Name == "Messages":
 			x, c, err = scanExportMessages(value, path, redact, budget)
 		default:
-			x, c, err = scanValue(value, path, redact, budget)
+			x, c, err = scanValue(value, path, redact, generatedMarkers, budget)
 		}
 		if err != nil {
 			return v, false, err
@@ -287,7 +326,7 @@ func scanExportMessages(v reflect.Value, field string, redact bool, budget *int)
 	out, changed := v, false
 	for i := range v.Len() {
 		path := fmt.Sprintf("%s[%d]", field, i)
-		clean, c, err := scanExportScalar(v.Index(i).String(), path, false, redact, budget)
+		clean, c, err := scanExportScalar(v.Index(i).String(), path, false, redact, false, budget)
 		if blocked, ok := err.(*ExportBlockedError); ok && redact {
 			for _, pattern := range secretPatterns {
 				if blocked.Kind == pattern.kind && blocked.Kind != "private_key" {
@@ -311,7 +350,7 @@ func scanExportMessages(v reflect.Value, field string, redact bool, budget *int)
 	return out, changed, nil
 }
 
-func scanExportMap(v reflect.Value, field string, redact, omitBodyHeaders bool, budget *int) (reflect.Value, bool, error) {
+func scanExportMap(v reflect.Value, field string, redact, generatedMarkers, omitBodyHeaders bool, budget *int) (reflect.Value, bool, error) {
 	if v.IsNil() {
 		return v, false, nil
 	}
@@ -320,21 +359,17 @@ func scanExportMap(v reflect.Value, field string, redact, omitBodyHeaders bool, 
 		out = reflect.MakeMapWithSize(v.Type(), v.Len())
 	}
 	storedBody := false
-	if v.Type().Key().Kind() == reflect.String {
-		key := reflect.ValueOf("body_encoding").Convert(v.Type().Key())
-		value := v.MapIndex(key)
-		if value.IsValid() && value.Kind() == reflect.Interface && !value.IsNil() {
-			value = value.Elem()
+	for iter := v.MapRange(); iter.Next(); {
+		if strings.EqualFold(exportMapString(iter.Key()), "body_encoding") &&
+			strings.EqualFold(strings.TrimSpace(exportMapString(iter.Value())), "base64") {
+			storedBody = true
+			break
 		}
-		storedBody = value.IsValid() && value.Kind() == reflect.String && strings.EqualFold(value.String(), "base64")
 	}
 	iter := v.MapRange()
 	for iter.Next() {
 		key, value := iter.Key(), iter.Value()
-		name := ""
-		if key.Kind() == reflect.String {
-			name = key.String()
-		}
+		name := exportMapString(key)
 		if omitBodyHeaders {
 			switch strings.ToLower(name) {
 			case "content-type", "content-encoding", "grpc-encoding", "transfer-encoding", "content-transfer-encoding", "content-range":
@@ -342,7 +377,7 @@ func scanExportMap(v reflect.Value, field string, redact, omitBodyHeaders bool, 
 				continue
 			}
 		}
-		k, keyChanged, err := scanValue(key, field+".key", redact, budget)
+		k, keyChanged, err := scanValue(key, field+".key", redact, generatedMarkers, budget)
 		if err != nil {
 			return v, false, err
 		}
@@ -351,7 +386,8 @@ func scanExportMap(v reflect.Value, field string, redact, omitBodyHeaders bool, 
 		}
 		var x reflect.Value
 		var c bool
-		if strings.HasSuffix(field, ".headers") && value.Kind() == reflect.String && name != "" {
+		stored := base64Field(name) || storedBody && strings.EqualFold(name, "body")
+		if !stored && strings.HasSuffix(field, ".headers") && value.Kind() == reflect.String && name != "" {
 			var clean string
 			clean, c, err = scanExportHeader(name, value.String(), field, redact, budget)
 			x = value
@@ -363,17 +399,17 @@ func scanExportMap(v reflect.Value, field string, redact, omitBodyHeaders bool, 
 			path := field
 			if strings.EqualFold(name, "Location") {
 				path += ".location"
-			} else if base64Field(name) || storedBody && name == "body" {
+			} else if stored {
 				path += ".base64"
 			}
-			x, c, err = scanValue(value, path, redact, budget)
+			x, c, err = scanValue(value, path, redact, generatedMarkers, budget)
 		}
 		if err != nil {
 			return v, false, err
 		}
 		if redact || c {
-			if !k.Type().AssignableTo(v.Type().Key()) || !x.Type().AssignableTo(v.Type().Elem()) {
-				return v, false, unsupportedBody(field)
+			if !k.Type().AssignableTo(v.Type().Key()) || !k.Comparable() || !x.Type().AssignableTo(v.Type().Elem()) {
+				return v, false, unsupportedExportValue(field)
 			}
 			if redact {
 				if out.MapIndex(k).IsValid() {
@@ -393,10 +429,23 @@ func scanExportMap(v reflect.Value, field string, redact, omitBodyHeaders bool, 
 	return out, changed, nil
 }
 
+func exportMapString(v reflect.Value) string {
+	for (v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer) && !v.IsNil() {
+		v = v.Elem()
+	}
+	if v.Kind() == reflect.String {
+		return v.String()
+	}
+	return ""
+}
+
 func scanExportHeader(name, value, field string, redact bool, budget *int) (string, bool, error) {
 	class, err := classifyExportBody(value, "", "", "", "", field, budget, false)
 	if err == nil && (class.kind != exportCleanText || class.order != nil) {
 		err = &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
+	}
+	if err == nil {
+		err = scanBodyEntities(value, field, redact, budget)
 	}
 	if redact && replaceUnscannable(err) {
 		return "REDACTED", true, nil

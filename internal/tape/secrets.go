@@ -43,10 +43,10 @@ func PrepareExport(t Tape, redact bool) (Tape, error) {
 		return Tape{}, err
 	}
 	budget := 64 << 20
-	v, changed, err := scanValue(reflect.ValueOf(t), "$", false, &budget)
+	v, changed, err := scanValue(reflect.ValueOf(t), "$", false, t.exportGeneratedMarkers, &budget)
 	redacted := err != nil && redact
 	if redacted {
-		v, changed, err = scanValue(reflect.ValueOf(t), "$", true, &budget)
+		v, changed, err = scanValue(reflect.ValueOf(t), "$", true, t.exportGeneratedMarkers, &budget)
 	}
 	if err != nil {
 		return Tape{}, err
@@ -60,7 +60,8 @@ func PrepareExport(t Tape, redact bool) (Tape, error) {
 	}
 	if redacted {
 		out.Redacted = true
-		if _, _, err := scanValue(reflect.ValueOf(out), "$", false, &budget); err != nil {
+		out.exportGeneratedMarkers = true
+		if _, _, err := scanValue(reflect.ValueOf(out), "$", false, true, &budget); err != nil {
 			return Tape{}, err
 		}
 	}

@@ -61,6 +61,9 @@ type Tape struct {
 	IgnoreJSONPaths  []string       `yaml:"ignore_json_paths,omitempty" json:"ignore_json_paths,omitempty"`
 	Redacted         bool           `yaml:"redacted,omitempty" json:"redacted,omitempty"`
 	Expect           Expect         `yaml:"expect,omitempty" json:"expect,omitempty"`
+
+	// Only PrepareExport can authorize a marker for its in-memory result.
+	exportGeneratedMarkers bool
 }
 type ConfigChange struct {
 	BeforeSeq uint64       `yaml:"before_seq" json:"before_seq"`
@@ -283,11 +286,16 @@ func decode(r io.Reader, cassetteLimit, rawLimit int) (Tape, error) {
 	}
 	return t, nil
 }
-func Encode(w io.Writer, t Tape) error {
+func Encode(w io.Writer, t Tape) (err error) {
 	out, err := PrepareExport(t, false)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if recover() != nil {
+			err = unsupportedExportValue("$")
+		}
+	}()
 	e := yaml.NewEncoder(w)
 	defer e.Close()
 	return e.Encode(out)

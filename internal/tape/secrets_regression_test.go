@@ -185,11 +185,11 @@ func TestScannerCompressedExpansionLimit(t *testing.T) {
 	one := Cassette{Response: response}
 	const work = 1 << 20
 	budget := work
-	if _, _, err := scanValue(reflect.ValueOf(Tape{Cassettes: []Cassette{one}}), "$", false, &budget); err != nil {
+	if _, _, err := scanValue(reflect.ValueOf(Tape{Cassettes: []Cassette{one}}), "$", false, false, &budget); err != nil {
 		t.Fatalf("one compressed body: %v", err)
 	}
 	budget = 2*(work-budget) - 1
-	if _, _, err := scanValue(reflect.ValueOf(Tape{Cassettes: []Cassette{one, one}}), "$", false, &budget); err == nil {
+	if _, _, err := scanValue(reflect.ValueOf(Tape{Cassettes: []Cassette{one, one}}), "$", false, false, &budget); err == nil {
 		t.Fatal("accepted excessive aggregate expansion")
 	}
 }
