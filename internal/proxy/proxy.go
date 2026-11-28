@@ -1340,8 +1340,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					_ = source.Close()
 					responseRecord.Body = capture.body
 					responseRecord.UnscannableEncoding = responseRecord.UnscannableEncoding && capture.seen
-					responseRecord.Truncated = responseRecord.Truncated || raw.remaining == 0
 					if capture.failed && encoding != "" && encoding != "identity" && raw.err == nil && !capture.truncated {
+						responseRecord.Truncated = responseRecord.Truncated || raw.remaining == 0
 						responseRecord.Body = nil
 						responseRecord.UnscannableEncoding = raw.remaining < maxBody+1
 					} else {
