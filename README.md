@@ -93,6 +93,8 @@ glitchdeck test --mode replay examples/tapes/your-app-openai-sse-cassette.tape.y
 ```
 
 Exports block when the [secret scanner](docs/v2.3.0.md) finds a supported credential pattern. To replace matches with `REDACTED` and rescan, use `--redact-secrets` in record mode or the matching console/MCP export option. Review tapes before sharing: this is a fixed pattern set, not a guarantee that every credential is removed.
+
+The secret check is a best-effort guard against accidental credential leaks in recorded traffic. It is not a defence against a deliberately crafted tape or upstream response; review tapes from untrusted sources before sharing.
 Wire logs and telemetry are not secret-scanned; do not share them.
 
 | Exit | Meaning |
