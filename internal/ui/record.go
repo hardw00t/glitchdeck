@@ -107,8 +107,12 @@ func (r *Recording) SetCassetteMetadata(target string, ignoreJSONPaths []string)
 	r.rec.mu.Lock()
 	defer r.rec.mu.Unlock()
 	r.rec.target = target
-	r.rec.ignoreJSONPaths = slices.Clone(ignoreJSONPaths)
-	r.rec.bodyMatcher = tape.NewBodyMatcher(r.rec.ignoreJSONPaths)
+	r.rec.setIgnoreJSONPaths(ignoreJSONPaths)
+}
+
+func (r *recorder) setIgnoreJSONPaths(paths []string) {
+	r.ignoreJSONPaths = slices.Clone(paths)
+	r.bodyMatcher = tape.NewBodyMatcher(r.ignoreJSONPaths)
 }
 
 func (r *Recording) SetDemoHTTPAuthority(authority string) {

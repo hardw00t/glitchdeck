@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -59,7 +58,8 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	if opts.Recording != nil {
 		c.rec = &opts.Recording.rec
 	} else {
-		c.rec = &recorder{ignoreJSONPaths: slices.Clone(opts.IgnoreJSONPaths)}
+		c.rec = &recorder{}
+		c.rec.setIgnoreJSONPaths(opts.IgnoreJSONPaths)
 		c.rec.attach(p)
 	}
 	if demo, err := url.Parse(opts.DemoURL); err == nil && demo.Scheme == "http" {
