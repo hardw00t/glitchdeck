@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -654,9 +654,9 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		return map[string]any{"ok": true, "version": t.Version, "name": t.Name, "rules": len(t.Rules)}, nil
 	case "tape_export":
 		var a struct {
-			Name    string `json:"name"`
-			OutPath string `json:"out_path"`
-			Format  string `json:"format"`
+			Name          string `json:"name"`
+			RedactSecrets bool   `json:"redact_secrets"`
+			Format        string `json:"format"`
 		}
 		if json.Unmarshal(raw, &a) != nil {
 			return nil, malformedArgs()
@@ -668,29 +668,39 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		if e != nil {
 			return fail("INVALID_TAPE", e.Error()), nil
 		}
-		if a.Format == "v1" {
-			if t.Version == 2 {
-				return fail("VERSION_CONFLICT", `recording uses v2-only features (tls_mitm, stream, url/proto); export with format "v2"`), nil
-			}
-		} else {
-			t.Version = 2
-		}
 		if s.isDemo {
 			t.Target = "demo"
 		} else {
 			t.Target = s.target
 		}
-		limit := 64 << 10
-		if a.OutPath != "" {
-			limit = 1 << 20
+		t, e = tape.PrepareExport(t, a.RedactSecrets)
+		if e != nil {
+			var blocked *tape.ExportBlockedError
+			if errors.As(e, &blocked) {
+				return fail("EXPORT_BLOCKED", e.Error()), nil
+			}
+			return fail("INVALID_TAPE", e.Error()), nil
 		}
-		b, e := encodeExport(&t, limit)
+		if a.Format == "v1" || a.Format == "v2" {
+			if a.Format == "v1" && usesV2(t) {
+				return fail("VERSION_CONFLICT", `recording uses v2-only features; export with format "v2"`), nil
+			}
+			markLegacyForwardIncomplete(&t)
+			t.Cassettes, t.IgnoreJSONPaths = nil, nil
+			if a.Format == "v1" {
+				t.Version = 1
+			} else {
+				t.Version = 2
+			}
+		} else if len(t.Cassettes) != 0 {
+			t.Version = 3
+		} else {
+			t.Version = 2
+		}
+		b, e := encodeExport(&t, 64<<10)
 		if e != nil {
 			if e == errExportSize {
-				if a.OutPath == "" {
-					return fail("INVALID_PATH", "use out_path for large tapes"), nil
-				}
-				return fail("INVALID_TAPE", "tape exceeds 1 MiB"), nil
+				return fail("INVALID_TAPE", "tape exceeds export size limit"), nil
 			}
 			return fail("INVALID_TAPE", e.Error()), nil
 		}
@@ -698,41 +708,14 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		if a.Format != "v1" && decodeErr != nil && !t.Incomplete {
 			return fail("INVALID_TAPE", "recording did not encode a valid tape"), nil
 		}
-		res := map[string]any{"name": a.Name, "steps": len(t.Script), "rules": len(t.Rules), "incomplete": t.Incomplete, "version": t.Version, "replayable": !t.Incomplete && decodeErr == nil}
+		res := map[string]any{"name": t.Name, "steps": len(t.Script), "rules": len(t.Rules), "incomplete": t.Incomplete, "version": t.Version, "replayable": !t.Incomplete && decodeErr == nil}
 		if t.Truncated {
 			res["truncated"], res["dropped_entries"] = true, t.DroppedEntries
 		}
 		if t.OmittedBodyBytes > 0 {
 			res["omitted_body_bytes"] = t.OmittedBodyBytes
 		}
-		if a.OutPath == "" {
-			res["yaml"] = b
-		} else {
-			path, e := s.outputPath(a.OutPath)
-			if e != nil {
-				return fail("INVALID_PATH", e.Error()), nil
-			}
-			base := s.opts.Workdir
-			if base == "" {
-				base = "."
-			}
-			base, e = filepath.Abs(base)
-			if e == nil {
-				base, e = filepath.EvalSymlinks(base)
-			}
-			var relative string
-			if e == nil {
-				relative, e = filepath.Rel(base, path)
-			}
-			if e != nil {
-				return fail("INVALID_PATH", e.Error()), nil
-			}
-			if e = s.writeTape(path, []byte(b)); e != nil {
-				return fail("INVALID_PATH", e.Error()), nil
-			}
-			res["out_path"] = path
-			res["tape_path"] = relative
-		}
+		res["yaml"] = b
 		if t.Truncated {
 			LogDiagnostic(fmt.Sprintf("tape export truncated: dropped_entries=%d", t.DroppedEntries))
 		}
@@ -830,6 +813,69 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 	}
 }
 
+func markLegacyForwardIncomplete(t *tape.Tape) {
+	if t.Incomplete {
+		return
+	}
+	for _, step := range t.Script {
+		raw := ""
+		if step.HTTP != nil {
+			raw = step.HTTP.URL
+		} else if step.Stream != nil {
+			raw = step.Stream.URL
+		}
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || !strings.EqualFold(u.Hostname(), "localhost") && !net.ParseIP(u.Hostname()).IsLoopback() {
+			t.Incomplete = true
+			t.IncompleteReason = "forwarded traffic requires explicit upstream authorization for replay"
+			return
+		}
+	}
+}
+
+func usesV2(t tape.Tape) bool {
+	if t.TLSMITM {
+		return true
+	}
+	for _, step := range t.Script {
+		if step.Stream != nil || step.GRPC != nil || step.HTTP != nil && (step.HTTP.URL != "" || step.HTTP.Proto != "") {
+			return true
+		}
+	}
+	check := func(rules []fault.Rule) bool {
+		for _, r := range rules {
+			if r.Fault.Type == "sse-glitch" || r.Fault.Type == "grpc-glitch" || r.Fault.Type == "h2-glitch" || r.Match.Host != "" || r.Match.Scheme != "" || r.Match.Proto != "" {
+				return true
+			}
+		}
+		return false
+	}
+	if check(t.Rules) {
+		return true
+	}
+	for _, change := range t.ConfigChanges {
+		if check(change.Rules) {
+			return true
+		}
+	}
+	return false
+}
+
+func compressedBody(headers map[string]string) bool {
+	for k, v := range headers {
+		if strings.EqualFold(k, "Content-Encoding") {
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "gzip", "x-gzip", "deflate":
+				return true
+			}
+		}
+	}
+	return false
+}
+
 var errExportSize = errors.New("tape exceeds export size limit without request bodies")
 
 func encodeExport(t *tape.Tape, limit int) (string, error) {
@@ -844,48 +890,113 @@ func encodeExport(t *tape.Tape, limit int) (string, error) {
 	}
 	t.Script = append([]tape.Step(nil), t.Script...)
 	type capturedBody struct {
-		target *string
-		value  string
+		target       *string
+		value        string
+		truncated    *bool
+		wasTruncated bool
+		base64       bool
+		compressed   bool
+		cassette     int
 	}
 	var bodies []capturedBody
 	total := 0
 	for i := range t.Script {
 		step := &t.Script[i]
 		var body *string
+		var headers map[string]string
 		if step.HTTP != nil {
 			h := *step.HTTP
 			step.HTTP = &h
 			body = &h.Body
+			headers = h.Headers
 		} else if step.Stream != nil {
 			stream := *step.Stream
 			step.Stream = &stream
 			body = &stream.Body
+			headers = stream.Headers
 		}
 		if body != nil && *body != "" {
-			bodies = append(bodies, capturedBody{body, *body})
+			bodies = append(bodies, capturedBody{target: body, value: *body, compressed: compressedBody(headers)})
 			total += len(*body)
 		}
 	}
-	if total == 0 {
-		return "", errExportSize
+	t.Cassettes = append([]tape.Cassette(nil), t.Cassettes...)
+	for i := range t.Cassettes {
+		response := &t.Cassettes[i].Response
+		if response.Body != "" {
+			bodies = append(bodies, capturedBody{target: &response.Body, value: response.Body, truncated: &response.Truncated, wasTruncated: response.Truncated, base64: response.BodyEncoding == "base64", compressed: compressedBody(response.Headers), cassette: i + 1})
+			total += len(response.Body)
+		}
 	}
 	previousOmitted := t.OmittedBodyBytes
 	t.Truncated, t.Incomplete = true, true
 	if t.IncompleteReason == "" {
-		t.IncompleteReason = "recorded request body was truncated for export"
+		t.IncompleteReason = "recording exceeded export size limit"
 	}
 	retain := func(n int) {
-		t.OmittedBodyBytes = previousOmitted + total - n
+		omitted := 0
 		for i := len(bodies) - 1; i >= 0; i-- {
 			keep := min(n, len(bodies[i].value))
+			if bodies[i].compressed && keep < len(bodies[i].value) {
+				keep = 0
+			}
+			if bodies[i].base64 && keep < len(bodies[i].value) {
+				keep -= keep % 4
+			}
 			*bodies[i].target = bodies[i].value[:keep]
+			if bodies[i].truncated != nil {
+				*bodies[i].truncated = bodies[i].wasTruncated || keep < len(bodies[i].value)
+			}
+			omitted += len(bodies[i].value) - keep
 			n -= keep
 		}
+		t.OmittedBodyBytes = previousOmitted + omitted
 	}
 	retain(0)
 	data, err = encode()
 	if err != nil {
 		return "", err
+	}
+	if len(data) > limit && len(t.Cassettes) != 0 {
+		cassettes := t.Cassettes
+		low, high, removed := 1, len(cassettes), len(cassettes)+1
+		for low <= high {
+			mid := low + (high-low)/2
+			t.Cassettes = cassettes[mid:]
+			candidate, encodeErr := encode()
+			if encodeErr != nil {
+				return "", encodeErr
+			}
+			if len(candidate) <= limit {
+				removed = mid
+				high = mid - 1
+			} else {
+				low = mid + 1
+			}
+		}
+		if removed > len(cassettes) {
+			return "", errExportSize
+		}
+		t.Cassettes = cassettes[removed:]
+		if len(t.Cassettes) == 0 {
+			t.Version = 2
+			t.IgnoreJSONPaths = nil
+		}
+		kept := bodies[:0]
+		total = 0
+		for _, body := range bodies {
+			if body.cassette != 0 && body.cassette <= removed {
+				continue
+			}
+			kept = append(kept, body)
+			total += len(body.value)
+		}
+		bodies = kept
+		retain(0)
+		data, err = encode()
+		if err != nil {
+			return "", err
+		}
 	}
 	if len(data) > limit {
 		return "", errExportSize
@@ -973,77 +1084,4 @@ func (s *Server) readTapeBytes(path string) ([]byte, error) {
 		return nil, errors.New("tape exceeds 1 MiB")
 	}
 	return data, nil
-}
-
-func (s *Server) writeTape(path string, data []byte) error {
-	base := s.opts.Workdir
-	if base == "" {
-		base = "."
-	}
-	root, err := os.OpenRoot(base)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	base, err = filepath.Abs(base)
-	if err != nil {
-		return err
-	}
-	base, err = filepath.EvalSymlinks(base)
-	if err != nil {
-		return err
-	}
-	rel, err := filepath.Rel(base, path)
-	if err != nil {
-		return err
-	}
-	tmp := filepath.Join(filepath.Dir(rel), ".glitchdeck-"+rand.Text())
-	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	defer root.Remove(tmp)
-	_, err = f.Write(data)
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	return root.Rename(tmp, rel)
-}
-func (s *Server) outputPath(p string) (string, error) {
-	if strings.ContainsRune(p, 0) || (filepath.Ext(p) != ".yaml" && filepath.Ext(p) != ".yml") {
-		return "", fmt.Errorf("output must be YAML")
-	}
-	base := s.opts.Workdir
-	if base == "" {
-		base = "."
-	}
-	base, e := filepath.Abs(base)
-	if e != nil {
-		return "", e
-	}
-	base, e = filepath.EvalSymlinks(base)
-	if e != nil {
-		return "", e
-	}
-	target := s.path(p)
-	parent, e := filepath.EvalSymlinks(filepath.Dir(target))
-	if e != nil {
-		return "", e
-	}
-	parent, e = filepath.Abs(parent)
-	if e != nil {
-		return "", e
-	}
-	rel, e := filepath.Rel(base, parent)
-	if e != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("output outside workdir")
-	}
-	dest := filepath.Join(parent, filepath.Base(target))
-	if info, e := os.Lstat(dest); e == nil && info.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("output is symlink")
-	}
-	return dest, nil
 }

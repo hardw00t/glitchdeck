@@ -460,6 +460,9 @@ $("#copy-cli").onclick = async () => {
     message("Clipboard unavailable");
   }
 };
+$("#redact-secrets").onchange = (event) => {
+  $("#export-button").href = event.target.checked ? "/api/tape/export?redact_secrets=true" : "/api/tape/export";
+};
 $("#export-button").onclick = () => {
   if (tape.events || tape.incomplete) message("Tape exported");
 };

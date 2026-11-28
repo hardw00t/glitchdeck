@@ -573,6 +573,19 @@ func TestControlRecordsReplayableCheckout(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if doc.Version != 3 || len(doc.Cassettes) == 0 {
+		t.Fatal("console export did not include upstream responses")
+	}
+	_, playback, err := tape.RunReplay(ctx, doc, "", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := playback.Rules["dup-webhook"]
+	if stats.Applied != 1 || stats.Replays == nil || stats.Replays.Status["200"] != 1 {
+		t.Fatalf("offline checkout did not replay the duplicate response: %+v", stats)
+	}
+	// Payment state is a live demo invariant, not an effect of an offline HTTP response.
+	doc.Assertions = append(doc.Assertions, tape.Assertion{Name: "demo invariants", HTTPGet: "/api/state", Direct: true, ExpectStatus: 200, JSONEq: map[string]any{"duplicate_charges": 0}})
 	results, err := tape.Run(ctx, doc, "")
 	if err != nil {
 		t.Fatal(err)

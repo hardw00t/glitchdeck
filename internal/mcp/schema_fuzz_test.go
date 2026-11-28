@@ -47,7 +47,8 @@ func TestSchemaErrorDetails(t *testing.T) {
 		{"exec_run", `{"command":[""]}`, "arguments.command[0]", "too_short"},
 		{"exec_run", `{"command":["ok"],"timeout_sec":301}`, "arguments.timeout_sec", "out_of_range"},
 		{"exec_run", `{"command":["ok"],"seed":1.5}`, "arguments.seed", "not_integer"},
-		{"tape_export", `{"name":"n","format":"v3"}`, "arguments.format", "not_in_enum"},
+		{"tape_export", `{"name":"n","format":"v4"}`, "arguments.format", "not_in_enum"},
+		{"tape_export", `{"name":"n","out_path":"capture.yaml"}`, "arguments.out_path", "unknown_field"},
 		{"proxy_stop", `{"z":1,"a":2}`, "arguments.a", "unknown_field"},
 		{"fault_set", `{}`, "arguments.rules", "required"},
 	}

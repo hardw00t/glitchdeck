@@ -1,0 +1,31 @@
+version: 3
+name: your-app-openai-sse-cassette
+target: demo
+rules:
+  - id: openai-stream-cut
+    enabled: true
+    match: {method: POST, path_prefix: /v1/chat/completions}
+    fault: {type: sse-glitch, params: {action: eof_early, after_events: 3, http_clean: true}}
+script:
+  - name: chat
+    stream: {method: POST, path: /v1/chat/completions, body: '{"model":"local","stream":true}'}
+cassettes:
+  - request: {method: POST, path: /v1/chat/completions}
+    response:
+      status: 200
+      headers: {Content-Type: text/event-stream}
+      body: |+
+        data: {"choices":[{"delta":{"content":"one"}}]}
+
+        data: {"choices":[{"delta":{"content":"two"}}]}
+
+        data: {"choices":[{"delta":{"content":"three"}}]}
+
+        data: {"choices":[{"delta":{"content":"four"},"finish_reason":"stop"}]}
+
+        data: [DONE]
+
+assertions:
+  - {name: truncated, stream_step: chat, expect_sse: {end: eof_early, done: false}}
+expect:
+  faults: [{rule: openai-stream-cut, min_applied: 1}]

@@ -39,6 +39,7 @@ type Options struct {
 	RequireUpstreamAllow bool
 	AllowLoopbackEgress  bool
 	SuppressStderr       bool
+	CassetteUpstream     func(*http.Request) (*http.Response, error)
 }
 
 type RuleStats struct {
@@ -223,6 +224,9 @@ func H2CProtocols() *http.Protocols {
 }
 
 func (p *Proxy) allowed(host, port string) bool {
+	if p.options.CassetteUpstream != nil {
+		return host != "" && port != ""
+	}
 	return upstreamAllowed(host, port, p.options.UpstreamAllow)
 }
 
@@ -306,6 +310,9 @@ func (p *Proxy) DialContext(ctx context.Context, network, addr string) (net.Conn
 }
 
 func (p *Proxy) dialWithPolicy(ctx context.Context, network, addr string, restrict bool) (net.Conn, error) {
+	if p.options.CassetteUpstream != nil {
+		return nil, errEgressDenied
+	}
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err

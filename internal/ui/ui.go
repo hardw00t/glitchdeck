@@ -29,7 +29,10 @@ var assets embed.FS
 
 const maxInput = 16 << 20
 
-type Options struct{ Target, Listen, UI, DemoURL, ProxyAuth string }
+type Options struct {
+	Target, Listen, UI, DemoURL, ProxyAuth string
+	Recording                              *Recording
+}
 
 type control struct {
 	Options
@@ -37,7 +40,7 @@ type control struct {
 	bus         *telemetry.Bus
 	client      *http.Client
 	cfgMu       sync.Mutex
-	rec         recorder
+	rec         *recorder
 	broken      atomic.Bool
 	streamSlots chan struct{}
 	streamID    atomic.Uint64
@@ -50,7 +53,12 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
 	c.streamSlots = make(chan struct{}, 4)
-	c.rec.attach(p)
+	if opts.Recording != nil {
+		c.rec = &opts.Recording.rec
+	} else {
+		c.rec = &recorder{}
+		c.rec.attach(p)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		cfg := c.p.Config()
@@ -374,9 +382,19 @@ func (c *control) export(w http.ResponseWriter, r *http.Request) {
 	doc := c.rec.tape(c.p.Config())
 	c.cfgMu.Unlock()
 	doc.Name, doc.Target = "glitchdeck-recording", c.Target
+	if doc.Version < 3 {
+		doc.Version = 2
+	}
 	if c.DemoURL != "" {
 		doc.Target = "demo"
-		doc.Assertions = []tape.Assertion{{Name: "demo invariants", HTTPGet: "/api/state", Direct: true, ExpectStatus: 200, JSONEq: map[string]any{"duplicate_charges": 0, "ws_broken": false}}}
+		if doc.Version < 3 {
+			doc.Assertions = []tape.Assertion{{Name: "demo invariants", HTTPGet: "/api/state", Direct: true, ExpectStatus: 200, JSONEq: map[string]any{"duplicate_charges": 0, "ws_broken": false}}}
+		}
+	}
+	doc, err := tape.PrepareExport(doc, r.URL.Query().Get("redact_secrets") == "true")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	var data bytes.Buffer
 	if err := tape.Encode(&data, doc); err != nil {

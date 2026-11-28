@@ -55,6 +55,9 @@ type Tape struct {
 	TLSMITM          bool           `yaml:"tls_mitm,omitempty" json:"tls_mitm,omitempty"`
 	UpstreamAllow    []string       `yaml:"upstream_allow,omitempty" json:"upstream_allow,omitempty"`
 	TLSPassthrough   []string       `yaml:"tls_passthrough,omitempty" json:"tls_passthrough,omitempty"`
+	Cassettes        []Cassette     `yaml:"cassettes,omitempty" json:"cassettes,omitempty"`
+	IgnoreJSONPaths  []string       `yaml:"ignore_json_paths,omitempty" json:"ignore_json_paths,omitempty"`
+	Redacted         bool           `yaml:"redacted,omitempty" json:"redacted,omitempty"`
 	Expect           Expect         `yaml:"expect,omitempty" json:"expect,omitempty"`
 }
 type ConfigChange struct {
@@ -141,6 +144,10 @@ func Decode(r io.Reader) (Tape, error) {
 			}
 		}
 	}
+	if (t.Version == 1 || t.Version == 2) && len(doc.Content) != 0 &&
+		(yamlField(doc.Content[0], "cassettes") != nil || yamlField(doc.Content[0], "ignore_json_paths") != nil) {
+		return t, fmt.Errorf("new keys require version: 3")
+	}
 	if t.Version == 1 || len(t.Expect.Faults) != 0 {
 		if len(doc.Content) == 0 {
 			return t, fmt.Errorf("empty tape document")
@@ -155,7 +162,7 @@ func Decode(r io.Reader) (Tape, error) {
 			return t, err
 		}
 	}
-	if t.Version == 2 && len(doc.Content) != 0 {
+	if t.Version >= 2 && len(doc.Content) != 0 {
 		for i, item := range yamlItems(yamlField(doc.Content[0], "tls_passthrough")) {
 			if item.Kind == yaml.AliasNode {
 				item = item.Alias
@@ -170,13 +177,35 @@ func Decode(r io.Reader) (Tape, error) {
 	}
 	return t, nil
 }
-func Encode(w io.Writer, t Tape) error { e := yaml.NewEncoder(w); defer e.Close(); return e.Encode(t) }
+func Encode(w io.Writer, t Tape) error {
+	if _, err := PrepareExport(t, false); err != nil {
+		return err
+	}
+	e := yaml.NewEncoder(w)
+	defer e.Close()
+	return e.Encode(t)
+}
 func validPath(p string) bool {
 	return strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") && !strings.ContainsAny(p, "\r\n")
 }
 func validate(t Tape) error {
-	if t.Version != 1 && t.Version != 2 {
+	if t.Version != 1 && t.Version != 2 && t.Version != 3 {
 		return fmt.Errorf("unsupported tape version %d", t.Version)
+	}
+	if t.Version < 3 && (len(t.Cassettes) != 0 || len(t.IgnoreJSONPaths) != 0) {
+		return fmt.Errorf("new keys require version: 3")
+	}
+	for i, c := range t.Cassettes {
+		if !validCassetteMethod(c.Request.Method) || !validPath(c.Request.Path) || strings.ContainsAny(c.Request.Path, "?#") {
+			return fmt.Errorf("cassettes[%d]: invalid request", i)
+		}
+		if c.Response.Status < 100 || c.Response.Status > 599 {
+			return fmt.Errorf("cassettes[%d]: invalid response status", i)
+		}
+		body, err := c.Response.Bytes()
+		if err != nil || len(body) > maxCassetteBody || c.Response.Truncated {
+			return fmt.Errorf("cassettes[%d]: invalid or truncated response body", i)
+		}
 	}
 	if t.Version == 1 {
 		if t.TLSMITM || len(t.UpstreamAllow) != 0 || len(t.TLSPassthrough) != 0 || t.Expect.ChildExit != nil || len(t.Expect.Faults) != 0 {
@@ -437,16 +466,27 @@ func RunWithOptions(ctx context.Context, t Tape, targetOverride, caDir string) (
 }
 
 func RunWithTLS(ctx context.Context, t Tape, targetOverride, caDir string, tlsOverride bool) ([]Result, RunReport, error) {
+	return runWithMode(ctx, t, targetOverride, caDir, tlsOverride, false)
+}
+
+func RunReplay(ctx context.Context, t Tape, targetOverride, caDir string, tlsOverride bool) ([]Result, RunReport, error) {
+	return runWithMode(ctx, t, targetOverride, caDir, tlsOverride, true)
+}
+
+func runWithMode(ctx context.Context, t Tape, targetOverride, caDir string, tlsOverride, replay bool) ([]Result, RunReport, error) {
 	if err := validate(t); err != nil {
 		return nil, RunReport{}, err
 	}
 	t.TLSMITM = t.TLSMITM || tlsOverride
 	var report RunReport
-	results, err := run(ctx, t, targetOverride, caDir, &report)
+	results, err := run(ctx, t, targetOverride, caDir, &report, replay)
 	return results, report, err
 }
 
-func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunReport) ([]Result, error) {
+func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunReport, replay bool) (results []Result, runErr error) {
+	if replay && t.Version == 3 && len(t.Cassettes) == 0 {
+		return nil, &proxy.CassetteError{Kind: "cassette_miss"}
+	}
 	target := t.Target
 	if targetOverride != "" {
 		target = targetOverride
@@ -474,7 +514,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		roots.AddCert(ca.Cert)
 	}
 	var app *httptest.Server
-	isDemo := target == "demo"
+	isDemo := !replay && target == "demo"
 	if isDemo {
 		handler := demo.New()
 		app = httptest.NewUnstartedServer(handler)
@@ -502,16 +542,34 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		}
 	}
 	for _, a := range t.Assertions {
+		if replay && a.Direct {
+			return nil, fmt.Errorf("direct assertions are not available in replay mode")
+		}
 		if a.Direct && (!isDemo || a.HTTPGet != "/api/state") {
 			return nil, fmt.Errorf("direct assertions require demo /api/state")
 		}
 	}
-	u, err := proxy.ParseTarget(target)
-	if err != nil && len(t.UpstreamAllow) != 0 {
-		u, err = proxy.ParseExplicitTarget(target)
-	}
-	if err != nil {
-		return nil, err
+	var u *url.URL
+	if replay {
+		if target == "demo" {
+			target = "http://127.0.0.1"
+		}
+		if target != "" {
+			var err error
+			u, err = proxy.ParseExplicitTarget(target)
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		var err error
+		u, err = proxy.ParseTarget(target)
+		if err != nil && len(t.UpstreamAllow) != 0 {
+			u, err = proxy.ParseExplicitTarget(target)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	p := proxy.New(u, fault.Config{Seed: t.Seed, Rules: t.Rules}, telemetry.New())
 	var frameErrors proxy.FrameErrorLog
@@ -522,8 +580,17 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		report.RequestsTotal = p.RequestsTotal()
 		report.AppliedFaults = p.AppliedFaults()
 		report.FrameErrors, report.FrameErrorsOmitted = frameErrors.Snapshot()
+		if replay {
+			if err := p.CassetteFailure(); err != nil {
+				results, runErr = nil, err
+			}
+		}
 	}()
-	p.SetOptions(proxy.Options{CA: ca, UpstreamCA: upstreamRoots, UpstreamAllow: t.UpstreamAllow, TLSPassthrough: t.TLSPassthrough, Demo: isDemo, RequireUpstreamAllow: true})
+	opts := proxy.Options{CA: ca, UpstreamCA: upstreamRoots, UpstreamAllow: t.UpstreamAllow, TLSPassthrough: t.TLSPassthrough, Demo: isDemo, RequireUpstreamAllow: true}
+	if replay {
+		opts.CassetteUpstream = t.CassetteUpstream()
+	}
+	p.SetOptions(opts)
 	var outcomeMu sync.Mutex
 	type wsEvidence struct {
 		drop    time.Time
@@ -830,7 +897,7 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 		}
 	}
 	outcomeMu.Unlock()
-	results := make([]Result, 0, len(t.Assertions))
+	results = make([]Result, 0, len(t.Assertions))
 	diagnostics := assertionDiagnostics{remaining: assertionDiagnosticBudget}
 	for _, a := range t.Assertions {
 		result := Result{Name: a.Name, Failures: []string{}}

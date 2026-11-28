@@ -231,7 +231,7 @@ func (p *Proxy) sequentialReplays(r *http.Request, body []byte, seq, gen uint64,
 	if !u.IsAbs() {
 		u = p.target
 	}
-	if u == nil || !p.allowed(u.Hostname(), upstreamPort(u.Scheme, u.Port())) {
+	if p.options.CassetteUpstream == nil && (u == nil || !p.allowed(u.Hostname(), upstreamPort(u.Scheme, u.Port()))) {
 		authority := ""
 		if u != nil {
 			authority = u.Host
@@ -280,7 +280,7 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 		ctx = context.WithValue(ctx, http.LocalAddrContextKey, local)
 	}
 	q := p.upstream(r, body, ctx)
-	if q == nil || !p.allowed(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port())) {
+	if q == nil || p.options.CassetteUpstream == nil && !p.allowed(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port())) {
 		authority := ""
 		if q != nil {
 			authority = q.URL.Host
@@ -295,14 +295,20 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 	replayCtx, cancel := context.WithTimeout(ctx, time.Duration(fault.Int(params, "replay_timeout_ms", 5000))*time.Millisecond)
 	defer cancel()
 	q = q.WithContext(replayCtx)
-	transport := p.transportFor(replayCtx, r.ProtoMajor == 2 && q.URL.Scheme == "http")
 	start := time.Now()
 	if clock != nil {
 		clock.start()
 	}
-	resp, err := transport.RoundTrip(q)
-	if origin, _ := r.Context().Value(replayDialOriginKey{}).(*replayDialOrigin); origin != nil && (origin.client.Err() == nil || origin.completed.Load()) {
-		p.noteRoundTripDial(replayCtx, gen, q.URL.Host, origin.reverse, err)
+	var resp *http.Response
+	var err error
+	if p.options.CassetteUpstream != nil {
+		resp, err = p.cassetteResponse(q)
+	} else {
+		transport := p.transportFor(replayCtx, r.ProtoMajor == 2 && q.URL.Scheme == "http")
+		resp, err = transport.RoundTrip(q)
+		if origin, _ := r.Context().Value(replayDialOriginKey{}).(*replayDialOrigin); origin != nil && (origin.client.Err() == nil || origin.completed.Load()) {
+			p.noteRoundTripDial(replayCtx, gen, q.URL.Host, origin.reverse, err)
+		}
 	}
 	if clock != nil {
 		clock.record()

@@ -68,7 +68,7 @@ glitchdeck test --json examples/clean.tape.yaml
 glitchdeck test examples/checkout-dup-webhook.tape.yaml
 ```
 
-The checkout regression tape exits `1` and reports `duplicate_charges: expected 0, got 1`. [Example packs](examples/tapes/) show faults against the bundled demo and an OpenAI-compatible upstream. Version 1 tapes keep the original `test --json` array. Version 2 tapes and `exec --json` emit a versioned object with assertions and applied faults. `--report` saves that object to a file.
+The checkout regression tape exits `1` and reports `duplicate_charges: expected 0, got 1`. [Example packs](examples/tapes/) show faults against the bundled demo and an OpenAI-compatible upstream. Version 1 tapes keep the original `test --json` array. Version 2 and 3 tapes and `exec --json` emit a versioned object with assertions and applied faults. `--report` saves that object to a file.
 
 `exec` injects `GLITCHDECK_PROXY_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and lowercase proxy variants. Both `NO_PROXY` cases receive the same deduplicated list: inherited entries are kept unless they would bypass the target (dropped with a warning), `--no-proxy` entries are kept verbatim, and the listener address is included. Passthrough is not added to `NO_PROXY`: the connection still goes through glitchdeck. Use `GLITCHDECK_PROXY_URL` as the client base URL for reverse mode, including with Go clients that skip environment proxies for loopback.
 
@@ -81,6 +81,18 @@ Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers
 `exec` exits `1` for TLS-rejected-only traffic (`tls_rejected_only`), upstream-allowlist-denied-only traffic (`egress_denied_only`), no requests (`zero_traffic`), or enabled fault rules that never apply and do not all explicitly permit zero (`zero_faults`). `--allow-zero-traffic` skips all four checks; explicit fault and child-exit expectations still apply. `exec.traffic` reports CONNECT and inner-request counts, successful interception and tunnel counts, TLS rejections, egress denials, and dial failures. TLS handshake failures appear on stderr and in the wire log; `exec.tls_handshake_failure_count` counts them even if report details are omitted.
 
 `exec.traffic.dial_failed` counts dial failures visible to a request or replay, not background connection attempts abandoned by the transport. A counted reverse-target dial failure makes `exec` fail even with `--allow-zero-traffic` and names the target's host and port. `exec.traffic.egress_denied_hosts` and stderr list up to 10 denied hostnames, including in runs that also reach allowed hosts.
+
+### Record and replay HTTP cassettes
+
+- **Passthrough** (`--mode passthrough`, the default): use the live upstream and apply the tape's faults.
+- **Record** (`exec --mode record --tape-out recorded.yaml`): capture the live HTTP responses before faults mutate them. Gzip SSE is stored decoded, without `Content-Encoding`. The source tape stays unchanged unless you explicitly use its path for output.
+- **Replay** (`exec --mode replay` or `test --mode replay`): serve cassette responses in-process and apply the same faults without contacting the upstream. A miss returns HTTP 502 (`cassette_miss`); an unresolved tie reports `cassette_ambiguous`. Neither falls through to the network, and `--allow-zero-traffic` does not override them. Use `GLITCHDECK_PROXY_URL` as the child's base URL in reverse mode. The proxy does not sandbox a child that opens its own sockets.
+
+```sh
+glitchdeck test --mode replay examples/tapes/your-app-openai-sse-cassette.tape.yaml
+```
+
+Exports block when the [secret scanner](docs/v2.3.0.md) finds a supported credential pattern. To replace matches with `REDACTED` and rescan, use `--redact-secrets` in record mode or the matching console/MCP export option. Review tapes before sharing: this is a fixed pattern set, not a guarantee that every credential is removed.
 
 | Exit | Meaning |
 | --- | --- |
@@ -230,9 +242,9 @@ The ten tools are `proxy_start`, `proxy_stop`, `fault_set`, `fault_clear`, `wire
 
 `exec_run` takes an argv array, not a shell command string; inspect `ok` in its report for assertion failures. Remote targets require the server's `--upstream-allow`; an MCP call can never widen `--upstream-allow`. The `cwd` is resolved within the workdir, but a writable symlink can be swapped between validation and process start (TOCTOU). Windows process cleanup is best-effort and does not guarantee stopping grandchildren.
 
-`tape_export` emits v2 by default; request `format: "v1"` for a compatible recording. Incomplete exports report `replayable: false`.
+`tape_export` returns v3 YAML when it contains cassettes and v2 otherwise. Request `format: "v1"` or `"v2"` to omit cassettes; the scanner still checks them before conversion. MCP returns YAML inline only and does not write output files. Incomplete exports report `replayable: false`.
 
-Recordings strip common credential headers and `Referer`, and redact sensitive query values, including ambiguous semicolon-separated suffixes. Check bodies and other fields for credentials before sharing a tape. Ring eviction sets `truncated` and `dropped_entries`; MCP also reports `omitted_body_bytes` when it shortens bodies to fit the 64 KiB inline or 1 MiB file export limit. Recordings that omit bodies or trailers are incomplete and cannot be replayed.
+Recordings strip common credential headers and `Referer`, and redact sensitive query values, including ambiguous semicolon-separated suffixes. Response capture also strips `Set-Cookie`. Ring eviction marks the tape truncated; MCP reports `omitted_body_bytes` if it shortens bodies to fit its 64 KiB inline limit. Recordings that omit bodies or trailers are incomplete and cannot be replayed.
 
 Use `glitchdeck report --junit report.json` for CI test dashboards and `glitchdeck validate -` to lint tapes from stdin.
 

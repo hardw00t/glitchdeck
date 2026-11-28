@@ -46,6 +46,9 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	if valid && p.options.CA != nil {
 		pattern, passthrough = p.passthrough(host, port)
 	}
+	if p.options.CassetteUpstream != nil {
+		passthrough = false
+	}
 	intercept := valid && p.options.CA != nil && !passthrough
 	tunnel := "blind"
 	if passthrough {
@@ -74,6 +77,11 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	}
 	if ctx.Err() != nil {
 		http.Error(w, "proxy closed", http.StatusServiceUnavailable)
+		return
+	}
+	if p.options.CassetteUpstream != nil && !intercept {
+		p.failCassette("cassette_miss", r.Method, "/")
+		http.Error(w, "cassette tunnel unavailable", http.StatusBadGateway)
 		return
 	}
 	p.mu.Lock()

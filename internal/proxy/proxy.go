@@ -57,59 +57,151 @@ type Record struct {
 	HasTrailers        bool
 	BodyCaptureStarted bool
 }
+type ResponseRecord struct {
+	Seq       uint64
+	Status    int
+	Header    http.Header
+	Body      []byte
+	Truncated bool
+}
+
+type CassetteError struct {
+	Kind   string
+	Method string
+	Path   string
+}
+
+func (e *CassetteError) Error() string {
+	if e.Method == "" && e.Path == "" {
+		return e.Kind
+	}
+	return fmt.Sprintf("%s: %s %s", e.Kind, e.Method, e.Path)
+}
+
+func (p *Proxy) CassetteFailure() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cassetteFailure
+}
+
+func (p *Proxy) failCassette(kind, method, path string) *CassetteError {
+	err := &CassetteError{Kind: kind, Method: method, Path: path}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cassetteFailure == nil {
+		p.cassetteFailure = err
+	}
+	return err
+}
+
+func (p *Proxy) cassetteResponse(r *http.Request) (*http.Response, error) {
+	resp, err := p.options.CassetteUpstream(r)
+	if err == nil && resp != nil {
+		return resp, nil
+	}
+	kind := "cassette_miss"
+	var cassetteErr *CassetteError
+	if errors.As(err, &cassetteErr) && cassetteErr.Kind == "cassette_ambiguous" {
+		kind = cassetteErr.Kind
+	}
+	return nil, p.failCassette(kind, r.Method, r.URL.EscapedPath())
+}
+
+type responseCapture struct {
+	io.ReadCloser
+	body      []byte
+	truncated bool
+	failed    bool
+	eof       bool
+	reserve   func(int) int
+}
+
+func (c *responseCapture) Read(b []byte) (int, error) {
+	n, err := c.ReadCloser.Read(b)
+	remaining := maxBody - len(c.body)
+	take := min(n, remaining)
+	if c.reserve != nil && take > 0 {
+		take = max(0, min(take, c.reserve(take)))
+	}
+	c.body = append(c.body, b[:take]...)
+	if n > take {
+		c.truncated = true
+	}
+	if err == io.EOF {
+		c.eof = true
+	}
+	if err != nil && err != io.EOF {
+		c.failed = true
+	}
+	return n, err
+}
+
+func (c *responseCapture) finish() {
+	if !c.eof && !c.truncated && !c.failed {
+		_, err := io.Copy(io.Discard, io.LimitReader(c, int64(maxBody-len(c.body)+1)))
+		if err != nil {
+			c.failed = true
+		}
+	}
+}
+
 type Proxy struct {
-	target              *url.URL
-	cfg                 atomic.Pointer[fault.Config]
-	seq                 atomic.Uint64
-	requests            atomic.Uint64
-	connects            atomic.Int64
-	interceptedOK       atomic.Int64
-	tlsRejected         atomic.Int64
-	passthroughOK       atomic.Int64
-	blindOK             atomic.Int64
-	connectEgressDenied atomic.Int64
-	innerEgressDenied   atomic.Int64
-	replayDenied        int64
-	deniedHosts         []string
-	dialFailed          atomic.Int64
-	reverseDialFailed   atomic.Int64
-	innerUsable         atomic.Int64
-	interceptedEmpty    atomic.Int64
-	bus                 *telemetry.Bus
-	transports          [8]*http.Transport
-	gate                sync.Mutex
-	admission           sync.Mutex
-	resetBarrier        sync.RWMutex
-	generation          uint64
-	activeWS            int
-	activeTunnels       int
-	mu                  sync.Mutex
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	pending             int
-	active              int
-	replayWorkers       sync.WaitGroup
-	done                chan struct{}
-	closed              bool
-	draining            bool
-	options             Options
-	server              *http.Server
-	front               *front
-	stats               map[string]RuleStats
-	applied             map[appliedKey]uint64
-	replayCapacitySkips map[appliedKey]uint64
-	replayWarned        map[string]bool
-	sseEncodingWarned   map[string]bool
-	burstUsed           map[string]int
-	sseAdmission        map[string]chan []string
-	OnBlindTunnel       func(uint64)
-	OnSSE               func(uint64)
-	OnRequest           func(Record)
-	ShouldCaptureBody   func(uint64) bool
-	OnClientFrame       func(uint64, []byte)
-	OnServerFrame       func(uint64, string, byte)
-	OnUnsupportedFrame  func(uint64)
-	OnOutcome           func(Outcome)
+	target                *url.URL
+	cfg                   atomic.Pointer[fault.Config]
+	seq                   atomic.Uint64
+	requests              atomic.Uint64
+	connects              atomic.Int64
+	interceptedOK         atomic.Int64
+	tlsRejected           atomic.Int64
+	passthroughOK         atomic.Int64
+	blindOK               atomic.Int64
+	connectEgressDenied   atomic.Int64
+	innerEgressDenied     atomic.Int64
+	replayDenied          int64
+	deniedHosts           []string
+	dialFailed            atomic.Int64
+	reverseDialFailed     atomic.Int64
+	innerUsable           atomic.Int64
+	interceptedEmpty      atomic.Int64
+	bus                   *telemetry.Bus
+	transports            [8]*http.Transport
+	gate                  sync.Mutex
+	admission             sync.Mutex
+	resetBarrier          sync.RWMutex
+	generation            uint64
+	activeWS              int
+	activeTunnels         int
+	mu                    sync.Mutex
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	pending               int
+	active                int
+	replayWorkers         sync.WaitGroup
+	done                  chan struct{}
+	closed                bool
+	draining              bool
+	options               Options
+	cassetteFailure       error
+	server                *http.Server
+	front                 *front
+	stats                 map[string]RuleStats
+	applied               map[appliedKey]uint64
+	replayCapacitySkips   map[appliedKey]uint64
+	replayWarned          map[string]bool
+	sseEncodingWarned     map[string]bool
+	burstUsed             map[string]int
+	sseAdmission          map[string]chan []string
+	OnBlindTunnel         func(uint64)
+	OnSSE                 func(uint64)
+	OnRequest             func(Record)
+	ShouldCaptureBody     func(uint64) bool
+	ShouldCaptureResponse func(uint64) bool
+	OnResponse            func(ResponseRecord)
+	ReserveResponseBytes  func(uint64, int) int
+	OnClientFrame         func(uint64, []byte)
+	OnServerFrame         func(uint64, string, byte)
+	OnUnsupportedFrame    func(uint64)
+	OnOutcome             func(Outcome)
 }
 
 func ParseTarget(s string) (*url.URL, error) {
@@ -430,7 +522,12 @@ func (p *Proxy) callback(gen uint64, fn func()) {
 }
 func (p *Proxy) upstream(r *http.Request, body []byte, ctx context.Context) *http.Request {
 	var u url.URL
-	if r.URL.IsAbs() {
+	if p.options.CassetteUpstream != nil {
+		u = *r.URL
+		if !u.IsAbs() {
+			u.Scheme, u.Host = "http", r.Host
+		}
+	} else if r.URL.IsAbs() {
 		u = *r.URL
 	} else if p.target != nil {
 		u = *p.target
@@ -567,10 +664,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	seq := p.seq.Add(1)
 	p.gate.Unlock()
+	captureResponse := p.OnResponse != nil && p.ShouldCaptureResponse != nil && p.ShouldCaptureResponse(seq)
+	responseRecord := ResponseRecord{Seq: seq}
+	if captureResponse {
+		defer func() { p.OnResponse(responseRecord) }()
+	}
 	if p.options.BeforeRequest != nil {
 		p.options.BeforeRequest(seq)
 	}
 	ws := r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") && headerToken(r.Header, "Connection", "upgrade")
+	if ws || r.ProtoMajor == 2 {
+		captureResponse = false
+	}
 	proto, recordProto := "h1", ""
 	if r.ProtoMajor == 2 {
 		proto, recordProto = "h2", "h2c"
@@ -790,14 +895,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}()
 		if plan.BeforeHdrs {
-			record(nil, r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0, false)
+			record(nil, kind != "tcp-rst" && r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0, false)
 			flushPlanned = true
 			_ = http.NewResponseController(w).Flush()
 			return
 		}
 	}
 	if !ws && kind == "tcp-rst" && fault.Bool(params, "before_headers", false) {
-		record(nil, r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0, false)
+		record(nil, false, false)
 		resetWriter(w, func() {
 			end = "rst"
 			markApplied()
@@ -834,6 +939,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	capture := hasBody && p.OnRequest != nil && (p.ShouldCaptureBody == nil || p.ShouldCaptureBody(seq))
 	capturing = capture && p.ShouldCaptureBody != nil
 	buffered := kind == "dup-webhook" && fault.Int(params, "count", 2) > 1
+
 	if buffered && hasBody {
 		var err error
 		body, err = io.ReadAll(io.LimitReader(r.Body, maxBody+1))
@@ -860,6 +966,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		record(body, !buffered && hasBody, false)
 	}
 	if ws {
+		if p.options.CassetteUpstream != nil {
+			p.failCassette("cassette_miss", r.Method, r.URL.Path)
+			http.Error(w, "cassette unavailable", http.StatusBadGateway)
+			return
+		}
 		p.serveWS(w, r, gen, match)
 		return
 	}
@@ -983,7 +1094,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !buffered && hasBody && r.ProtoMajor == 1 {
 		_ = http.NewResponseController(w).EnableFullDuplex()
 	}
-	transport := p.transportFor(ctx, r.ProtoMajor == 2 && q.URL.Scheme == "http")
+	var transport *http.Transport
+	if p.options.CassetteUpstream == nil {
+		transport = p.transportFor(ctx, r.ProtoMajor == 2 && q.URL.Scheme == "http")
+	}
 	var releaseReplay func(bool)
 	var replayClock *replayTiming
 	if kind == "dup-webhook" && buffered && mode == "concurrent" {
@@ -1001,8 +1115,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		replayClock.start()
 		releaseReplay(true)
 	}
-	resp, err := transport.RoundTrip(q)
-	p.noteRoundTripDial(incoming.Context(), gen, q.URL.Host, reverse, err)
+	var resp *http.Response
+	var err error
+	if p.options.CassetteUpstream != nil {
+		resp, err = p.cassetteResponse(q)
+		if err != nil {
+			status, end = http.StatusBadGateway, "upstream_error"
+			http.Error(w, err.Error(), status)
+			return
+		}
+	} else {
+		resp, err = transport.RoundTrip(q)
+		p.noteRoundTripDial(incoming.Context(), gen, q.URL.Host, reverse, err)
+	}
 	if errors.Is(err, errEgressDenied) {
 		dialDenied, deniedHost = true, p.deniedHost(q.URL.Host)
 	}
@@ -1013,7 +1138,34 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			originalOutcome = replayError(err)
 		} else {
 			committedStatus = resp.StatusCode
-			_, drainErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+			var drainErr error
+			if captureResponse {
+				responseRecord.Status = resp.StatusCode
+				responseRecord.Header = resp.Header.Clone()
+				encoding := strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ", ")))
+				responseRecord.Header.Del("Content-Encoding")
+				responseRecord.Header.Del("Content-Length")
+				if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
+					responseRecord.Truncated = true
+					_, drainErr = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+				} else {
+					var source io.ReadCloser = resp.Body
+					if encoding != "" && encoding != "identity" {
+						decoder := &sseDecoder{source: resp.Body, encoding: encoding}
+						defer decoder.Close()
+						source = decoder
+					}
+					capture := &responseCapture{ReadCloser: source}
+					if p.ReserveResponseBytes != nil {
+						capture.reserve = func(n int) int { return p.ReserveResponseBytes(seq, n) }
+					}
+					capture.finish()
+					responseRecord.Body = capture.body
+					responseRecord.Truncated = capture.truncated || capture.failed
+				}
+			} else {
+				_, drainErr = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBody))
+			}
 			if drainErr != nil {
 				originalOutcome = replayError(drainErr)
 			}
@@ -1069,6 +1221,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	markUsable()
 	resp.Header.Del(TransportErrorHeader)
+	if p.options.CassetteUpstream != nil && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		resp.Header.Del("Location")
+	}
 	status, upstreamHeaders = resp.StatusCode, resp.Header
 	media, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	encoding := strings.ToLower(strings.TrimSpace(strings.Join(resp.Header.Values("Content-Encoding"), ", ")))
@@ -1082,6 +1237,49 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	recordMu.Unlock()
 	if finishRecord != nil {
 		finishRecord(false)
+	}
+	if captureResponse && (encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate") {
+		decoder := &sseDecoder{source: resp.Body, encoding: encoding}
+		defer decoder.Close()
+		resp.Body = decoder
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
+		resp.ContentLength = -1
+		stripSSEIntegrity(resp.Header)
+		stripSSEIntegrity(resp.Trailer)
+		if isSSE && kind == "sse-glitch" {
+			decoded := encoding
+			if decoded == "x-gzip" {
+				decoded = "gzip"
+			}
+			resp.Header.Set("X-Glitchdeck-Decoded", decoded)
+		}
+	}
+	decodedResponse := false
+	if _, ok := resp.Body.(*sseDecoder); ok {
+		decodedResponse = true
+	}
+	if captureResponse {
+		responseRecord.Status = resp.StatusCode
+		responseRecord.Header = resp.Header.Clone()
+		if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
+			responseRecord.Header.Del("Content-Encoding")
+			responseRecord.Header.Del("Content-Length")
+			responseRecord.Truncated = true
+		} else {
+			capture := &responseCapture{ReadCloser: resp.Body}
+			if p.ReserveResponseBytes != nil {
+				capture.reserve = func(n int) int { return p.ReserveResponseBytes(seq, n) }
+			}
+			resp.Body = capture
+			defer func() {
+				timer := time.AfterFunc(2*time.Second, cancel)
+				defer timer.Stop()
+				capture.finish()
+				responseRecord.Body = capture.body
+				responseRecord.Truncated = capture.truncated || capture.failed
+			}()
+		}
 	}
 	switch kind {
 	case "dup-webhook":
@@ -1109,13 +1307,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !isSSE {
 			skip = "not_sse"
 			p.countRule(gen, rule, "skipped", skip)
-		} else if encoding != "" && encoding != "identity" {
+		} else if encoding != "" && encoding != "identity" && !decodedResponse {
 			switch encoding {
 			case "gzip", "x-gzip", "deflate":
 				// Keep upstream flushes visible to clients; io.ReadAll would buffer the stream.
 				decoder := &sseDecoder{source: resp.Body, encoding: encoding}
 				defer decoder.Close()
 				resp.Body = decoder
+				decodedResponse = true
 				resp.Header.Del("Content-Encoding")
 				resp.Header.Del("Content-Length")
 				stripSSEIntegrity(resp.Header)
@@ -1189,7 +1388,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if result.err != nil && result.end != "client_cancel" {
 			p.outcome(gen, Outcome{Seq: seq, Err: result.err})
 			if result.end == "upstream_error" {
-				if _, decoded := resp.Body.(*sseDecoder); !decoded {
+				if !decodedResponse {
 					panic(http.ErrAbortHandler)
 				}
 				if r.ProtoMajor == 2 {
@@ -1203,7 +1402,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if result.err == nil && (result.end == "eof" || result.end == "done") {
-			if _, decoded := resp.Body.(*sseDecoder); decoded {
+			if decodedResponse {
 				stripSSEIntegrity(resp.Trailer)
 			}
 			for k, v := range resp.Trailer {

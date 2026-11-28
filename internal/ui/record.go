@@ -41,6 +41,7 @@ type recorded struct {
 	done          bool
 	sse           bool
 	mitm          bool
+	cassette      *tape.Cassette
 }
 
 type recordedChange struct {
@@ -50,20 +51,26 @@ type recordedChange struct {
 }
 
 type recorder struct {
-	mu               sync.Mutex
-	running          bool
-	started, stopped time.Time
-	startSeq         uint64
-	entries          []*recorded
-	streams          map[uint64]*recorded
-	bytes, events    int
-	config           fault.Config
-	changes          []recordedChange
-	incompleteReason string
-	lastFrame        time.Time
-	bodyTruncated    bool
-	droppedEntries   int
-	pendingBodies    int
+	mu                    sync.Mutex
+	running               bool
+	started, stopped      time.Time
+	startSeq              uint64
+	entries               []*recorded
+	streams               map[uint64]*recorded
+	bytes, events         int
+	config                fault.Config
+	changes               []recordedChange
+	incompleteReason      string
+	lastFrame             time.Time
+	bodyTruncated         bool
+	droppedEntries        int
+	pendingBodies         int
+	pendingResponses      map[uint64]bool
+	responseReservations  map[uint64]int
+	reservedResponseBytes int
+	forwardWarning        bool
+	target                string
+	ignoreJSONPaths       []string
 }
 
 // Recording captures traffic and configuration changes from a single proxy.
@@ -87,6 +94,13 @@ func (r *Recording) Stop() { r.rec.stop() }
 
 func (r *Recording) ConfigChanged(before uint64, cfg fault.Config) { r.rec.changed(before, cfg) }
 
+func (r *Recording) SetCassetteMetadata(target string, ignoreJSONPaths []string) {
+	r.rec.mu.Lock()
+	defer r.rec.mu.Unlock()
+	r.rec.target = target
+	r.rec.ignoreJSONPaths = slices.Clone(ignoreJSONPaths)
+}
+
 func (r *Recording) Export(name string) (tape.Tape, error) {
 	var cfg fault.Config
 	if r.p != nil {
@@ -100,6 +114,9 @@ func (r *Recording) Export(name string) (tape.Tape, error) {
 func (r *recorder) attach(p *proxy.Proxy) {
 	p.OnRequest = r.request
 	p.ShouldCaptureBody = r.shouldCaptureBody
+	p.ShouldCaptureResponse = r.shouldCaptureResponse
+	p.OnResponse = r.response
+	p.ReserveResponseBytes = r.reserveResponseBytes
 	p.OnClientFrame = r.clientFrame
 	p.OnServerFrame = r.serverFrame
 	p.OnUnsupportedFrame = r.unsupportedFrame
@@ -115,6 +132,71 @@ func (r *recorder) shouldCaptureBody(seq uint64) bool {
 	}
 	r.pendingBodies++
 	return true
+}
+
+func (r *recorder) shouldCaptureResponse(seq uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running || seq <= r.startSeq {
+		return false
+	}
+	r.pendingResponses[seq] = true
+	return true
+}
+
+func (r *recorder) reserveResponseBytes(seq uint64, n int) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running || !r.pendingResponses[seq] || n <= 0 {
+		return 0
+	}
+	allowed := min(n, max(0, maxRecordBytes-r.bytes-r.reservedResponseBytes))
+	r.responseReservations[seq] += allowed
+	r.reservedResponseBytes += allowed
+	return allowed
+}
+
+func (r *recorder) response(res proxy.ResponseRecord) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running || !r.pendingResponses[res.Seq] {
+		return
+	}
+	delete(r.pendingResponses, res.Seq)
+	r.reservedResponseBytes -= r.responseReservations[res.Seq]
+	delete(r.responseReservations, res.Seq)
+	if res.Status == 0 {
+		return
+	}
+	for _, e := range r.entries {
+		if e.seq != res.Seq || e.cassette == nil {
+			continue
+		}
+		headers := make(map[string]string)
+		for k, v := range res.Header {
+			name := strings.ToLower(k)
+			switch name {
+			case "authorization", "proxy-authorization", "cookie", "set-cookie", "referer", "connection", "upgrade", "transfer-encoding", "content-length", "expect", "te", "trailer", "x-glitchdeck-run", "x-glitchdeck-seq":
+				continue
+			}
+			if strings.Contains(name, "secret") || strings.Contains(name, "token") || strings.Contains(name, "api-key") || strings.Contains(name, "apikey") || strings.Contains(name, "signature") {
+				continue
+			}
+			headers[k] = strings.Join(v, ", ")
+			e.bytes += len(k) + len(headers[k])
+			r.bytes += len(k) + len(headers[k])
+		}
+		e.cassette.Response = tape.NewCassetteResponse(res.Status, headers, res.Body, res.Truncated)
+		size := len(e.cassette.Response.Body)
+		e.bytes += size
+		r.bytes += size
+		if res.Truncated {
+			r.bodyTruncated = true
+			r.markIncomplete("recorded response body was truncated")
+		}
+		r.trim()
+		return
+	}
 }
 
 func (r *recorder) markSSE(seq uint64) {
@@ -141,6 +223,10 @@ func (r *recorder) clear() {
 	r.incompleteReason = ""
 	r.lastFrame = time.Time{}
 	r.bodyTruncated, r.droppedEntries, r.pendingBodies = false, 0, 0
+	r.pendingResponses = nil
+	r.responseReservations = nil
+	r.reservedResponseBytes = 0
+	r.forwardWarning = false
 }
 
 func (r *recorder) reset() {
@@ -161,6 +247,8 @@ func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config, usedBu
 			r.markIncomplete("initial configuration exceeded the recording byte budget")
 		}
 		r.streams = make(map[uint64]*recorded)
+		r.pendingResponses = make(map[uint64]bool)
+		r.responseReservations = make(map[uint64]int)
 		if activeStreams != 0 {
 			r.markIncomplete("WebSocket, blind or passthrough CONNECT tunnel already open when recording started")
 		}
@@ -179,6 +267,9 @@ func (r *recorder) stop() recordingStatus {
 		if r.pendingBodies != 0 {
 			r.markIncomplete(pendingBodyReason)
 		}
+		if len(r.pendingResponses) != 0 {
+			r.markIncomplete("recording ended with responses still in flight")
+		}
 	}
 	return r.snapshot()
 }
@@ -196,7 +287,7 @@ func (r *recorder) snapshot() recordingStatus {
 	}
 	return recordingStatus{
 		Recording: r.running, ElapsedMS: end.Sub(r.started).Milliseconds(), Events: r.events,
-		Incomplete: r.incompleteReason != "", IncompleteReason: r.incompleteReason,
+		Incomplete: r.incompleteReason != "" || len(r.pendingResponses) != 0, IncompleteReason: r.incompleteReason,
 		Truncated: r.bodyTruncated || r.droppedEntries != 0, DroppedEntries: r.droppedEntries,
 	}
 }
@@ -235,7 +326,7 @@ func (r *recorder) changed(before uint64, cfg fault.Config) {
 		previousSize = r.changes[last].bytes
 	}
 	size, ok := configSize(cfg)
-	if !ok || size > maxRecordBytes-r.bytes+previousSize {
+	if !ok || size > maxRecordBytes-r.bytes-r.reservedResponseBytes+previousSize {
 		r.markIncomplete("configuration change exceeded the recording byte budget")
 		return
 	}
@@ -296,8 +387,17 @@ func (r *recorder) request(req proxy.Record) {
 	if req.URL != "" {
 		u, err := url.Parse(req.URL)
 		if err != nil || !strings.EqualFold(u.Hostname(), "localhost") && !net.ParseIP(u.Hostname()).IsLoopback() {
-			r.markIncomplete("forwarded traffic requires explicit upstream authorization for replay")
+			r.forwardWarning = true
 		}
+	}
+	requestPath := req.Path
+	host := ""
+	if req.URL != "" {
+		if u, err := url.Parse(req.URL); err == nil {
+			requestPath, host = u.EscapedPath(), u.Host
+		}
+	} else if u, err := url.ParseRequestURI(requestPath); err == nil {
+		requestPath = u.EscapedPath()
 	}
 	req.Path, req.URL = redactQuery(req.Path), redactQuery(req.URL)
 	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE}
@@ -312,6 +412,8 @@ func (r *recorder) request(req proxy.Record) {
 		r.streams[req.Seq] = e
 	} else {
 		e.http = &tape.HTTP{Method: req.Method, Path: req.Path, URL: req.URL, Proto: req.Proto, Body: string(req.Body)}
+		e.cassette = &tape.Cassette{Request: tape.CassetteRequest{Method: req.Method, Path: requestPath, Host: host, BodySHA256: tape.BodySHA256(req.Body, r.ignoreJSONPaths)}}
+		e.bytes += len(requestPath) + len(host) + len(req.Method) + len(e.cassette.Request.BodySHA256)
 		if req.URL != "" {
 			e.http.Path = ""
 		}
@@ -387,7 +489,7 @@ func redactQuery(raw string) string {
 }
 
 func (r *recorder) trim() {
-	for len(r.entries) > maxEntries || r.bytes > maxRecordBytes {
+	for len(r.entries) > 0 && (len(r.entries) > maxEntries || r.bytes+r.reservedResponseBytes > maxRecordBytes) {
 		old := r.entries[0]
 		r.entries[0] = nil
 		r.entries = r.entries[1:]
@@ -395,6 +497,7 @@ func (r *recorder) trim() {
 		r.bytes -= old.bytes
 		r.events -= old.events
 		r.droppedEntries++
+		r.markIncomplete("recorded entries were evicted")
 	}
 }
 
@@ -468,6 +571,9 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 	if reason == "" && r.pendingBodies != 0 {
 		reason = pendingBodyReason
 	}
+	if reason == "" && len(r.pendingResponses) != 0 {
+		reason = "recording ended with responses still in flight"
+	}
 	doc := tape.Tape{
 		Version: 1,
 		Seed:    fallback.Seed, Rules: fallback.Rules,
@@ -475,6 +581,7 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 		Truncated: r.bodyTruncated || r.droppedEntries != 0, DroppedEntries: r.droppedEntries,
 		Script: make([]tape.Step, 0, len(entries)),
 	}
+	doc.Target = r.target
 	if r.started.IsZero() {
 		if v2Rules(doc.Rules) {
 			doc.Version = 2
@@ -530,7 +637,17 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 			ws.Messages = slices.Clone(ws.Messages)
 			step.WS = &ws
 		}
+		if e.cassette != nil && e.cassette.Response.Status != 0 {
+			doc.Cassettes = append(doc.Cassettes, *e.cassette)
+		}
 		doc.Script = append(doc.Script, step)
+	}
+	if len(doc.Cassettes) != 0 {
+		doc.Version = 3
+		doc.IgnoreJSONPaths = slices.Clone(r.ignoreJSONPaths)
+	} else if r.forwardWarning && !doc.Incomplete {
+		doc.Incomplete = true
+		doc.IncompleteReason = "forwarded traffic requires explicit upstream authorization for replay"
 	}
 	return doc
 }

@@ -95,22 +95,6 @@ func TestTapeFilesAreRegularAndBounded(t *testing.T) {
 	}
 }
 
-func TestTapeExportStaysInRoot(t *testing.T) {
-	dir := t.TempDir()
-	s := NewServer(nil, nil, Options{Workdir: dir})
-	path := filepath.Join(dir, "tape.yaml")
-	if err := s.writeTape(path, []byte("version: 1\n")); err != nil {
-		t.Fatal(err)
-	}
-	b, err := os.ReadFile(path)
-	if err != nil || string(b) != "version: 1\n" {
-		t.Fatalf("output %q: %v", b, err)
-	}
-	if err := s.writeTape(filepath.Join(filepath.Dir(dir), "outside.yaml"), []byte("bad")); err == nil {
-		t.Fatal("wrote outside root")
-	}
-}
-
 func TestTapeExportReportsDroppedEntries(t *testing.T) {
 	s := NewServer(nil, nil, Options{Workdir: t.TempDir()})
 	s.ctx = context.Background()
@@ -144,7 +128,6 @@ func TestTapeExportFitsBodyBudgets(t *testing.T) {
 		budget int
 	}{
 		{"inline", "", 64 << 10},
-		{"file", "capture.yaml", 1 << 20},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := NewServer(nil, nil, Options{Workdir: t.TempDir()})
@@ -174,19 +157,12 @@ func TestTapeExportFitsBodyBudgets(t *testing.T) {
 					t.Fatalf("upload status: %d", resp.StatusCode)
 				}
 			}
-			args, _ := json.Marshal(map[string]string{"name": "budget", "out_path": tc.path})
+			args, _ := json.Marshal(map[string]string{"name": "budget"})
 			got, _ := s.call("tape_export", args)
 			if got["error"] != nil {
 				t.Fatal(got)
 			}
 			data, _ := got["yaml"].(string)
-			if tc.path != "" {
-				b, err := os.ReadFile(got["out_path"].(string))
-				if err != nil {
-					t.Fatal(err)
-				}
-				data = string(b)
-			}
 			if len(data) > tc.budget {
 				t.Fatalf("export size %d exceeds %d", len(data), tc.budget)
 			}

@@ -19,6 +19,14 @@ import (
 	"github.com/hardw00t/glitchdeck/internal/sse"
 )
 
+func isDecodedSSE(body io.Reader) bool {
+	if capture, ok := body.(*responseCapture); ok {
+		body = capture.ReadCloser
+	}
+	_, decoded := body.(*sseDecoder)
+	return decoded
+}
+
 func selected(params map[string]any, seed uint64, id string, seq uint64, idx int) bool {
 	if every := fault.Int(params, "every", 0); every > 0 && idx%every == 0 {
 		return true
@@ -109,7 +117,7 @@ func (p *Proxy) relaySSE(ctx context.Context, w http.ResponseWriter, body io.Rea
 	framesSeen := 0
 	var droppedTool toolKey
 	doneEvents := fault.Strings(params, "done_events")
-	_, decoded := body.(*sseDecoder)
+	decoded := isDecodedSSE(body)
 	opaque := !decoded && encoding != "" && encoding != "identity"
 	if action == "corrupt_tool_args" {
 		res.skip = "no_tool_args"
@@ -587,7 +595,7 @@ func (p *Proxy) relayHijackedSSE(ctx context.Context, w http.ResponseWriter, res
 	}
 	out := &hijackedSSEWriter{out: b.Writer, conn: conn, chunked: chunked}
 	result := p.relaySSE(ctx, out, resp.Body, rule, seed, seq, gen, start, run, encoding)
-	if _, decoded := resp.Body.(*sseDecoder); decoded && result.end == "upstream_error" {
+	if isDecodedSSE(resp.Body) && result.end == "upstream_error" {
 		rst(conn)
 		return result
 	}

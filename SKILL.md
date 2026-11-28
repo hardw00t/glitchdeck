@@ -5,11 +5,15 @@ description: Reproduce and regression-test HTTP, webhook, SSE, WebSocket, and gR
 
 # Glitchdeck regression loop
 
-Validate tapes without running them with `glitchdeck validate faults.tape.yaml`. Run a local tape with `glitchdeck test --json examples/checkout-dup-webhook.tape.yaml`, or wrap a command with `glitchdeck exec --tape faults.tape.yaml --json -- your-command`. The child receives `GLITCHDECK_PROXY_URL` and standard proxy environment variables. Version 1 test JSON is an array; version 2 and exec use an envelope. `--report` writes the envelope to a file.
+Validate tapes without running them with `glitchdeck validate faults.tape.yaml`. Run a local tape with `glitchdeck test --json examples/checkout-dup-webhook.tape.yaml`, or wrap a command with `glitchdeck exec --tape faults.tape.yaml --json -- your-command`. The child receives `GLITCHDECK_PROXY_URL` and standard proxy environment variables. Version 1 test JSON is an array; versions 2 and 3 and exec use an envelope. `--report` writes the envelope to a file.
 
 Use `--tls-passthrough` or v2 `tls_passthrough` for pinned CONNECT hosts that should keep their upstream certificate; the upstream allowlist still applies.
 Exec fails closed on `tls_rejected_only`, `egress_denied_only`, `zero_traffic`, or `zero_faults`; `--allow-zero-traffic` skips those checks but not tape expectations. To assert that a client rejects the interception CA, use `--allow-zero-traffic` with `expect.child_exit: nonzero`.
 Go skips environment proxies for localhost; use reverse mode by setting the client base URL to `GLITCHDECK_PROXY_URL`.
+
+Default `--mode passthrough` uses the live upstream. Use `exec --mode record --tape-out recorded.yaml` to capture HTTP responses before fault mutation, including decoded gzip SSE. Then `exec --mode replay` or `test --mode replay` serves the recorded response in-process and applies faults without dialing the upstream. Misses and ambiguous matches fail closed; `--allow-zero-traffic` cannot override them. Try `glitchdeck test --mode replay examples/tapes/your-app-openai-sse-cassette.tape.yaml`.
+
+Exports block on the fixed [secret pattern set](docs/v2.3.0.md). `--redact-secrets` replaces matches and rescans before writing; MCP uses `redact_secrets: true`. Review before sharing even after redaction.
 
 For LLM streams, start with `examples/tapes/your-app-openai-sse-cut.tape.yaml` or its Anthropic counterpart.
 Use `--target http://127.0.0.1:<port>` to change a starter tape's port. To change the route, copy the tape and edit `match.path_prefix` and the client request path together.
@@ -24,4 +28,4 @@ For piped tapes and CI reports, use `glitchdeck validate -` and `glitchdeck repo
 Inspect failed assertions and fault counts, fix the application, then rerun the same tape. Keep the tape in the repository as a regression test; the composite action supports exec mode with its `command` input. Exit 0 means pass; 1 means a mismatch; 2 means invalid input; 3 means runtime failure; 124 means timeout; 125–127 mean child startup failure.
 
 The stdio server exposes 10 MCP tools. `exec_run` requires `glitchdeck mcp --allow-exec` and runs argv arrays, never shell strings, through a tape; its exec report includes `ok`, `child_exit`, `traffic`, `faults_triggered`, `diff`, and bounded `stdout`/`stderr`. Remote targets require server `--upstream-allow`.
-`tape_export` emits v2 by default. Inspect `-32602` errors via `data.field` and `data.reason`; cancel a running job with `notifications/cancelled`.
+`tape_export` returns v3 for a recording with cassettes and v2 otherwise; `format: "v1"` or `"v2"` strips cassettes. It returns YAML inline. Inspect `-32602` errors via `data.field` and `data.reason`; cancel a running job with `notifications/cancelled`.

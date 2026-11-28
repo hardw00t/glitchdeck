@@ -38,6 +38,9 @@ import (
 type Options struct {
 	Command              []string
 	TapePath             string
+	Mode                 string
+	TapeOut              string
+	RedactSecrets        bool
 	Target               string
 	Listen               string
 	UI                   string
@@ -216,6 +219,21 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		}
 		return e
 	}
+	if err := o.ValidateMode(); err != nil {
+		return finish(2, "USAGE_ERROR", err)
+	}
+	replay := o.Mode == "replay"
+	if replay {
+		if t.Version == 3 && len(t.Cassettes) == 0 {
+			return finish(1, "cassette_miss", &proxy.CassetteError{Kind: "cassette_miss"})
+		}
+		for _, assertion := range t.Assertions {
+			if assertion.Direct {
+				return finish(2, "USAGE_ERROR", fmt.Errorf("direct assertions are not available in replay mode"))
+			}
+		}
+	}
+	recordTarget := target
 	if len(o.Command) == 0 {
 		return finish(2, "USAGE_ERROR", fmt.Errorf("missing child command"))
 	}
@@ -233,7 +251,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		o.Grace = 5 * time.Second
 	}
 	var demoHandler http.Handler
-	if target == "demo" {
+	if replay && target == "demo" {
+		target = "http://127.0.0.1"
+	}
+	if !replay && target == "demo" {
 		al, e := net.Listen("tcp", "127.0.0.1:0")
 		if e != nil {
 			return finish(3, "PROXY_START_FAILED", e)
@@ -247,7 +268,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	var parsed *url.URL
 	if target != "" {
-		if o.Target != "" {
+		if o.Target != "" || replay {
 			parsed, err = proxy.ParseExplicitTarget(target)
 		} else {
 			parsed, err = proxy.ParseTarget(target)
@@ -287,6 +308,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	defer p.Close()
 	opts := proxy.Options{Demo: demoHandler != nil, UpstreamAllow: append(t.UpstreamAllow, o.UpstreamAllow...), TLSPassthrough: append(append([]string{}, t.TLSPassthrough...), o.TLSPassthrough...), InsecureUpstream: o.InsecureUpstream, AllowLoopbackEgress: o.AllowLoopbackEgress, RequireUpstreamAllow: o.RequireUpstreamAllow}
 	opts.SuppressStderr = o.DetachStdio
+	if replay {
+		opts.CassetteUpstream = t.CassetteUpstream()
+	}
 	for i, pattern := range opts.TLSPassthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {
 			return finish(2, "USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
@@ -296,6 +320,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		warn("tls-passthrough has no effect without --tls")
 	}
 	var scheduleStart time.Time
+	var recording *ui.Recording
 	var configMu sync.Mutex
 	applied := make([]bool, len(t.ConfigChanges))
 	applyChanges := func(seq uint64) {
@@ -310,7 +335,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 				due = seq != 0 && seq >= change.BeforeSeq
 			}
 			if due {
-				p.SetConfig(fault.Config{Seed: change.Seed, Rules: change.Rules})
+				before := p.SetConfigAt(fault.Config{Seed: change.Seed, Rules: change.Rules})
+				if recording != nil {
+					if seq != 0 {
+						before = seq
+					}
+					recording.ConfigChanged(before, p.Config())
+				}
 				applied[i] = true
 			}
 		}
@@ -418,6 +449,12 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	p.SetOptions(opts)
 	e.Exec.ProxyURL, e.Exec.LeakedPIDs = publicURL, []int{}
+	if o.Mode == "record" {
+		recording = ui.NewRecorder()
+		recording.SetCassetteMetadata(recordTarget, t.IgnoreJSONPaths)
+		recording.Start(p)
+		defer recording.Stop()
+	}
 	if o.UI != "" {
 		host, _, bindErr := net.SplitHostPort(o.UI)
 		if bindErr != nil || host != "localhost" && !net.ParseIP(host).IsLoopback() {
@@ -433,7 +470,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			demoURL = target
 		}
 		e.Exec.UIURL = "http://" + l.Addr().String()
-		server := &http.Server{Handler: ui.New(p, bus, ui.Options{Target: target, Listen: listener.Addr().String(), UI: l.Addr().String(), DemoURL: demoURL, ProxyAuth: opts.ProxyAuth})}
+		server := &http.Server{Handler: ui.New(p, bus, ui.Options{Target: target, Listen: listener.Addr().String(), UI: l.Addr().String(), DemoURL: demoURL, ProxyAuth: opts.ProxyAuth, Recording: recording})}
 		go server.Serve(l)
 		defer server.Close()
 	}
@@ -457,7 +494,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	go p.Serve(listener)
 	noProxy := listenerAddr
-	if o.DetachStdio {
+	if o.DetachStdio || replay {
 		e.Exec.NoProxy = listenerAddr
 		if os.Getenv("NO_PROXY") != "" || os.Getenv("no_proxy") != "" {
 			warn("no_proxy: ignored inherited bypass entries")
@@ -477,7 +514,11 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			warn(fmt.Sprintf("no_proxy: dropped %q from inherited NO_PROXY; it would bypass glitchdeck for target %s (pass --no-proxy %s to keep it)", entry, safeTarget, entry))
 		}
 	}
-	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
+	childTarget := target
+	if replay && parsed != nil {
+		childTarget = proxyURL
+	}
+	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+childTarget, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
 	if e.Exec.UIURL != "" {
 		env = append(env, "GLITCHDECK_UI_URL="+e.Exec.UIURL)
 	}
@@ -668,6 +709,16 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	// TrafficStats snapshots counters and denied hosts together, even on timeout.
 	childStats := p.TrafficStats()
 	childFaults := p.AppliedFaults()
+	if recording != nil {
+		recording.Stop()
+		if err := writeRecording(recording, t, o); err != nil {
+			var blocked *tape.ExportBlockedError
+			if errors.As(err, &blocked) {
+				return finish(2, "EXPORT_BLOCKED", err)
+			}
+			return finish(3, "TAPE_IO", err)
+		}
+	}
 	var httpResults []tape.Result
 	if waitErr == nil {
 		probeURL, probePassword := "", ""
@@ -698,6 +749,12 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	deniedList := strings.Join(childStats.EgressDeniedHosts, ", ")
 	if deniedList != "" {
 		warn(fmt.Sprintf("warning: egress denied %d (hosts: %s)", childStats.EgressDenied, deniedList))
+	}
+	if replay {
+		var cassetteErr *proxy.CassetteError
+		if err := p.CassetteFailure(); errors.As(err, &cassetteErr) {
+			return finish(1, cassetteErr.Kind, err)
+		}
 	}
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))

@@ -108,18 +108,6 @@ func TestProtocolErrorsAndNotifications(t *testing.T) {
 	}
 }
 
-func TestExportPathGuard(t *testing.T) {
-	s := NewServer(strings.NewReader(""), io.Discard, Options{Workdir: t.TempDir()})
-	for _, p := range []string{"../escape.yaml", "file.sh", "bad\x00.yaml"} {
-		if _, err := s.outputPath(p); err == nil {
-			t.Fatalf("accepted %q", p)
-		}
-	}
-	if _, err := s.outputPath("safe.yaml"); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestTapeRunReportsAssertions(t *testing.T) {
 	for i, path := range []string{"clean.tape.yaml", "checkout-dup-webhook.tape.yaml"} {
 		input := fmt.Sprintf("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tape_run\",\"arguments\":{\"tape_path\":%q}}}\n", path)

@@ -112,11 +112,12 @@ func testTape(args []string) int {
 	report := f.String("report", "", "write JSON report")
 	tlsEnabled := f.Bool("tls", false, "enable TLS")
 	caDir := f.String("ca-dir", "", "CA directory")
+	mode := f.String("mode", "passthrough", "passthrough or replay")
 	const testUsage = "usage: glitchdeck test [flags] tape.yaml"
 	if showCommandHelp(f, args, testUsage) {
 		return 0
 	}
-	flags, files := cli.SplitArgs(args, "target", "timeout", "report", "ca-dir")
+	flags, files := cli.SplitArgs(args, "target", "timeout", "report", "ca-dir", "mode")
 	filename := ""
 	if len(files) == 1 {
 		filename = files[0]
@@ -152,6 +153,9 @@ func testTape(args []string) int {
 	if filename == "" || *timeout <= 0 {
 		return fail("USAGE", errors.New(testUsage))
 	}
+	if *mode != "passthrough" && *mode != "replay" {
+		return fail("USAGE", errors.New("test mode must be passthrough or replay"))
+	}
 	file, err := os.Open(filename)
 	if err != nil {
 		return fail("TAPE_IO", err)
@@ -166,8 +170,16 @@ func testTape(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	var results []tape.Result
-	results, runReport, err = tape.RunWithTLS(ctx, t, *target, *caDir, *tlsEnabled)
+	if *mode == "replay" {
+		results, runReport, err = tape.RunReplay(ctx, t, *target, *caDir, *tlsEnabled)
+	} else {
+		results, runReport, err = tape.RunWithTLS(ctx, t, *target, *caDir, *tlsEnabled)
+	}
 	if err != nil {
+		var cassetteErr *proxy.CassetteError
+		if errors.As(err, &cassetteErr) {
+			return fail(cassetteErr.Kind, err)
+		}
 		return fail("INTERNAL", err)
 	}
 	failed := false

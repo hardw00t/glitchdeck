@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -149,29 +148,5 @@ func TestCancelledJobDoesNotWaitForStderr(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocked stderr prevented slot cleanup")
-	}
-}
-
-func TestTapeExportReturnsReusableRelativePath(t *testing.T) {
-	s, proxyURL := exportTestServer(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
-	req, err := http.NewRequest("GET", proxyURL+"/resource", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	exportTestRequest(t, req)
-	got, _ := s.call("tape_export", []byte(`{"name":"capture","out_path":"capture.yaml"}`))
-	if got["out_path"] != filepath.Join(s.opts.Workdir, "capture.yaml") || got["tape_path"] != "capture.yaml" {
-		t.Fatalf("export paths: %v", got)
-	}
-	args, _ := json.Marshal(map[string]any{"command": []string{"true"}, "tape_path": got["tape_path"]})
-	s.opts.AllowExec = true
-	_, result, params := s.prepareExec(args)
-	if result != nil || params != nil {
-		t.Fatalf("exported path rejected: %v %v", result, params)
-	}
-	absolute, _ := json.Marshal(map[string]string{"name": "capture", "out_path": filepath.Join(s.opts.Workdir, "absolute.yaml")})
-	got, _ = s.call("tape_export", absolute)
-	if got["out_path"] != filepath.Join(s.opts.Workdir, "absolute.yaml") || got["tape_path"] != "absolute.yaml" {
-		t.Fatalf("absolute export paths: %v", got)
 	}
 }

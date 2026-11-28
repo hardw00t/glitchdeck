@@ -53,7 +53,7 @@ func TestTapeExportVersionsAndRedaction(t *testing.T) {
 
 	got, _ := s.call("tape_export", []byte(`{"name":"capture"}`))
 	data, ok := got["yaml"].(string)
-	if !ok || got["version"] != 2 || !strings.HasPrefix(data, "version: 2\n") {
+	if !ok || got["version"] != 3 || !strings.HasPrefix(data, "version: 3\n") {
 		t.Fatalf("default export: %v", got)
 	}
 	if strings.Contains(data, "query-secret") || strings.Contains(data, "header-secret") || strings.Contains(strings.ToLower(data), "authorization") {
@@ -64,7 +64,7 @@ func TestTapeExportVersionsAndRedaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	validated, _ := s.call("tape_validate", args)
-	if validated["ok"] != true || validated["version"] != 2 {
+	if validated["ok"] != true || validated["version"] != 3 {
 		t.Fatalf("validation: %v", validated)
 	}
 }
@@ -76,6 +76,15 @@ func TestTapeExportV1ReleaseBytes(t *testing.T) {
 	start, _ := s.call("proxy_start", []byte(`{"target":"demo","record":true}`))
 	if start["error"] != nil {
 		t.Fatal(start)
+	}
+	requestOnly, _ := s.call("tape_export", []byte(`{"name":"empty"}`))
+	const requestOnlyV2 = "version: 2\nname: empty\nseed: 1\ntarget: demo\nrules: []\nscript: []\nassertions: []\n"
+	if requestOnly["yaml"] != requestOnlyV2 {
+		t.Fatalf("request-only v2 export changed: %v", requestOnly)
+	}
+	explicitV3, _ := s.call("tape_export", []byte(`{"name":"empty","format":"v3"}`))
+	if explicitV3["yaml"] != requestOnlyV2 {
+		t.Fatalf("empty v3 request changed request-only export: %v", explicitV3)
 	}
 	req, err := http.NewRequest("GET", start["proxy_url"].(string)+"/api/state", nil)
 	if err != nil {
@@ -104,6 +113,10 @@ assertions: []
 	v1, _ := s.call("tape_export", []byte(`{"name":"live-smoke","format":"v1"}`))
 	if v1["version"] != 1 || v1["yaml"] != expected {
 		t.Fatalf("v1 export changed: %v\nwant: %s", v1, expected)
+	}
+	v2, _ := s.call("tape_export", []byte(`{"name":"live-smoke","format":"v2"}`))
+	if v2["yaml"] != strings.Replace(expected, "version: 1\n", "version: 2\n", 1) {
+		t.Fatalf("v2 downgrade changed: %v", v2)
 	}
 }
 

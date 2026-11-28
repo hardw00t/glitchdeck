@@ -223,8 +223,8 @@ func TestRecordingExportReportsEvictions(t *testing.T) {
 			if !bytes.Contains(data.Bytes(), []byte("truncated: true")) || !bytes.Contains(data.Bytes(), []byte("dropped_entries: 2")) {
 				t.Fatal("tape omits truncation metadata")
 			}
-			if _, err := tape.Decode(&data); err != nil {
-				t.Fatalf("truncated tape does not decode: %v", err)
+			if _, err := tape.Decode(&data); err == nil {
+				t.Fatal("evicted tape accepted as complete")
 			}
 		})
 	}

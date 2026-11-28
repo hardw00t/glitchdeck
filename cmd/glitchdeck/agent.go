@@ -44,6 +44,9 @@ func execCommand(args []string) int {
 	report := f.String("report", "", "report file")
 	asJSON := f.Bool("json", false, "JSON output")
 	var o execrun.Options
+	f.StringVar(&o.Mode, "mode", "passthrough", "passthrough, record, or replay")
+	f.StringVar(&o.TapeOut, "tape-out", "", "output path for record mode")
+	f.BoolVar(&o.RedactSecrets, "redact-secrets", false, "redact detected secrets before tape export")
 	f.StringVar(&o.Target, "target", "", "target override")
 	f.StringVar(&o.Listen, "listen", "127.0.0.1:0", "proxy listener")
 	f.StringVar(&o.UI, "ui", "", "UI listener")
@@ -130,6 +133,9 @@ func execCommand(args []string) int {
 	}
 	if *path == "" || f.NArg() != 0 || sep+1 == len(args) || o.Timeout <= 0 || o.Grace <= 0 {
 		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
+	}
+	if err := o.ValidateMode(); err != nil {
+		return fail("USAGE_ERROR", err)
 	}
 	for i, pattern := range passthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {
