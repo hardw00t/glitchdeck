@@ -54,7 +54,7 @@ func TestReorderedV3JustOverLimitRejectedBeforeParsing(t *testing.T) {
 }
 
 func TestOversizedLegacyWithAmbiguousVersionRejected(t *testing.T) {
-	for _, suffix := range []string{"version: 3\n", "'version': 3\n", "<<: {version: 3}\n"} {
+	for _, suffix := range []string{"version: 3\n", "'version': 3\n", "<<: {version: 3}\n", "# comment\ufeff\u2028---\u2028version: 3\n"} {
 		input := "version: 1\n" + suffix + "name: " + strings.Repeat("x", maxTapeInput)
 		_, err := Decode(strings.NewReader(input))
 		if err == nil || err.Error() != "tape exceeds input limit" {

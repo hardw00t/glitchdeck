@@ -115,6 +115,9 @@ func legacyLargeInput(raw []byte) bool {
 	for len(data) != 0 {
 		line, rest, more := bytes.Cut(data, []byte("\n"))
 		line = bytes.TrimSuffix(line, []byte("\r"))
+		if bytes.ContainsAny(line, "\r\u0085\u2028\u2029") {
+			return false
+		}
 		data = rest
 		if len(line) == 0 || line[0] == ' ' || line[0] == '\t' || line[0] == '#' {
 			continue
