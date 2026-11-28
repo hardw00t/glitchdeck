@@ -47,17 +47,26 @@ func syncRedactedCassetteRequests(before Tape, after *Tape) error {
 		return blocked()
 	}
 	updated := make([]CassetteRequest, len(after.Cassettes))
+	type stepKeys struct {
+		before, after     cassetteStepKey
+		beforeOK, afterOK bool
+	}
+	keys := make([]stepKeys, len(before.Script))
+	for i := range before.Script {
+		keys[i].before, keys[i].beforeOK = cassetteStepRequest(before.Script[i], before.IgnoreJSONPaths)
+		keys[i].after, keys[i].afterOK = cassetteStepRequest(after.Script[i], after.IgnoreJSONPaths)
+	}
 	for i, cassette := range before.Cassettes {
 		old := cassetteRequestKey(cassette.Request)
 		updated[i] = after.Cassettes[i].Request
 		var next cassetteStepKey
 		found := false
-		for j, step := range before.Script {
-			key, ok := cassetteStepRequest(step, before.IgnoreJSONPaths)
+		for _, step := range keys {
+			key, ok := step.before, step.beforeOK
 			if !ok || key.method != old.method || key.path != old.path || key.digest != old.digest || old.host != "" && key.host != old.host {
 				continue
 			}
-			candidate, ok := cassetteStepRequest(after.Script[j], after.IgnoreJSONPaths)
+			candidate, ok := step.after, step.afterOK
 			if !ok {
 				return blocked()
 			}

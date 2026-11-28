@@ -1,3 +1,11 @@
+export async function requestTape(url, fetchTape = fetch) {
+  const response = await fetchTape(url, { redirect: "error" });
+  if (!response.ok) {
+    throw new Error((await response.text()).trim() || `HTTP ${response.status}`);
+  }
+  return response.blob();
+}
+
 export function mergeEvents(a, b) {
   const events = new Map();
   for (const event of [...a, ...b]) events.set(Number(event.id), event);

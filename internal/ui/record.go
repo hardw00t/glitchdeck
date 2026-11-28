@@ -42,6 +42,7 @@ type recorded struct {
 	sse           bool
 	mitm          bool
 	cassette      *tape.Cassette
+	probe         bool
 }
 
 type recordedChange struct {
@@ -67,6 +68,7 @@ type recorder struct {
 	pendingBodies         int
 	pendingResponses      map[uint64]bool
 	responseReservations  map[uint64]int
+	requestReservations   map[uint64]int
 	reservedResponseBytes int
 	forwardWarning        bool
 	target                string
@@ -117,6 +119,7 @@ func (r *recorder) attach(p *proxy.Proxy) {
 	p.ShouldCaptureResponse = r.shouldCaptureResponse
 	p.OnResponse = r.response
 	p.ReserveResponseBytes = r.reserveResponseBytes
+	p.ReserveRequestBytes = r.reserveRequestBytes
 	p.OnClientFrame = r.clientFrame
 	p.OnServerFrame = r.serverFrame
 	p.OnUnsupportedFrame = r.unsupportedFrame
@@ -156,15 +159,27 @@ func (r *recorder) reserveResponseBytes(seq uint64, n int) int {
 	return allowed
 }
 
+func (r *recorder) reserveRequestBytes(seq uint64, n int) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running || seq <= r.startSeq || n <= 0 {
+		return 0
+	}
+	allowed := min(n, max(0, maxRecordBytes-r.bytes-r.reservedResponseBytes))
+	r.requestReservations[seq] += allowed
+	r.reservedResponseBytes += allowed
+	return allowed
+}
+
 func (r *recorder) response(res proxy.ResponseRecord) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.reservedResponseBytes -= r.responseReservations[res.Seq]
+	delete(r.responseReservations, res.Seq)
 	if !r.running || !r.pendingResponses[res.Seq] {
 		return
 	}
 	delete(r.pendingResponses, res.Seq)
-	r.reservedResponseBytes -= r.responseReservations[res.Seq]
-	delete(r.responseReservations, res.Seq)
 	if res.Status == 0 {
 		return
 	}
@@ -224,8 +239,12 @@ func (r *recorder) clear() {
 	r.lastFrame = time.Time{}
 	r.bodyTruncated, r.droppedEntries, r.pendingBodies = false, 0, 0
 	r.pendingResponses = nil
-	r.responseReservations = nil
-	r.reservedResponseBytes = 0
+	if r.responseReservations == nil {
+		r.responseReservations = make(map[uint64]int)
+	}
+	if r.requestReservations == nil {
+		r.requestReservations = make(map[uint64]int)
+	}
 	r.forwardWarning = false
 }
 
@@ -241,14 +260,13 @@ func (r *recorder) start(seq uint64, activeStreams int, cfg fault.Config, usedBu
 	if !r.running {
 		r.clear()
 		r.running, r.started, r.startSeq = true, time.Now(), seq
-		if size, ok := configSize(cfg); ok && size <= maxRecordBytes {
+		if size, ok := configSize(cfg); ok && size <= maxRecordBytes-r.reservedResponseBytes {
 			r.config, r.bytes = cfg, size
 		} else {
 			r.markIncomplete("initial configuration exceeded the recording byte budget")
 		}
 		r.streams = make(map[uint64]*recorded)
 		r.pendingResponses = make(map[uint64]bool)
-		r.responseReservations = make(map[uint64]int)
 		if activeStreams != 0 {
 			r.markIncomplete("WebSocket, blind or passthrough CONNECT tunnel already open when recording started")
 		}
@@ -369,6 +387,8 @@ func (r *recorder) blindTunnel(seq uint64) {
 func (r *recorder) request(req proxy.Record) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.reservedResponseBytes -= r.requestReservations[req.Seq]
+	delete(r.requestReservations, req.Seq)
 	if !r.running || req.Seq <= r.startSeq {
 		return
 	}
@@ -400,7 +420,7 @@ func (r *recorder) request(req proxy.Record) {
 		requestPath = u.EscapedPath()
 	}
 	req.Path, req.URL = redactQuery(req.Path), redactQuery(req.URL)
-	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE}
+	e := &recorded{seq: req.Seq, at: req.At, events: 1, bytes: len(req.Path), mitm: req.MITM, sse: req.SSE, probe: req.AssertionProbe}
 	if req.WebSocket {
 		if req.MITM || req.URL != "" {
 			r.markIncomplete("forwarded WebSocket authority cannot be replayed")
@@ -497,7 +517,6 @@ func (r *recorder) trim() {
 		r.bytes -= old.bytes
 		r.events -= old.events
 		r.droppedEntries++
-		r.markIncomplete("recorded entries were evicted")
 	}
 }
 
@@ -640,11 +659,17 @@ func (r *recorder) tape(fallback fault.Config) tape.Tape {
 		if e.cassette != nil && e.cassette.Response.Status != 0 {
 			doc.Cassettes = append(doc.Cassettes, *e.cassette)
 		}
-		doc.Script = append(doc.Script, step)
+		if !e.probe {
+			doc.Script = append(doc.Script, step)
+		}
 	}
 	if len(doc.Cassettes) != 0 {
 		doc.Version = 3
 		doc.IgnoreJSONPaths = slices.Clone(r.ignoreJSONPaths)
+		if r.droppedEntries != 0 && !doc.Incomplete {
+			doc.Incomplete = true
+			doc.IncompleteReason = "recorded entries were evicted"
+		}
 	} else if r.forwardWarning && !doc.Incomplete {
 		doc.Incomplete = true
 		doc.IncompleteReason = "forwarded traffic requires explicit upstream authorization for replay"

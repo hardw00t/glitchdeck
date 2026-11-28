@@ -168,7 +168,7 @@ func TestPrepareExportUnscannableBodies(t *testing.T) {
 		for _, redact := range []bool{false, true} {
 			_, err := PrepareExport(input, redact)
 			var blocked *ExportBlockedError
-			if !errors.As(err, &blocked) || blocked.Kind != "unscannable_body" {
+			if !errors.As(err, &blocked) || (blocked.Kind != "unscannable_body" && blocked.Kind != "unsupported_encoding") {
 				t.Fatalf("expected unscannable block: %v", err)
 			}
 		}

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -223,8 +224,8 @@ func TestRecordingExportReportsEvictions(t *testing.T) {
 			if !bytes.Contains(data.Bytes(), []byte("truncated: true")) || !bytes.Contains(data.Bytes(), []byte("dropped_entries: 2")) {
 				t.Fatal("tape omits truncation metadata")
 			}
-			if _, err := tape.Decode(&data); err == nil {
-				t.Fatal("evicted tape accepted as complete")
+			if _, err := tape.Decode(&data); err != nil {
+				t.Fatalf("truncated tape does not decode: %v", err)
 			}
 		})
 	}
@@ -263,4 +264,79 @@ func TestRecordingStopReportsPendingBody(t *testing.T) {
 	if status := r.stop(); !status.Incomplete || !strings.Contains(status.IncompleteReason, "in flight") {
 		t.Fatalf("stopped recording omitted pending upload: %+v", status)
 	}
+}
+
+func TestAssertionProbeRecordsCassetteWithoutScriptStep(t *testing.T) {
+	var r recorder
+	r.start(0, 0, fault.Config{})
+	r.shouldCaptureResponse(1)
+	r.request(proxy.Record{Seq: 1, Method: "GET", Path: "/probe", At: time.Now(), AssertionProbe: true})
+	r.response(proxy.ResponseRecord{Seq: 1, Status: 200, Body: []byte("ok")})
+	doc := r.tape(fault.Config{})
+	if len(doc.Script) != 0 || len(doc.Cassettes) != 1 || doc.Cassettes[0].Response.Body != "ok" {
+		t.Fatalf("probe recording: %+v", doc)
+	}
+}
+
+func TestConcurrentCapturesRemainChargedAcrossRestart(t *testing.T) {
+	uploadReady := make(chan struct{})
+	responseReady := make(chan struct{})
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/upload" {
+			_, _ = io.CopyN(io.Discard, req.Body, 1<<20)
+			close(uploadReady)
+			<-release
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 1<<20))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer up.Close()
+	target, _ := proxy.ParseExplicitTarget(up.URL)
+	p := proxy.New(target, fault.Config{}, nil)
+	defer p.Close()
+	recording := NewRecorder()
+	recording.Start(p)
+	server := httptest.NewServer(p)
+	defer server.Close()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	go func() { _, _ = writer.Write(bytes.Repeat([]byte("a"), 1<<20)); <-release; _ = writer.Close() }()
+	uploadDone := make(chan struct{})
+	go func() {
+		resp, err := http.Post(server.URL+"/upload", "text/plain", reader)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		close(uploadDone)
+	}()
+	<-uploadReady
+	responseDone := make(chan struct{})
+	go func() {
+		resp, err := http.Get(server.URL + "/response")
+		if err == nil {
+			_, _ = io.CopyN(io.Discard, resp.Body, 1<<20)
+			close(responseReady)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		close(responseDone)
+	}()
+	<-responseReady
+	recording.Stop()
+	p.CaptureRecordingBoundary(func(next uint64, active int, cfg fault.Config, used bool) {
+		recording.rec.start(next-1, active, cfg, used)
+	})
+	recording.rec.mu.Lock()
+	reserved := recording.rec.reservedResponseBytes
+	recording.rec.mu.Unlock()
+	if reserved < 2<<20 || reserved > maxRecordBytes {
+		t.Errorf("in-flight captures after restart reserved %d bytes", reserved)
+	}
+	close(release)
+	<-uploadDone
+	<-responseDone
 }

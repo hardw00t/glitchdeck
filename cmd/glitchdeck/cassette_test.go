@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,13 +27,15 @@ func TestExecHybridCassette(t *testing.T) {
 		base := os.Getenv("GLITCHDECK_PROXY_URL")
 		if os.Getenv("GD_CASSETTE_TEST_USE_TARGET") != "" {
 			base = os.Getenv("GLITCHDECK_TARGET")
+			proxyURL, _ := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
+			client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 		}
 		for path := range strings.SplitSeq(route, ",") {
 			response, err := client.Get(base + path)
 			if err != nil {
 				os.Exit(9)
 			}
-			if response.Header.Get("Content-Type") == "text/event-stream" {
+			if response.Header.Get("Content-Type") == "text/event-stream" || route == "/secret" {
 				_, err = io.Copy(os.Stdout, response.Body)
 			} else {
 				_, err = io.Copy(io.Discard, response.Body)
@@ -158,9 +161,7 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 		t.Fatalf("ambiguous replay: exit %d, error %v", code, report.Error)
 	}
 	t.Setenv("GD_CASSETTE_TEST_PATH", "/plain,/v1/chat/completions")
-	t.Setenv("GD_CASSETTE_TEST_USE_TARGET", "1")
 	checkCut(invoke(output, "--mode", "replay"))
-	t.Setenv("GD_CASSETTE_TEST_USE_TARGET", "")
 	if delta := accepts.Load() - before; delta != 0 {
 		t.Fatalf("replay reached the upstream: %d accepts", delta)
 	}
@@ -197,8 +198,15 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 		t.Fatal(err)
 	}
 	t.Setenv("GD_CASSETTE_TEST_PATH", "/secret")
-	if code, report := invoke(input, "--mode", "record", "--tape-out", output); code != 2 || !strings.Contains(fmt.Sprint(report.Error), "EXPORT_BLOCKED") || strings.Contains(fmt.Sprint(report.Error), secret) || strings.Contains(fmt.Sprint(report.Error), dir) {
-		t.Fatalf("blocked recording: exit %d, %#v", code, report.Error)
+	reportPath := filepath.Join(dir, "report.json")
+	code, stdout := launchOutput(t, "exec", "--tape", input, "--json", "--report", reportPath, "--mode", "record", "--tape-out", output, "--", os.Args[0], "-test.run=^TestExecHybridCassette$")
+	reportBytes, err := os.ReadFile(reportPath)
+	if err != nil || code != 2 || !strings.Contains(stdout, "EXPORT_BLOCKED") || strings.Contains(stdout, secret) || bytes.Contains(reportBytes, []byte(secret)) || strings.Contains(stdout, dir) || bytes.Contains(reportBytes, []byte(dir)) {
+		t.Fatalf("blocked output leaked or failed: exit %d, stdout %q, report %q, err %v", code, stdout, reportBytes, err)
+	}
+	code, stdout = launchOutput(t, "exec", "--tape", input, "--mode", "record", "--tape-out", output, "--", os.Args[0], "-test.run=^TestExecHybridCassette$")
+	if code != 2 || strings.Contains(stdout, secret) {
+		t.Fatalf("blocked non-JSON output leaked: exit %d, stdout %q", code, stdout)
 	}
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Fatal("blocked export wrote a file")
@@ -209,5 +217,36 @@ expect: {faults: [{rule: cut, min_applied: 1}]}
 	raw = readOutput()
 	if bytes.Contains(raw, []byte(secret)) || !bytes.Contains(raw, []byte("redacted: true")) || !bytes.Contains(raw, []byte("REDACTED")) {
 		t.Fatal("redacted export still contains the original secret or lacks its markers")
+	}
+}
+
+func TestRecordReplayPreservesLogicalTargetPrefix(t *testing.T) {
+	var requests atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/prefix/item" {
+			t.Errorf("unexpected logical path: %s", r.URL.Path)
+		}
+		requests.Add(1)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+	dir := t.TempDir()
+	input, output := filepath.Join(dir, "in.yaml"), filepath.Join(dir, "out.yaml")
+	if err := os.WriteFile(input, []byte("version: 2\ntarget: "+upstream.URL+"/prefix\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GD_CASSETTE_TEST_PATH", "/item")
+	t.Setenv("GD_CASSETTE_TEST_USE_TARGET", "1")
+	child := []string{"--", os.Args[0], "-test.run=^TestExecHybridCassette$"}
+	args := append([]string{"exec", "--json", "--tape", input, "--mode", "record", "--tape-out", output}, child...)
+	if code, out := launchOutput(t, args...); code != 0 {
+		t.Fatalf("record exit %d: %s", code, out)
+	}
+	args = append([]string{"exec", "--json", "--tape", output, "--mode", "replay"}, child...)
+	if code, out := launchOutput(t, args...); code != 0 {
+		t.Fatalf("replay exit %d: %s", code, out)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("replay reached upstream or record missed it: %d requests", requests.Load())
 	}
 }

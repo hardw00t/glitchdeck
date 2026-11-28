@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,13 +111,19 @@ type Result struct {
 
 func Decode(r io.Reader) (Tape, error) {
 	var t Tape
-	raw, err := io.ReadAll(r)
+	raw, err := io.ReadAll(io.LimitReader(r, maxTapeInput+1))
 	if err != nil {
 		return t, err
+	}
+	if len(raw) > maxTapeInput {
+		return t, fmt.Errorf("tape exceeds input limit")
 	}
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return t, err
+	}
+	if len(doc.Content) != 0 && len(yamlItems(yamlField(doc.Content[0], "cassettes"))) > maxCassettes {
+		return t, fmt.Errorf("too many cassettes")
 	}
 	d := yaml.NewDecoder(bytes.NewReader(raw))
 	d.KnownFields(true)
@@ -195,15 +203,36 @@ func validate(t Tape) error {
 	if t.Version < 3 && (len(t.Cassettes) != 0 || len(t.IgnoreJSONPaths) != 0) {
 		return fmt.Errorf("new keys require version: 3")
 	}
+	if len(t.Cassettes) > maxCassettes {
+		return fmt.Errorf("too many cassettes")
+	}
+	for _, path := range t.IgnoreJSONPaths {
+		for _, part := range strings.Split(path, ".") {
+			if part == "" {
+				return fmt.Errorf("invalid ignore_json_paths")
+			}
+		}
+	}
+	total := 0
 	for i, c := range t.Cassettes {
 		if !validCassetteMethod(c.Request.Method) || !validPath(c.Request.Path) || strings.ContainsAny(c.Request.Path, "?#") {
 			return fmt.Errorf("cassettes[%d]: invalid request", i)
 		}
+		if c.Request.BodySHA256 != "" {
+			digest, err := hex.DecodeString(c.Request.BodySHA256)
+			if err != nil || len(digest) != sha256.Size {
+				return fmt.Errorf("cassettes[%d]: invalid request digest", i)
+			}
+		}
 		if c.Response.Status < 100 || c.Response.Status > 599 {
 			return fmt.Errorf("cassettes[%d]: invalid response status", i)
 		}
-		body, err := c.Response.Bytes()
-		if err != nil || len(body) > maxCassetteBody || c.Response.Truncated {
+		size, err := c.Response.decodedSize()
+		if err != nil || size > maxCassetteBody || size > maxDecodedAggregate-total || c.Response.Truncated {
+			return fmt.Errorf("cassettes[%d]: invalid or truncated response body", i)
+		}
+		total += size
+		if _, err := c.Response.Bytes(); err != nil {
 			return fmt.Errorf("cassettes[%d]: invalid or truncated response body", i)
 		}
 	}
@@ -262,7 +291,7 @@ func validate(t Tape) error {
 			return fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern))
 		}
 	}
-	if t.Incomplete {
+	if t.Incomplete || t.Version == 3 && t.Truncated {
 		return fmt.Errorf("incomplete tape: %s", t.IncompleteReason)
 	}
 	if t.StartSeq == math.MaxUint64 {
@@ -515,6 +544,9 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 	}
 	var app *httptest.Server
 	isDemo := !replay && target == "demo"
+	if replay && target == "demo" && ca != nil {
+		demoTLS = "https://localhost"
+	}
 	if isDemo {
 		handler := demo.New()
 		app = httptest.NewUnstartedServer(handler)
@@ -780,6 +812,14 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 				return nil, fmt.Errorf("step %s: %w", s.Name, e)
 			}
 			stepClient := &http.Client{Transport: tr, CheckRedirect: client.CheckRedirect}
+			if replay {
+				stepClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+					if len(via) >= 10 || next.URL.Scheme != "http" || next.URL.Host != listener.Addr().String() || next.URL.User != nil {
+						return http.ErrUseLastResponse
+					}
+					return nil
+				}
+			}
 			seq := p.Seq() + 1
 			resp, e := stepClient.Do(req)
 			tr.CloseIdleConnections()
@@ -845,7 +885,11 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 			sseResults[s.Name] = func() streamEvidence {
 				runID, admission, cleanup := p.WatchSSEAdmission()
 				defer cleanup()
-				return runStreamWithAdmission(ctx, serverURL, *s.Stream, nil, runID, admission, t.TLSPassthrough, t.TLSMITM, roots)
+				passthrough := t.TLSPassthrough
+				if replay {
+					passthrough = nil
+				}
+				return runStreamWithAdmission(ctx, serverURL, *s.Stream, nil, runID, admission, passthrough, t.TLSMITM, roots)
 			}()
 		case s.GRPC != nil:
 			status, e := runGRPC(ctx, serverURL, *s.GRPC, roots)

@@ -93,6 +93,7 @@ glitchdeck test --mode replay examples/tapes/your-app-openai-sse-cassette.tape.y
 ```
 
 Exports block when the [secret scanner](docs/v2.3.0.md) finds a supported credential pattern. To replace matches with `REDACTED` and rescan, use `--redact-secrets` in record mode or the matching console/MCP export option. Review tapes before sharing: this is a fixed pattern set, not a guarantee that every credential is removed.
+Wire logs and telemetry are not secret-scanned; do not share them.
 
 | Exit | Meaning |
 | --- | --- |
@@ -242,9 +243,9 @@ The ten tools are `proxy_start`, `proxy_stop`, `fault_set`, `fault_clear`, `wire
 
 `exec_run` takes an argv array, not a shell command string; inspect `ok` in its report for assertion failures. Remote targets require the server's `--upstream-allow`; an MCP call can never widen `--upstream-allow`. The `cwd` is resolved within the workdir, but a writable symlink can be swapped between validation and process start (TOCTOU). Windows process cleanup is best-effort and does not guarantee stopping grandchildren.
 
-`tape_export` returns v3 YAML when it contains cassettes and v2 otherwise. Request `format: "v1"` or `"v2"` to omit cassettes; the scanner still checks them before conversion. MCP returns YAML inline only and does not write output files. Incomplete exports report `replayable: false`.
+`tape_export` returns v3 YAML when it contains cassettes and v2 otherwise. Request `format: "v1"` or `"v2"` to omit cassettes; the scanner still checks them before conversion. Exports are inline by default; the existing `out_path` option writes inside the MCP workdir. Incomplete exports report `replayable: false`.
 
-Recordings strip common credential headers and `Referer`, and redact sensitive query values, including ambiguous semicolon-separated suffixes. Response capture also strips `Set-Cookie`. Ring eviction marks the tape truncated; MCP reports `omitted_body_bytes` if it shortens bodies to fit its 64 KiB inline limit. Recordings that omit bodies or trailers are incomplete and cannot be replayed.
+Recordings strip common credential headers and `Referer`, and redact sensitive query values, including ambiguous semicolon-separated suffixes. Response capture also strips `Set-Cookie`. Ring eviction marks the tape truncated; MCP reports `omitted_body_bytes` if it shortens bodies to fit its 64 KiB inline or 1 MiB file limit. Recordings that omit bodies or trailers are incomplete and cannot be replayed.
 
 Use `glitchdeck report --junit report.json` for CI test dashboards and `glitchdeck validate -` to lint tapes from stdin.
 

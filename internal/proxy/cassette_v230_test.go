@@ -31,14 +31,15 @@ func TestResponseCaptureDecodesCompressedBodies(t *testing.T) {
 	_, _ = z.Write([]byte("secret response"))
 	_ = z.Close()
 	for _, tc := range []struct {
-		encoding  string
-		body      []byte
-		want      string
-		truncated bool
+		encoding         string
+		body             []byte
+		want             string
+		truncated        bool
+		capturedEncoding string
 	}{
-		{"gzip", encoded.Bytes(), "secret response", false},
-		{"gzip", []byte("bad gzip"), "", true},
-		{"br", []byte("opaque"), "", true},
+		{"gzip", encoded.Bytes(), "secret response", false, ""},
+		{"gzip", []byte("bad gzip"), "", true, ""},
+		{"br", []byte("opaque"), "", true, "br"},
 	} {
 		t.Run(tc.encoding+tc.want, func(t *testing.T) {
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,7 +57,7 @@ func TestResponseCaptureDecodesCompressedBodies(t *testing.T) {
 				defer func() { _ = recover() }()
 				p.ServeHTTP(httptest.NewRecorder(), localCassetteRequest("GET", "/"))
 			}()
-			if string(got.Body) != tc.want || got.Truncated != tc.truncated || got.Header.Get("Content-Encoding") != "" {
+			if string(got.Body) != tc.want || got.Truncated != tc.truncated || got.Header.Get("Content-Encoding") != tc.capturedEncoding {
 				t.Fatalf("body=%q truncated=%v headers=%v", got.Body, got.Truncated, got.Header)
 			}
 		})
@@ -128,6 +129,35 @@ func TestCaptureTimeoutRetryDecodesAndReserves(t *testing.T) {
 	}
 }
 
+func TestCaptureTimeoutRetryKeepsOriginalReadError(t *testing.T) {
+	var calls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Content-Length", "20")
+			_, _ = io.WriteString(w, "short")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	target, _ := ParseExplicitTarget(up.URL)
+	cfg := fault.Config{Rules: []fault.Rule{{ID: "dup", Enabled: true, Fault: fault.Fault{Type: "dup-webhook", Params: map[string]any{"mode": "timeout_retry", "count": 2, "delay_ms": 0}}}}}
+	p := New(target, cfg, nil)
+	defer p.Close()
+	p.ShouldCaptureResponse = func(uint64) bool { return true }
+	var got ResponseRecord
+	p.OnResponse = func(r ResponseRecord) { got = r }
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, localCassetteRequest("POST", "/"))
+	if err := p.Wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	stats := p.Stats()["dup"].Replays
+	if w.Code != 504 || !got.Truncated || stats == nil || stats.OriginalOutcome != "transport_error" {
+		t.Fatalf("status=%d truncated=%t replay=%+v", w.Code, got.Truncated, stats)
+	}
+}
+
 func TestBeforeHeadersResetRecordsBodylessRequest(t *testing.T) {
 	cfg := fault.Config{Rules: []fault.Rule{{ID: "rst", Enabled: true, Fault: fault.Fault{Type: "tcp-rst", Params: map[string]any{"before_headers": true}}}}}
 	p := New(nil, cfg, nil)
@@ -141,7 +171,7 @@ func TestBeforeHeadersResetRecordsBodylessRequest(t *testing.T) {
 	r.Body = io.NopCloser(strings.NewReader("unread"))
 	r.ContentLength = 6
 	p.ServeHTTP(httptest.NewRecorder(), r)
-	if req.UnrecordableBody || len(req.Body) != 0 || resp.Status != 0 {
+	if !req.UnrecordableBody || len(req.Body) != 0 || resp.Status != 0 {
 		t.Fatalf("request=%+v response=%+v", req, resp)
 	}
 }
@@ -262,13 +292,14 @@ func TestResponseCaptureDrainsAfterSSEFault(t *testing.T) {
 	cfg := fault.Config{Rules: []fault.Rule{{ID: "cut", Enabled: true, Fault: fault.Fault{Type: "sse-glitch", Params: map[string]any{"action": "eof_early", "after_events": 1, "http_clean": true}}}}}
 	p := New(target, cfg, nil)
 	defer p.Close()
-	var got ResponseRecord
+	got := make(chan ResponseRecord, 1)
 	p.ShouldCaptureResponse = func(uint64) bool { return true }
-	p.OnResponse = func(r ResponseRecord) { got = r }
+	p.OnResponse = func(r ResponseRecord) { got <- r }
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, localCassetteRequest("GET", "/"))
-	if w.Body.String() != "data: one\n\n" || string(got.Body) != original || got.Truncated {
-		t.Fatalf("client=%q capture=%q truncated=%v", w.Body.String(), got.Body, got.Truncated)
+	captured := <-got
+	if w.Body.String() != "data: one\n\n" || string(captured.Body) != original || captured.Truncated {
+		t.Fatalf("client=%q capture=%q truncated=%v", w.Body.String(), captured.Body, captured.Truncated)
 	}
 }
 
@@ -301,5 +332,126 @@ func TestCassetteBlocksTunnelAndWebSocketAndRedirect(t *testing.T) {
 	p.ServeHTTP(w, httptest.NewRequest("GET", "http://outside.example/", nil))
 	if w.Code != 302 || w.Header().Get("Location") != "" {
 		t.Fatalf("redirect: %d %q", w.Code, w.Header().Get("Location"))
+	}
+}
+
+func TestCaptureStopsAtFirstReservationGap(t *testing.T) {
+	c := &responseCapture{ReadCloser: io.NopCloser(strings.NewReader("abcdef"))}
+	calls := 0
+	c.reserve = func(n int) int {
+		calls++
+		if calls == 1 {
+			return 1
+		}
+		return n
+	}
+	buf := make([]byte, 3)
+	_, _ = c.Read(buf)
+	_, _ = c.Read(buf)
+	if string(c.body) != "a" || !c.truncated {
+		t.Fatalf("capture is not a prefix: %q", c.body)
+	}
+}
+
+func TestCapturePreservesLiveCompressedRepresentation(t *testing.T) {
+	var encoded bytes.Buffer
+	z := gzip.NewWriter(&encoded)
+	_, _ = z.Write([]byte("payload"))
+	_ = z.Close()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Connection", "X-Private")
+		w.Header().Set("X-Private", "hidden")
+		_, _ = w.Write(encoded.Bytes())
+	}))
+	defer up.Close()
+	target, _ := ParseExplicitTarget(up.URL)
+	p := New(target, fault.Config{}, nil)
+	defer p.Close()
+	p.ShouldCaptureResponse = func(uint64) bool { return true }
+	var requestRecord Record
+	p.OnRequest = func(r Record) { requestRecord = r }
+	var got ResponseRecord
+	p.OnResponse = func(r ResponseRecord) { got = r }
+	w := httptest.NewRecorder()
+	req := localCassetteRequest("GET", "/")
+	req.Header.Set("Connection", "X-Request-Private")
+	req.Header.Set("X-Request-Private", "hidden")
+	req.Header.Set("Accept-Encoding", "gzip")
+	p.ServeHTTP(w, req)
+	if !bytes.Equal(w.Body.Bytes(), encoded.Bytes()) || w.Header().Get("Content-Encoding") != "gzip" || string(got.Body) != "payload" || got.Header.Get("X-Private") != "" || requestRecord.Header.Get("X-Request-Private") != "" {
+		t.Fatalf("live=%x headers=%v capture=%+v", w.Body.Bytes(), w.Header(), got)
+	}
+}
+
+func TestEarlyEOFFinishesBeforeUpstreamCloses(t *testing.T) {
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: one\n\ndata: trigger\n\n")
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, "data: retained after downstream EOF\n\n")
+	}))
+	defer up.Close()
+	target, _ := ParseExplicitTarget(up.URL)
+	cfg := fault.Config{Rules: []fault.Rule{{ID: "cut", Enabled: true, Fault: fault.Fault{Type: "sse-glitch", Params: map[string]any{"action": "eof_early", "after_events": 1, "http_clean": true}}}}}
+	p := New(target, cfg, nil)
+	defer p.Close()
+	captured := make(chan ResponseRecord, 1)
+	p.ShouldCaptureResponse = func(uint64) bool { return true }
+	p.OnResponse = func(r ResponseRecord) { captured <- r }
+	server := httptest.NewServer(p)
+	defer server.Close()
+	done := make(chan error, 1)
+	go func() {
+		resp, err := http.Get(server.URL)
+		if err == nil {
+			_, err = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		t.Error("downstream EOF waited for upstream")
+	}
+	close(release)
+	got := <-captured
+	if got.Truncated || !strings.Contains(string(got.Body), "retained after downstream EOF") {
+		t.Fatalf("capture ended before upstream: %+v", got)
+	}
+}
+
+func TestCaptureProbeBodylessAndTrailers(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "HEAD" {
+			w.Header().Set("Content-Encoding", "gzip")
+			return
+		}
+		w.Header().Set("Trailer", "X-Trailer")
+		_, _ = io.WriteString(w, "body")
+		w.Header().Set("X-Trailer", "value")
+	}))
+	defer up.Close()
+	target, _ := ParseExplicitTarget(up.URL)
+	p := New(target, fault.Config{}, nil)
+	defer p.Close()
+	p.ShouldCaptureResponse = func(uint64) bool { return true }
+	var req Record
+	var res ResponseRecord
+	p.OnRequest = func(r Record) { req = r }
+	p.OnResponse = func(r ResponseRecord) { res = r }
+	p.ServeProbeHTTP(httptest.NewRecorder(), localCassetteRequest("HEAD", "/"))
+	if !req.AssertionProbe || res.Truncated || len(res.Body) != 0 {
+		t.Fatalf("bodyless probe: request=%+v response=%+v", req, res)
+	}
+	p.ServeHTTP(httptest.NewRecorder(), localCassetteRequest("GET", "/"))
+	if !res.Truncated {
+		t.Fatalf("response trailers not marked incomplete: %+v", res)
 	}
 }

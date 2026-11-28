@@ -1,6 +1,18 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { mergeEvents, chunkBytes, percentile, numericValue, duplicateTotal, matchesFilter, faultTag, streamPreview, streamOutcome } from './dist/model.mjs';
+import * as model from './dist/model.mjs';
+
+test('rejected export does not return a downloadable blob', async () => {
+  const safe = 'export blocked: secret_kind=anthropic field=$.cassettes[0].response.body';
+  await assert.rejects(
+    () => model.requestTape('/api/tape/export', async () => new Response(safe, {status: 400})),
+    { message: safe },
+  );
+  const yaml = 'version: 3\n';
+  const file = await model.requestTape('/api/tape/export', async () => new Response(yaml));
+  assert.equal(await file.text(), yaml);
+});
 
 test('snapshot and stream events deduplicate by ID and stay ordered', () => {
   assert.deepEqual(mergeEvents([{id: 2}, {id: 1}], [{id: 2}, {id: 3}]).map(e => e.id), [1, 2, 3]);

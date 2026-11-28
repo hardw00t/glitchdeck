@@ -2,6 +2,7 @@ package tape
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/base64"
@@ -67,37 +68,45 @@ func PrepareExport(t Tape, redact bool) (Tape, error) {
 var quotedString = regexp.MustCompile(`"(?:\\.|[^"\\])*"`)
 
 func scanText(s, field string, redact bool) (string, bool, error) {
+	return scanTextDepth(s, field, redact, 0)
+}
+
+func scanTextDepth(s, field string, redact bool, depth int) (string, bool, error) {
+	if depth > 8 {
+		return "", false, &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
+	}
 	changed := false
+	var scanErr error
 	if strings.Contains(s, `\`) {
-		// Inspect JSON string escapes before raw tokens so an escaped suffix is not left behind.
-		for _, loc := range reverseMatches(quotedString.FindAllStringIndex(s, -1)) {
-			part := s[loc[0]:loc[1]]
-			if !strings.Contains(part, `\`) {
-				continue
+		s = quotedString.ReplaceAllStringFunc(s, func(part string) string {
+			if scanErr != nil || !strings.Contains(part, `\`) {
+				return part
 			}
 			var value string
-			if err := json.Unmarshal([]byte(part), &value); err != nil {
-				continue
+			if json.Unmarshal([]byte(part), &value) != nil {
+				return part
 			}
-			clean, c, err := scanText(value, field, redact)
+			clean, c, err := scanTextDepth(value, field, redact, depth+1)
 			if err != nil {
-				return "", false, err
+				scanErr = err
+				return part
 			}
 			if c {
-				b, err := json.Marshal(clean)
-				if err != nil {
-					return "", false, err
-				}
-				s = s[:loc[0]] + string(b) + s[loc[1]:]
+				b, _ := json.Marshal(clean)
 				changed = true
+				return string(b)
 			}
+			return part
+		})
+		if scanErr != nil {
+			return "", false, scanErr
 		}
 	}
 	query := -1
-	if strings.HasSuffix(field, ".url") || strings.HasSuffix(field, ".path") || strings.HasSuffix(field, ".target") {
+	if strings.HasSuffix(field, ".url") || strings.HasSuffix(field, ".path") || strings.HasSuffix(field, ".target") || strings.HasSuffix(field, ".form") || strings.HasSuffix(field, ".location") {
 		query = strings.IndexByte(s, '?')
 	}
-	if strings.Contains(s, "%") || (query >= 0 && strings.Contains(s[query+1:], "+")) {
+	if strings.Contains(s, "%") || (strings.Contains(s, "+") && (query >= 0 || strings.HasSuffix(field, ".form") || strings.HasSuffix(field, ".location"))) {
 		var decoded strings.Builder
 		starts := make([]int, 0, len(s)+1)
 		for i := 0; i < len(s); {
@@ -122,7 +131,7 @@ func scanText(s, field string, redact bool) (string, bool, error) {
 					continue
 				}
 			}
-			if s[i] == '+' && query >= 0 && i > query {
+			if s[i] == '+' && (strings.HasSuffix(field, ".form") || strings.HasSuffix(field, ".location") || query >= 0 && i > query) {
 				decoded.WriteByte(' ')
 			} else {
 				decoded.WriteByte(s[i])
@@ -132,6 +141,13 @@ func scanText(s, field string, redact bool) (string, bool, error) {
 		starts = append(starts, len(s))
 		d := decoded.String()
 		if d != s {
+			_, composed, err := scanTextDepth(d, field, redact, depth+1)
+			if err != nil {
+				return "", false, err
+			}
+			if composed && strings.ContainsAny(d, `\%`) {
+				return "", false, unsupportedBody(field)
+			}
 			for _, p := range secretPatterns {
 				matches := p.re.FindAllStringIndex(d, -1)
 				if len(matches) == 0 {
@@ -140,11 +156,16 @@ func scanText(s, field string, redact bool) (string, bool, error) {
 				if !redact || strings.Contains(d, `\`) {
 					return "", false, &ExportBlockedError{Kind: p.kind, Field: field}
 				}
-				for i := len(matches) - 1; i >= 0; i-- {
-					m := matches[i]
-					s = s[:starts[m[0]]] + "REDACTED" + s[starts[m[1]]:]
+				var b strings.Builder
+				last := 0
+				for _, m := range matches {
+					b.WriteString(s[last:starts[m[0]]])
+					b.WriteString("REDACTED")
+					last = starts[m[1]]
 				}
-				clean, _, err := scanText(s, field, true)
+				b.WriteString(s[last:])
+				s = b.String()
+				clean, _, err := scanTextDepth(s, field, true, depth+1)
 				return clean, true, err
 			}
 		}
@@ -159,13 +180,6 @@ func scanText(s, field string, redact bool) (string, bool, error) {
 		}
 	}
 	return s, changed, nil
-}
-
-func reverseMatches(matches [][]int) [][]int {
-	for i, j := 0, len(matches)-1; i < j; i, j = i+1, j-1 {
-		matches[i], matches[j] = matches[j], matches[i]
-	}
-	return matches
 }
 
 func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool, error) {
@@ -240,22 +254,37 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 			encoded := f.Name == "MessageB64" || (f.Name == "Body" && v.Type().Name() == "CassetteResponse" && v.FieldByName("BodyEncoding").String() == "base64")
 			body := f.Name == "Body" && (v.Type().Name() == "HTTP" || v.Type().Name() == "Stream" || v.Type().Name() == "CassetteResponse")
 			if encoded || body {
-				encoding := ""
+				encoding, contentType, transfer, grpcEncoding := "", "", "", ""
 				if body {
 					headers := v.FieldByName("Headers")
 					iter := headers.MapRange()
-					found := false
+					seen := map[string]bool{}
 					for iter.Next() {
-						if strings.EqualFold(iter.Key().String(), "Content-Encoding") {
-							if found {
-								return reflect.Value{}, false, &ExportBlockedError{Kind: "unscannable_body", Field: path}
+						key := strings.ToLower(iter.Key().String())
+						switch key {
+						case "content-encoding", "content-type", "content-transfer-encoding", "grpc-encoding":
+							if seen[key] {
+								return reflect.Value{}, false, &ExportBlockedError{Kind: "unsupported_encoding", Field: path}
 							}
-							found = true
-							encoding = strings.TrimSpace(strings.ToLower(iter.Value().String()))
+							seen[key] = true
+							value := strings.TrimSpace(iter.Value().String())
+							switch key {
+							case "content-encoding":
+								encoding = strings.ToLower(value)
+							case "content-type":
+								contentType = value
+							case "content-transfer-encoding":
+								transfer = strings.ToLower(value)
+							case "grpc-encoding":
+								grpcEncoding = strings.ToLower(value)
+							}
 						}
 					}
 				}
-				s, c, err := scanBody(v.Field(i).String(), encoded, encoding, path, redact)
+				if grpcEncoding != "" && grpcEncoding != "identity" {
+					return reflect.Value{}, false, &ExportBlockedError{Kind: "unsupported_encoding", Field: path}
+				}
+				s, c, err := scanBody(v.Field(i).String(), encoded, encoding, contentType, transfer, path, redact)
 				if err != nil {
 					return reflect.Value{}, false, err
 				}
@@ -288,7 +317,8 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 			headers := out.FieldByName("Headers")
 			iter := headers.MapRange()
 			for iter.Next() {
-				if strings.EqualFold(iter.Key().String(), "Content-Length") {
+				key := strings.ToLower(iter.Key().String())
+				if key == "content-length" || key == "content-md5" || key == "content-digest" || key == "digest" || key == "etag" {
 					headers.SetMapIndex(iter.Key(), reflect.Value{})
 				}
 			}
@@ -330,7 +360,11 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 				return reflect.Value{}, false, err
 			}
 			changed = changed || c
-			x, c, err := scanValue(iter.Value(), field, redact)
+			valueField := field
+			if strings.EqualFold(iter.Key().String(), "Location") {
+				valueField += ".location"
+			}
+			x, c, err := scanValue(iter.Value(), valueField, redact)
 			if err != nil {
 				return reflect.Value{}, false, err
 			}
@@ -348,15 +382,18 @@ func scanValue(v reflect.Value, field string, redact bool) (reflect.Value, bool,
 	}
 }
 
-func scanBody(body string, encoded bool, encoding, field string, redact bool) (string, bool, error) {
-	if body == "" {
-		return body, false, nil
-	}
+func scanBody(body string, encoded bool, encoding, contentType, transfer, field string, redact bool) (string, bool, error) {
 	blocked := func() (string, bool, error) {
 		return "", false, &ExportBlockedError{Kind: "unscannable_body", Field: field}
 	}
-	if !encoded && (encoding == "" || encoding == "identity") {
-		return scanText(body, field, redact)
+	if err := checkBodyEncoding(contentType, transfer, field); err != nil {
+		return "", false, err
+	}
+	if encoding != "" && encoding != "identity" && encoding != "gzip" && encoding != "x-gzip" && encoding != "deflate" {
+		return "", false, &ExportBlockedError{Kind: "unsupported_encoding", Field: field}
+	}
+	if body == "" {
+		return body, false, nil
 	}
 	raw := []byte(body)
 	if encoded {
@@ -368,14 +405,32 @@ func scanBody(body string, encoded bool, encoding, field string, redact bool) (s
 	}
 	var reader io.ReadCloser
 	var err error
+	source := bytes.NewReader(raw)
+	rawDeflate := false
 	switch encoding {
 	case "", "identity":
 	case "gzip", "x-gzip":
-		reader, err = gzip.NewReader(bytes.NewReader(raw))
+		var g *gzip.Reader
+		g, err = gzip.NewReader(source)
+		if err == nil {
+			g.Multistream(false)
+		}
+		if err == nil {
+			for _, metadata := range []string{g.Name, g.Comment, string(g.Extra)} {
+				if _, _, e := scanText(metadata, field, false); e != nil {
+					g.Close()
+					return "", false, e
+				}
+			}
+			reader = g
+		}
 	case "deflate":
-		reader, err = zlib.NewReader(bytes.NewReader(raw))
-	default:
-		return blocked()
+		if len(raw) >= 2 && raw[0]&15 == 8 && raw[0]>>4 <= 7 && (int(raw[0])*256+int(raw[1]))%31 == 0 {
+			reader, err = zlib.NewReader(source)
+		} else {
+			rawDeflate = true
+			reader = flate.NewReader(source)
+		}
 	}
 	if err != nil {
 		return blocked()
@@ -383,11 +438,11 @@ func scanBody(body string, encoded bool, encoding, field string, redact bool) (s
 	if reader != nil {
 		raw, err = io.ReadAll(io.LimitReader(reader, (4<<20)+1))
 		closeErr := reader.Close()
-		if err != nil || closeErr != nil || len(raw) > 4<<20 {
+		if err != nil || closeErr != nil || len(raw) > 4<<20 || source.Len() != 0 {
 			return blocked()
 		}
 	}
-	clean, changed, err := scanText(string(raw), field, redact)
+	clean, changed, err := scanBodyText(string(raw), contentType, field, redact)
 	if err != nil {
 		return "", false, err
 	}
@@ -399,7 +454,14 @@ func scanBody(body string, encoded bool, encoding, field string, redact bool) (s
 		var output bytes.Buffer
 		var writer io.WriteCloser
 		if encoding == "deflate" {
-			writer = zlib.NewWriter(&output)
+			if rawDeflate {
+				writer, err = flate.NewWriter(&output, flate.DefaultCompression)
+				if err != nil {
+					return blocked()
+				}
+			} else {
+				writer = zlib.NewWriter(&output)
+			}
 		} else {
 			writer = gzip.NewWriter(&output)
 		}

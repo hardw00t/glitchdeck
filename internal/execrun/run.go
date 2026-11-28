@@ -222,6 +222,13 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if err := o.ValidateMode(); err != nil {
 		return finish(2, "USAGE_ERROR", err)
 	}
+	if o.Mode == "record" {
+		for _, a := range t.Assertions {
+			if a.HTTPGet == "" || a.Direct || a.MaxLatencyMS != 0 {
+				return finish(2, "USAGE_ERROR", errors.New("record mode supports only proxied HTTP assertions without latency limits"))
+			}
+		}
+	}
 	replay := o.Mode == "replay"
 	if replay {
 		if t.Version == 3 && len(t.Cassettes) == 0 {
@@ -470,7 +477,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			demoURL = target
 		}
 		e.Exec.UIURL = "http://" + l.Addr().String()
-		server := &http.Server{Handler: ui.New(p, bus, ui.Options{Target: target, Listen: listener.Addr().String(), UI: l.Addr().String(), DemoURL: demoURL, ProxyAuth: opts.ProxyAuth, Recording: recording})}
+		server := &http.Server{Handler: ui.New(p, bus, ui.Options{Target: target, Listen: listener.Addr().String(), UI: l.Addr().String(), DemoURL: demoURL, ProxyAuth: opts.ProxyAuth, Recording: recording, IgnoreJSONPaths: t.IgnoreJSONPaths})}
 		go server.Serve(l)
 		defer server.Close()
 	}
@@ -514,11 +521,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			warn(fmt.Sprintf("no_proxy: dropped %q from inherited NO_PROXY; it would bypass glitchdeck for target %s (pass --no-proxy %s to keep it)", entry, safeTarget, entry))
 		}
 	}
-	childTarget := target
-	if replay && parsed != nil {
-		childTarget = proxyURL
-	}
-	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+childTarget, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
+	env = append(env, "GLITCHDECK_PROXY_URL="+proxyURL, "GLITCHDECK_TARGET="+target, "HTTP_PROXY="+proxyURL, "http_proxy="+proxyURL, "HTTPS_PROXY="+proxyURL, "https_proxy="+proxyURL, "NO_PROXY="+noProxy, "no_proxy="+noProxy, "NODE_USE_ENV_PROXY=1")
 	if e.Exec.UIURL != "" {
 		env = append(env, "GLITCHDECK_UI_URL="+e.Exec.UIURL)
 	}
@@ -538,7 +541,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	stdout := tail{limit: limit, boundUTF8: o.DetachStdio}
 	stderr := stdout
-	if o.JSON || o.ProxyAuth || o.DetachStdio {
+	if o.JSON || o.ProxyAuth || o.DetachStdio || o.Mode == "record" {
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 	} else {
@@ -680,7 +683,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		e.Exec.StderrTail = strings.ReplaceAll(e.Exec.StderrTail, proxyURL, publicURL)
 		e.Exec.StdoutTail = strings.ReplaceAll(e.Exec.StdoutTail, opts.ProxyAuth, "[redacted]")
 		e.Exec.StderrTail = strings.ReplaceAll(e.Exec.StderrTail, opts.ProxyAuth, "[redacted]")
-		if !o.JSON && !o.DetachStdio {
+		if !o.JSON && !o.DetachStdio && recording == nil {
 			fmt.Fprintln(os.Stdout, e.Exec.StdoutTail)
 			fmt.Fprintln(os.Stderr, e.Exec.StderrTail)
 		}
@@ -709,16 +712,6 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	// TrafficStats snapshots counters and denied hosts together, even on timeout.
 	childStats := p.TrafficStats()
 	childFaults := p.AppliedFaults()
-	if recording != nil {
-		recording.Stop()
-		if err := writeRecording(recording, t, o); err != nil {
-			var blocked *tape.ExportBlockedError
-			if errors.As(err, &blocked) {
-				return finish(2, "EXPORT_BLOCKED", err)
-			}
-			return finish(3, "TAPE_IO", err)
-		}
-	}
 	var httpResults []tape.Result
 	if waitErr == nil {
 		probeURL, probePassword := "", ""
@@ -740,6 +733,22 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			}
 		}
 	}
+	if recording != nil {
+		recording.Stop()
+		if err := writeRecording(recording, t, o); err != nil {
+			var blocked *tape.ExportBlockedError
+			if errors.As(err, &blocked) {
+				e = NewEnvelope("exec", "", "")
+				e.Target = nil
+				return finish(2, "EXPORT_BLOCKED", blocked)
+			}
+			return finish(3, "TAPE_IO", err)
+		}
+		if !o.JSON && !o.DetachStdio {
+			fmt.Fprint(os.Stdout, e.Exec.StdoutTail)
+			fmt.Fprint(os.Stderr, e.Exec.StderrTail)
+		}
+	}
 	e.Summary.RequestsTotal = p.RequestsTotal()
 	e.SetAppliedFaults(p.AppliedFaults())
 	e.FrameErrors, e.FrameErrorsOmitted = frameErrors.Snapshot()
@@ -750,11 +759,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	if deniedList != "" {
 		warn(fmt.Sprintf("warning: egress denied %d (hosts: %s)", childStats.EgressDenied, deniedList))
 	}
-	if replay {
-		var cassetteErr *proxy.CassetteError
-		if err := p.CassetteFailure(); errors.As(err, &cassetteErr) {
-			return finish(1, cassetteErr.Kind, err)
-		}
+	var cassetteErr *proxy.CassetteError
+	if replay && errors.As(p.CassetteFailure(), &cassetteErr) {
+		e.Diff = append(e.Diff, cassetteErr.Error())
 	}
 	if len(leaked) > 0 {
 		return finish(3, "LEAKED_PIDS", fmt.Errorf("child processes remain: %v", leaked))
@@ -765,6 +772,9 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	if waitErr != nil {
 		return finish(3, "PROXY_WAIT_FAILED", waitErr)
+	}
+	if cassetteErr != nil {
+		return finish(1, cassetteErr.Kind, cassetteErr)
 	}
 	protocolTape := t
 	protocolTape.Assertions = nil

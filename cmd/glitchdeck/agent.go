@@ -10,6 +10,7 @@ import (
 	"io"
 	"maps"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -82,7 +83,11 @@ func execCommand(args []string) int {
 		if *report != "" {
 			if err := execrun.WriteReport(*report, e); err != nil {
 				e.ExitCode, e.OK = 3, false
-				e.Error = map[string]string{"code": "TAPE_IO", "message": err.Error()}
+				if problem, ok := e.Error.(map[string]string); ok && problem["code"] == "EXPORT_BLOCKED" {
+					e.Error = map[string]string{"code": "TAPE_IO", "message": "could not write report"}
+				} else {
+					e.Error = map[string]string{"code": "TAPE_IO", "message": err.Error()}
+				}
 			}
 		}
 		if wantJSON {
@@ -137,6 +142,13 @@ func execCommand(args []string) int {
 	if err := o.ValidateMode(); err != nil {
 		return fail("USAGE_ERROR", err)
 	}
+	if *report != "" && o.TapeOut != "" {
+		alias, err := sameOutputDestination(*report, o.TapeOut)
+		if err != nil || alias {
+			*report = ""
+			return fail("USAGE_ERROR", errors.New("report and tape output destinations must be distinct and resolvable"))
+		}
+	}
 	for i, pattern := range passthrough {
 		if err := proxy.ValidatePassthrough(pattern); err != nil {
 			return fail("USAGE_ERROR", fmt.Errorf("tls_passthrough[%d]: %v: %q", i, err, strings.TrimSpace(pattern)))
@@ -158,6 +170,39 @@ func execCommand(args []string) int {
 	})
 	o.Command, o.TapePath, o.JSON, o.UpstreamAllow, o.TLSPassthrough = args[sep+1:], *path, *asJSON, allow, passthrough
 	return emit(execrun.Run(context.Background(), t, o))
+}
+
+func sameOutputDestination(a, b string) (bool, error) {
+	resolve := func(path string) (string, error) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			return resolved, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		dir, err := filepath.EvalSymlinks(filepath.Dir(abs))
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(dir, filepath.Base(abs)), nil
+	}
+	x, err := resolve(a)
+	if err != nil {
+		return false, err
+	}
+	y, err := resolve(b)
+	if err != nil {
+		return false, err
+	}
+	if x == y || (runtime.GOOS == "windows" || runtime.GOOS == "darwin") && strings.EqualFold(x, y) {
+		return true, nil
+	}
+	ax, errA := os.Stat(a)
+	bx, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(ax, bx), nil
 }
 
 func mcpCommand(args []string) int {

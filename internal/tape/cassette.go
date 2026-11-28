@@ -8,14 +8,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/hardw00t/glitchdeck/internal/proxy"
 )
 
-const maxCassetteBody = 4 << 20
+const (
+	maxCassetteBody     = 4 << 20
+	maxTapeInput        = 16 << 20
+	maxCassettes        = 256
+	maxDecodedAggregate = 8 << 20
+)
 
 func validCassetteMethod(method string) bool {
 	if method == "" {
@@ -50,7 +57,36 @@ type CassetteResponse struct {
 	Truncated    bool              `yaml:"truncated,omitempty" json:"truncated,omitempty"`
 }
 
+func (r CassetteResponse) decodedSize() (int, error) {
+	switch r.BodyEncoding {
+	case "":
+		return len(r.Body), nil
+	case "base64":
+		n, padding := 0, 0
+		for i := range len(r.Body) {
+			switch r.Body[i] {
+			case '\r', '\n':
+			case '=':
+				n++
+				padding++
+			default:
+				n++
+			}
+		}
+		if n%4 != 0 || padding > 2 {
+			return 0, fmt.Errorf("invalid base64 cassette body")
+		}
+		return n/4*3 - padding, nil
+	default:
+		return 0, fmt.Errorf("invalid cassette body encoding")
+	}
+}
+
 func (r CassetteResponse) Bytes() ([]byte, error) {
+	size, err := r.decodedSize()
+	if err != nil || size > maxCassetteBody {
+		return nil, fmt.Errorf("invalid or oversized cassette body")
+	}
 	switch r.BodyEncoding {
 	case "":
 		if !utf8.ValidString(r.Body) {
@@ -58,7 +94,7 @@ func (r CassetteResponse) Bytes() ([]byte, error) {
 		}
 		return []byte(r.Body), nil
 	case "base64":
-		return base64.StdEncoding.DecodeString(r.Body)
+		return io.ReadAll(io.LimitReader(base64.NewDecoder(base64.StdEncoding, strings.NewReader(r.Body)), int64(size)+1))
 	default:
 		return nil, fmt.Errorf("invalid cassette body encoding")
 	}
@@ -79,7 +115,7 @@ func BodySHA256(body []byte, ignore []string) string {
 	var value any
 	d := json.NewDecoder(bytes.NewReader(body))
 	d.UseNumber()
-	if d.Decode(&value) == nil {
+	if losslessJSON(body) && d.Decode(&value) == nil {
 		var extra any
 		if d.Decode(&extra) == io.EOF {
 			for _, path := range ignore {
@@ -106,6 +142,98 @@ func BodySHA256(body []byte, ignore []string) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
 }
+func losslessJSON(body []byte) bool {
+	if !utf8.Valid(body) || !json.Valid(body) {
+		return false
+	}
+	inString := false
+	for i := 0; i < len(body); i++ {
+		if body[i] == '"' {
+			inString = !inString
+		} else if inString && body[i] == '\\' {
+			i++
+			if i >= len(body) {
+				return false
+			}
+			if body[i] != 'u' {
+				continue
+			}
+			if i+4 >= len(body) {
+				return false
+			}
+			n, err := strconv.ParseUint(string(body[i+1:i+5]), 16, 16)
+			if err != nil {
+				return false
+			}
+			i += 4
+			if n >= 0xdc00 && n <= 0xdfff {
+				return false
+			}
+			if n >= 0xd800 && n <= 0xdbff {
+				if i+6 >= len(body) || body[i+1] != '\\' || body[i+2] != 'u' {
+					return false
+				}
+				low, err := strconv.ParseUint(string(body[i+3:i+7]), 16, 16)
+				if err != nil || low < 0xdc00 || low > 0xdfff {
+					return false
+				}
+				i += 6
+			}
+		}
+	}
+	d := json.NewDecoder(bytes.NewReader(body))
+	d.UseNumber()
+	return uniqueJSONValue(d)
+}
+
+func uniqueJSONValue(d *json.Decoder) bool {
+	token, err := d.Token()
+	if err != nil {
+		return false
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return true
+	}
+	if delim == '{' {
+		keys := make(map[string]bool)
+		for d.More() {
+			key, err := d.Token()
+			if err != nil {
+				return false
+			}
+			name, ok := key.(string)
+			if !ok || keys[name] {
+				return false
+			}
+			keys[name] = true
+			if !uniqueJSONValue(d) {
+				return false
+			}
+		}
+	} else if delim == '[' {
+		for d.More() {
+			if !uniqueJSONValue(d) {
+				return false
+			}
+		}
+	} else {
+		return false
+	}
+	_, err = d.Token()
+	return err == nil
+}
+
+func sameAuthority(a, b, scheme string) bool {
+	normalize := func(authority string) string {
+		host, port, err := net.SplitHostPort(authority)
+		if err == nil && (scheme == "https" && port == "443" || scheme == "http" && port == "80") {
+			return strings.ToLower(strings.Trim(host, "[]"))
+		}
+		return strings.ToLower(strings.Trim(authority, "[]"))
+	}
+	return normalize(a) == normalize(b)
+}
 
 func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 	type replayCassette struct {
@@ -113,17 +241,17 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 		valid    bool
 	}
 	cassettes := make([]replayCassette, len(t.Cassettes))
+	total := 0
 	for i, c := range t.Cassettes {
-		valid := !c.Response.Truncated && c.Response.Status >= 100 && c.Response.Status <= 599
-		switch c.Response.BodyEncoding {
-		case "":
-			valid = valid && utf8.ValidString(c.Response.Body) && len(c.Response.Body) <= maxCassetteBody
-		case "base64":
-			body, err := base64.StdEncoding.DecodeString(c.Response.Body)
-			valid = valid && err == nil && len(body) <= maxCassetteBody
-			c.Response.Body = string(body)
-		default:
-			valid = false
+		size, err := c.Response.decodedSize()
+		valid := len(t.Cassettes) <= maxCassettes && err == nil && size <= maxCassetteBody && size <= maxDecodedAggregate-total && !c.Response.Truncated && c.Response.Status >= 100 && c.Response.Status <= 599
+		if valid {
+			total += size
+			body, err := c.Response.Bytes()
+			valid = err == nil
+			if valid && c.Response.BodyEncoding == "base64" {
+				c.Response.Body = string(body)
+			}
 		}
 		if c.Response.Headers != nil {
 			headers := make(map[string]string, len(c.Response.Headers))
@@ -137,8 +265,15 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 	ignore := append([]string(nil), t.IgnoreJSONPaths...)
 	return func(req *http.Request) (*http.Response, error) {
 		path := req.URL.EscapedPath()
+		scheme := req.URL.Scheme
+		if scheme == "" && req.TLS != nil {
+			scheme = "https"
+		}
+		if scheme == "" {
+			scheme = "http"
+		}
 		matches := func(c Cassette) bool {
-			return strings.EqualFold(c.Request.Method, req.Method) && c.Request.Path == path && (c.Request.Host == "" || strings.EqualFold(c.Request.Host, req.Host))
+			return strings.EqualFold(c.Request.Method, req.Method) && c.Request.Path == path && (c.Request.Host == "" || sameAuthority(c.Request.Host, req.Host, strings.ToLower(scheme)))
 		}
 		miss := func() (*http.Response, error) { return nil, &proxy.CassetteError{Kind: "cassette_miss"} }
 		index, count := -1, 0
@@ -164,7 +299,7 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 			count = 0
 			for i := range cassettes {
 				c := cassettes[i].cassette
-				if matches(c) && c.Request.BodySHA256 == digest {
+				if matches(c) && (c.Request.BodySHA256 == "" || strings.EqualFold(c.Request.BodySHA256, digest)) {
 					index = i
 					count++
 				}

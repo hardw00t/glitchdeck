@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -411,12 +412,14 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		if a.Seed != nil {
 			cfg.Seed = *a.Seed
 		}
+		var ignoreJSONPaths []string
 		if a.TapePath != "" {
 			t, e := s.readTape(a.TapePath)
 			if e != nil {
 				return fail("INVALID_TAPE", e.Error()), nil
 			}
 			cfg = fault.Config{Seed: t.Seed, Rules: t.Rules}
+			ignoreJSONPaths = t.IgnoreJSONPaths
 		}
 		target := a.Target
 		s.isDemo = target == "demo"
@@ -448,6 +451,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		s.proxyURL = "http://" + l.Addr().String()
 		if a.Record {
 			s.recording = ui.NewRecorder()
+			s.recording.SetCassetteMetadata(target, ignoreJSONPaths)
 			s.recording.Start(s.p)
 		}
 		go s.p.Serve(l)
@@ -655,6 +659,7 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 	case "tape_export":
 		var a struct {
 			Name          string `json:"name"`
+			OutPath       string `json:"out_path"`
 			RedactSecrets bool   `json:"redact_secrets"`
 			Format        string `json:"format"`
 		}
@@ -697,10 +702,17 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		} else {
 			t.Version = 2
 		}
-		b, e := encodeExport(&t, 64<<10)
+		limit := 64 << 10
+		if a.OutPath != "" {
+			limit = 1 << 20
+		}
+		b, e := encodeExport(&t, limit)
 		if e != nil {
 			if e == errExportSize {
-				return fail("INVALID_TAPE", "tape exceeds export size limit"), nil
+				if a.OutPath == "" {
+					return fail("INVALID_PATH", "use out_path for large tapes"), nil
+				}
+				return fail("INVALID_TAPE", "tape exceeds 1 MiB"), nil
 			}
 			return fail("INVALID_TAPE", e.Error()), nil
 		}
@@ -715,7 +727,34 @@ func (s *Server) call(name string, raw []byte) (map[string]any, *paramError) {
 		if t.OmittedBodyBytes > 0 {
 			res["omitted_body_bytes"] = t.OmittedBodyBytes
 		}
-		res["yaml"] = b
+		if a.OutPath == "" {
+			res["yaml"] = b
+		} else {
+			path, e := s.outputPath(a.OutPath)
+			if e != nil {
+				return fail("INVALID_PATH", e.Error()), nil
+			}
+			base := s.opts.Workdir
+			if base == "" {
+				base = "."
+			}
+			base, e = filepath.Abs(base)
+			if e == nil {
+				base, e = filepath.EvalSymlinks(base)
+			}
+			var relative string
+			if e == nil {
+				relative, e = filepath.Rel(base, path)
+			}
+			if e != nil {
+				return fail("INVALID_PATH", e.Error()), nil
+			}
+			if e = s.writeTape(path, []byte(b)); e != nil {
+				return fail("INVALID_PATH", e.Error()), nil
+			}
+			res["out_path"] = path
+			res["tape_path"] = relative
+		}
 		if t.Truncated {
 			LogDiagnostic(fmt.Sprintf("tape export truncated: dropped_entries=%d", t.DroppedEntries))
 		}
@@ -928,10 +967,17 @@ func encodeExport(t *tape.Tape, limit int) (string, error) {
 			total += len(response.Body)
 		}
 	}
+	if total == 0 && len(t.Cassettes) == 0 {
+		return "", errExportSize
+	}
 	previousOmitted := t.OmittedBodyBytes
 	t.Truncated, t.Incomplete = true, true
 	if t.IncompleteReason == "" {
-		t.IncompleteReason = "recording exceeded export size limit"
+		if len(t.Cassettes) == 0 {
+			t.IncompleteReason = "recorded request body was truncated for export"
+		} else {
+			t.IncompleteReason = "recording exceeded export size limit"
+		}
 	}
 	retain := func(n int) {
 		omitted := 0
@@ -986,6 +1032,7 @@ func encodeExport(t *tape.Tape, limit int) (string, error) {
 		total = 0
 		for _, body := range bodies {
 			if body.cassette != 0 && body.cassette <= removed {
+				previousOmitted += len(body.value)
 				continue
 			}
 			kept = append(kept, body)
@@ -1084,4 +1131,78 @@ func (s *Server) readTapeBytes(path string) ([]byte, error) {
 		return nil, errors.New("tape exceeds 1 MiB")
 	}
 	return data, nil
+}
+
+func (s *Server) writeTape(path string, data []byte) error {
+	base := s.opts.Workdir
+	if base == "" {
+		base = "."
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	base, err = filepath.Abs(base)
+	if err != nil {
+		return err
+	}
+	base, err = filepath.EvalSymlinks(base)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(base, path)
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(filepath.Dir(rel), ".glitchdeck-"+rand.Text())
+	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	defer root.Remove(tmp)
+	_, err = f.Write(data)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return root.Rename(tmp, rel)
+}
+
+func (s *Server) outputPath(p string) (string, error) {
+	if strings.ContainsRune(p, 0) || (filepath.Ext(p) != ".yaml" && filepath.Ext(p) != ".yml") {
+		return "", fmt.Errorf("output must be YAML")
+	}
+	base := s.opts.Workdir
+	if base == "" {
+		base = "."
+	}
+	base, e := filepath.Abs(base)
+	if e != nil {
+		return "", e
+	}
+	base, e = filepath.EvalSymlinks(base)
+	if e != nil {
+		return "", e
+	}
+	target := s.path(p)
+	parent, e := filepath.EvalSymlinks(filepath.Dir(target))
+	if e != nil {
+		return "", e
+	}
+	parent, e = filepath.Abs(parent)
+	if e != nil {
+		return "", e
+	}
+	rel, e := filepath.Rel(base, parent)
+	if e != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("output outside workdir")
+	}
+	dest := filepath.Join(parent, filepath.Base(target))
+	if info, e := os.Lstat(dest); e == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("output is symlink")
+	}
+	return dest, nil
 }

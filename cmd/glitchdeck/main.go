@@ -288,6 +288,7 @@ func serve(args []string, isDemo bool) int {
 	}
 	cfg := fault.Config{Seed: *seed}
 	var startSeq uint64
+	var ignoreJSONPaths []string
 	if *tapePath != "" {
 		file, e := os.Open(*tapePath)
 		if e != nil {
@@ -300,6 +301,7 @@ func serve(args []string, isDemo bool) int {
 		}
 		cfg = fault.Config{Seed: t.Seed, Rules: t.Rules}
 		startSeq = t.StartSeq
+		ignoreJSONPaths = t.IgnoreJSONPaths
 		passthrough = append(passthrough, t.TLSPassthrough...)
 	}
 	if len(passthrough) != 0 && !*tlsEnabled {
@@ -388,7 +390,7 @@ func serve(args []string, isDemo bool) int {
 	if isDemo {
 		demoURL = *target
 	}
-	handler := ui.New(p, bus, ui.Options{Target: *target, Listen: pl.Addr().String(), UI: ul.Addr().String(), DemoURL: demoURL})
+	handler := ui.New(p, bus, ui.Options{Target: *target, Listen: pl.Addr().String(), UI: ul.Addr().String(), DemoURL: demoURL, IgnoreJSONPaths: ignoreJSONPaths})
 	servers := []*http.Server{{Handler: handler}}
 	listeners := []net.Listener{ul}
 	if isDemo {

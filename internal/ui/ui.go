@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -32,6 +33,7 @@ const maxInput = 16 << 20
 type Options struct {
 	Target, Listen, UI, DemoURL, ProxyAuth string
 	Recording                              *Recording
+	IgnoreJSONPaths                        []string
 }
 
 type control struct {
@@ -56,7 +58,7 @@ func New(p *proxy.Proxy, bus *telemetry.Bus, opts Options) http.Handler {
 	if opts.Recording != nil {
 		c.rec = &opts.Recording.rec
 	} else {
-		c.rec = &recorder{}
+		c.rec = &recorder{ignoreJSONPaths: slices.Clone(opts.IgnoreJSONPaths)}
 		c.rec.attach(p)
 	}
 	mux := http.NewServeMux()

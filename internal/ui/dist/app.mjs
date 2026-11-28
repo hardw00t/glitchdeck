@@ -4,7 +4,7 @@ import {
   percentile,
   numericValue,
   duplicateTotal,
-  matchesFilter, faultFired, faultTag, streamPreview, streamOutcome,
+  matchesFilter, faultFired, faultTag, streamPreview, streamOutcome, requestTape,
 } from "./model.mjs";
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -463,8 +463,24 @@ $("#copy-cli").onclick = async () => {
 $("#redact-secrets").onchange = (event) => {
   $("#export-button").href = event.target.checked ? "/api/tape/export?redact_secrets=true" : "/api/tape/export";
 };
-$("#export-button").onclick = () => {
-  if (tape.events || tape.incomplete) message("Tape exported");
+$("#export-button").onclick = async (event) => {
+  event.preventDefault();
+  const button = event.currentTarget;
+  if (button.getAttribute("aria-disabled") === "true") return;
+  try {
+    const blob = await requestTape(button.href);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = button.download;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    message("Tape exported");
+  } catch (error) {
+    message(`Tape: ${error.message}`);
+  }
 };
 function selectTab(index, focus = false) {
   const tabs = [$("#tab-rack"), $("#tab-demo")];

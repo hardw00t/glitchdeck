@@ -39,6 +39,7 @@ func (p *Proxy) tunnelSequence() (uint64, uint64) {
 
 func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	replay := p.options.CassetteUpstream != nil
 	host, port, err := net.SplitHostPort(r.Host)
 	n, portErr := strconv.ParseUint(port, 10, 16)
 	valid := r.ProtoMajor == 1 && err == nil && portErr == nil && n != 0 && p.allowed(host, port)
@@ -46,10 +47,10 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 	if valid && p.options.CA != nil {
 		pattern, passthrough = p.passthrough(host, port)
 	}
-	if p.options.CassetteUpstream != nil {
+	intercept := valid && p.options.CA != nil && (replay || !passthrough)
+	if replay {
 		passthrough = false
 	}
-	intercept := valid && p.options.CA != nil && !passthrough
 	tunnel := "blind"
 	if passthrough {
 		tunnel = "passthrough"
@@ -64,8 +65,13 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 			p.gate.Unlock()
 		}()
 	}
-	if valid && !intercept && seq != 0 && p.OnBlindTunnel != nil {
+	if !replay && valid && !intercept && seq != 0 && p.OnBlindTunnel != nil {
 		p.callback(gen, func() { p.OnBlindTunnel(seq) })
+	}
+	if replay && !intercept {
+		p.failCassette("cassette_miss", r.Method, "/")
+		http.Error(w, "cassette tunnel unavailable", http.StatusBadGateway)
+		return
 	}
 	if !valid {
 		deniedHost := p.noteEgressDenial(r.Host, true)
@@ -79,17 +85,15 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy closed", http.StatusServiceUnavailable)
 		return
 	}
-	if p.options.CassetteUpstream != nil && !intercept {
-		p.failCassette("cassette_miss", r.Method, "/")
-		http.Error(w, "cassette tunnel unavailable", http.StatusBadGateway)
-		return
-	}
 	p.mu.Lock()
 	f := p.front
 	p.mu.Unlock()
 	var upstream net.Conn
 	if intercept {
 		if f == nil || f.minter == nil {
+			if replay {
+				p.failCassette("cassette_miss", r.Method, "/")
+			}
 			http.Error(w, "no tunnel listener", http.StatusBadGateway)
 			return
 		}
