@@ -35,7 +35,6 @@ type Options struct {
 	ProxyAuth            string
 	BeforeRequest        func(uint64)
 	OnAdmission          func(seq uint64, method, path, host string)
-	OnEgressDenied       func(host string) // Receives only public, normalized hostnames.
 	OnReset              func()
 	RequireUpstreamAllow bool
 	AllowLoopbackEgress  bool

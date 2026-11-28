@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/proxy"
 	"github.com/hardw00t/glitchdeck/internal/tape"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 	"github.com/hardw00t/glitchdeck/internal/testutil"
@@ -309,6 +310,61 @@ func TestObservedGRPCUsesAdmissionOrder(t *testing.T) {
 	}
 }
 
+func TestDeniedGRPCAssertionUsesPrivateAdmissionKey(t *testing.T) {
+	const path = "/unreported.Service/Call?fixture=value"
+	want := 14
+	a := tape.Assertion{Name: "unavailable", GRPCStep: "denied", ExpectGRPCStatus: &want}
+	tp := tape.Tape{Script: []tape.Step{{Name: "denied", Seq: 1, GRPC: &tape.GRPC{Path: path}}}, Assertions: []tape.Assertion{a}}
+	evidence := newAssertionEvidence(tp)
+	bus := telemetry.New()
+	bus.SetObserver(evidence.observe)
+	target, err := proxy.ParseExplicitTarget("http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := fault.Config{Rules: []fault.Rule{{ID: "buffer", Enabled: true, Fault: fault.Fault{Type: "dup-webhook"}}}}
+	p := proxy.New(target, cfg, bus)
+	defer p.Close()
+	p.SetOptions(proxy.Options{RequireUpstreamAllow: true, OnAdmission: evidence.admit})
+	r := httptest.NewRequest(http.MethodPost, path, strings.NewReader("fixture-body"))
+	r.Host = "127.0.0.1:8081"
+	r.Proto, r.ProtoMajor, r.ProtoMinor = "HTTP/2.0", 2, 0
+	r.Header.Set("Content-Type", "application/grpc")
+	r.Header.Set("X-Glitchdeck-Run", "fixture-run")
+	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 8081}))
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if p.TrafficStats().EgressDenied != 1 {
+		t.Fatalf("request was not denied at dial time: %+v", p.TrafficStats())
+	}
+	public := map[string]map[string]bool{
+		"http_req":  {"seq": true, "status": true, "error": true, "req_bytes": true, "resp_bytes": true, "host": true},
+		"grpc_call": {"seq": true, "http_status": true, "grpc_status": true, "error": true, "req_messages": true, "resp_messages": true, "host": true},
+	}
+	for _, event := range bus.History(10) {
+		allowed, ok := public[event.Type]
+		if !ok {
+			continue
+		}
+		delete(public, event.Type)
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(event.Data, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for key := range fields {
+			if !allowed[key] {
+				t.Errorf("%s exposes field %q", event.Type, key)
+			}
+		}
+	}
+	if len(public) != 0 {
+		t.Errorf("missing denial events: %v", public)
+	}
+	if got := observedAssertion(a, tp, evidence.history()); len(got.Failures) != 0 {
+		t.Error(got.Failures)
+	}
+}
+
 func TestAssertionEvidenceSurvivesHistoryEviction(t *testing.T) {
 	want := 14
 	tp := tape.Tape{Script: []tape.Step{{Name: "call", GRPC: &tape.GRPC{Path: "/call"}}}, Assertions: []tape.Assertion{{GRPCStep: "call", ExpectGRPCStatus: &want}}}
@@ -547,6 +603,17 @@ func TestTLSFailureEvidenceSurvivesHistoryEvictionAndIsBounded(t *testing.T) {
 
 func TestExecWaitTimeoutSkipsAssertions(t *testing.T) {
 	if os.Getenv("GD_WAIT_CHILD") == "1" {
+		proxyURL, _ := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
+		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+		defer client.CloseIdleConnections()
+		denied, err := client.Get("http://denied.example.test/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		denied.Body.Close()
+		if denied.StatusCode != http.StatusForbidden {
+			t.Fatalf("denial got HTTP %d", denied.StatusCode)
+		}
 		resp, err := http.Get(os.Getenv("GLITCHDECK_PROXY_URL") + "/slow")
 		if err != nil {
 			os.Exit(9)
@@ -571,7 +638,9 @@ func TestExecWaitTimeoutSkipsAssertions(t *testing.T) {
 	if slow.Load() != 1 {
 		t.Fatalf("slow requests = %d", slow.Load())
 	}
-	if r.ExitCode != 3 || probes.Load() != 0 {
+	problem, _ := r.Error.(map[string]string)
+	if r.ExitCode != 3 || problem["code"] != "PROXY_WAIT_FAILED" || probes.Load() != 0 ||
+		r.Exec.Traffic.InnerRequests != 2 || r.Exec.Traffic.EgressDenied != 1 || strings.Join(r.Exec.Traffic.EgressDeniedHosts, ",") != "denied.example.test" {
 		t.Fatalf("exit=%d probes=%d result=%+v", r.ExitCode, probes.Load(), r)
 	}
 }
@@ -674,7 +743,7 @@ func TestExecTrafficChecks(t *testing.T) {
 		rejected   int64
 		denied     int64
 	}{
-		{mode: "denied", diff: "egress_denied_only: 1 request(s) blocked by the upstream allowlist (hosts: example.com)", want: 1, denied: 1},
+		{mode: "denied", diff: "egress_denied_only: 1 request(s) blocked by upstream egress policy (hosts: example.com); check the upstream allowlist (--upstream-allow or tape upstream_allow) and the listener's resolved-address policy", want: 1, denied: 1},
 		{mode: "oversized denial", diff: "egress_denied_only:", want: 1, denied: 1},
 		{mode: "rejected", diff: "tls_rejected_only:", want: 1, rejected: 1},
 		{mode: "rejected_nonzero", allow: true, childExit: "nonzero", rejected: 1},
@@ -807,14 +876,35 @@ func TestExecRefusedReverseTarget(t *testing.T) {
 		t.Error("refusal fixture released its address before exec")
 	}
 	t.Setenv("GD_REFUSED_HELPER", "1")
-	r := Run(context.Background(), tape.Tape{Version: 2}, Options{
+	t.Setenv("NO_PROXY", "127.0.0.1")
+	t.Setenv("no_proxy", "")
+	logs, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logs.Close()
+	oldStderr := os.Stderr
+	os.Stderr = logs
+	defer func() { os.Stderr = oldStderr }()
+	tp := tape.Tape{Version: 2, Assertions: []tape.Assertion{{Name: "direct-check", HTTPGet: "/fixture-probe", Direct: true}}}
+	r := Run(context.Background(), tp, Options{
 		Target: "http://" + strings.Replace(addr, ":", ":"+strings.Repeat("0", 1024), 1) + "/upstream-only", AllowZeroTraffic: true,
 		Command: []string{os.Args[0], "-test.run=^TestExecRefusedReverseTarget$"},
 	})
 	diff := strings.Join(r.Diff, " ")
 	wire, err := json.Marshal(r)
-	if err != nil || strings.Contains(string(wire), "upstream-only") || strings.Contains(string(wire), strings.Repeat("0", 1024)) {
-		t.Errorf("unbounded or unsanitized target in serialized report: %s (%v)", wire, err)
+	stderr, readErr := os.ReadFile(logs.Name())
+	if err != nil || readErr != nil {
+		t.Fatalf("reading diagnostics: %v / %v", err, readErr)
+	}
+	for _, text := range []string{string(wire), string(stderr)} {
+		if strings.Contains(text, "upstream-only") || strings.Contains(text, "fixture-probe") || strings.Contains(text, strings.Repeat("0", 1024)) {
+			t.Error("diagnostic exposed the target path or padded port")
+		}
+	}
+	if !strings.Contains(string(stderr), "it would bypass glitchdeck for target http://"+addr) ||
+		!strings.Contains(diff, "direct-check: assertion request failed: "+addr) {
+		t.Errorf("missing public diagnostics: stderr=%q diff=%q", stderr, diff)
 	}
 	if r.ExitCode != 1 || r.Exec.ExitCode != 0 || r.Exec.Traffic.DialFailed != 2 ||
 		!strings.Contains(diff, "target "+addr+" unreachable") || strings.Contains(diff, "upstream-only") {

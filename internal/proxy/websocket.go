@@ -89,8 +89,9 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	}
 	up, err := p.dial(dialCtx, "tcp", addr)
 	if err != nil {
-		if failure, host := p.noteDialResult(ctx, gen, q.URL.Host, reverse, false, err); failure == "egress_denied" {
-			p.tunnelEvent(r, time.Now(), seq, gen, 502, "", "", failure, host, 0, 0)
+		p.noteDialResult(ctx, gen, q.URL.Host, reverse, false, err)
+		if errors.Is(err, errEgressDenied) {
+			p.publishDeniedRequest(gen, seq, 502, p.deniedHost(q.URL.Host), 0, 0, 0)
 		}
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		w.Header().Set(TransportErrorHeader, "1")

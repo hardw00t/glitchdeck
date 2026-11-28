@@ -62,11 +62,6 @@ type Options struct {
 	RequireUpstreamAllow bool
 	javaHome             bool
 }
-type execTrafficSummary struct {
-	proxy.TrafficStats
-	EgressDeniedHosts []string `json:"egress_denied_hosts,omitempty"`
-}
-
 type Exec struct {
 	Cmd                         []string           `json:"cmd"`
 	ProxyURL                    string             `json:"proxy_url"`
@@ -87,7 +82,7 @@ type Exec struct {
 	TLSHandshakeFailuresOmitted uint64             `json:"tls_handshake_failures_omitted,omitempty"`
 	NoProxy                     string             `json:"no_proxy"`
 	NoProxyDropped              []string           `json:"no_proxy_dropped,omitempty"`
-	Traffic                     execTrafficSummary `json:"traffic"`
+	Traffic                     proxy.TrafficStats `json:"traffic"`
 }
 type Summary struct {
 	AssertionsTotal  int    `json:"assertions_total"`
@@ -107,7 +102,7 @@ type Envelope struct {
 	OK                 bool                    `json:"ok"`
 	ExitCode           int                     `json:"exit_code"`
 	Tape               string                  `json:"tape"`
-	Target             string                  `json:"target,omitempty"`
+	Target             *string                 `json:"target,omitempty"`
 	DurationMS         int64                   `json:"duration_ms"`
 	Summary            Summary                 `json:"summary"`
 	FaultsTriggered    []any                   `json:"faults_triggered"`
@@ -120,16 +115,16 @@ type Envelope struct {
 }
 
 func NewEnvelope(command, path, target string) Envelope {
-	if target != "" && target != "demo" {
-		u, err := proxy.ParseExplicitTarget(target)
-		target = ""
-		if err == nil {
-			if authority := publicTargetAuthority(u, false); authority != "" {
-				target = u.Scheme + "://" + authority
-			}
+	e := Envelope{SchemaVersion: 2, Command: command, Tape: path, FaultsTriggered: []any{}, Assertions: []Assertion{}, Diff: []string{}}
+	if target == "" || target == "demo" {
+		e.Target = &target
+	} else if u, err := proxy.ParseExplicitTarget(target); err == nil {
+		if authority := publicTargetAuthority(u, false); authority != "" {
+			public := u.Scheme + "://" + authority
+			e.Target = &public
 		}
 	}
-	return Envelope{SchemaVersion: 2, Command: command, Tape: path, Target: target, FaultsTriggered: []any{}, Assertions: []Assertion{}, Diff: []string{}}
+	return e
 }
 
 func publicTargetAuthority(u *url.URL, includeDefaultPort bool) string {
@@ -263,7 +258,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			}
 		}
 		if err != nil {
-			e.Target = ""
+			e.Target = nil
 			return finish(2, "TARGET_INVALID", err)
 		}
 	}
@@ -322,7 +317,6 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	opts.BeforeRequest = applyChanges
 	opts.OnAdmission = evidence.admit
-	opts.OnEgressDenied = hosts.addDenied
 	opts.OnReset = func() {
 		tlsFailures.reset()
 		hosts.reset()
@@ -472,7 +466,10 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 		noProxy, dropped = mergeNoProxy(os.Getenv("NO_PROXY"), os.Getenv("no_proxy"), o.NoProxy, listenerAddr, parsed)
 		safeTarget := "(forward-only)"
 		if parsed != nil {
-			safeTarget = parsed.Scheme + "://" + parsed.Host
+			safeTarget = "(unreported)"
+			if authority := publicTargetAuthority(parsed, false); authority != "" {
+				safeTarget = parsed.Scheme + "://" + authority
+			}
 		}
 		e.Exec.NoProxy, e.Exec.NoProxyDropped = reportNoProxy(noProxy), dropped
 		for _, entry := range dropped {
@@ -667,13 +664,8 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), o.Grace)
 	defer cancelDrain()
 	waitErr = p.Drain(drainCtx)
-	var childStats proxy.TrafficStats
-	var deniedHosts []string
-	if waitErr == nil {
-		// Dial accounting finishes in handlers and replay workers, before Drain returns.
-		childStats = p.TrafficStats()
-		deniedHosts = hosts.deniedSnapshot()
-	}
+	// TrafficStats snapshots counters and denied hosts together, even on timeout.
+	childStats := p.TrafficStats()
 	childFaults := p.AppliedFaults()
 	var httpResults []tape.Result
 	if waitErr == nil {
@@ -701,9 +693,8 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	e.FrameErrors, e.FrameErrorsOmitted = frameErrors.Snapshot()
 	e.Exec.TLSHandshakeFailureCount, e.Exec.TLSHandshakeFailures = tlsFailures.snapshot()
 	e.Exec.TLSHandshakeFailuresOmitted = e.Exec.TLSHandshakeFailureCount - uint64(len(e.Exec.TLSHandshakeFailures))
-	e.Exec.Traffic.TrafficStats = childStats
-	e.Exec.Traffic.EgressDeniedHosts = deniedHosts
-	deniedList := strings.Join(deniedHosts, ", ")
+	e.Exec.Traffic = childStats
+	deniedList := strings.Join(childStats.EgressDeniedHosts, ", ")
 	if deniedList != "" {
 		warn(fmt.Sprintf("warning: egress denied %d (hosts: %s)", childStats.EgressDenied, deniedList))
 	}
@@ -744,7 +735,8 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	}
 	innerOK := childStats.InnerUsable > 0
 	tlsOnly := childStats.TLSRejected > 0 && !innerOK && childStats.PassthroughOK+childStats.BlindOK == 0
-	deniedOnly := childStats.EgressDenied > 0 && !innerOK && childStats.InterceptedOK+childStats.PassthroughOK+childStats.BlindOK == 0
+	// Denied replicas are report evidence, not a new denied-only verdict input.
+	deniedOnly := childStats.EgressDenied > childStats.ReplayAdmissionDenied && !innerOK && childStats.InterceptedOK+childStats.PassthroughOK+childStats.BlindOK == 0
 	tlsHosts := hosts.tlsList()
 	if opts.ProxyAuth != "" {
 		tlsHosts = strings.ReplaceAll(tlsHosts, opts.ProxyAuth, "[redacted]")
@@ -758,7 +750,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 			e.Diff = append(e.Diff, strings.Join(append([]string{line}, hint(o, o.Command, parsed, childStats)...), "; "))
 			failed = true
 		} else if deniedOnly {
-			e.Diff = append(e.Diff, fmt.Sprintf("egress_denied_only: %d request(s) blocked by the upstream allowlist (hosts: %s); add --upstream-allow <host> or tape upstream_allow", childStats.EgressDenied, deniedList))
+			e.Diff = append(e.Diff, fmt.Sprintf("egress_denied_only: %d request(s) blocked by upstream egress policy (hosts: %s); check the upstream allowlist (--upstream-allow or tape upstream_allow) and the listener's resolved-address policy", childStats.EgressDenied, deniedList))
 			failed = true
 		} else if childStats.RequestsTotal == 0 {
 			line := "zero_traffic: no requests reached the proxy; check HTTP(S)_PROXY bypass (Go ignores proxies for localhost/127.0.0.1) and CA trust"

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -97,5 +98,29 @@ func TestOwnAppOpenAISSE(t *testing.T) {
 	body := got.Exec.StdoutTail
 	if strings.Count(body, "data: ") != 3 || !strings.Contains(body, `"content":"third"`) || strings.Contains(body, "fourth") || strings.Contains(body, "[DONE]") {
 		t.Fatalf("unexpected child stream %q", body)
+	}
+}
+
+func TestExecForwardAndRejectedTargetJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forward.tape.yaml")
+	if err := os.WriteFile(path, []byte("version: 2\nname: forward\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		target, want string
+		code         int
+	}{
+		{"", `""`, 0},
+		{"http://user:fixture@127.0.0.1:3000", "", 2},
+	} {
+		args := []string{"exec", "--tape", path, "--json", "--allow-zero-traffic"}
+		if tc.target != "" {
+			args = append(args, "--target", tc.target)
+		}
+		code, out := launchOutput(t, append(args, "--", os.Args[0], "-test.run=^$")...)
+		var report map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(out), &report); err != nil || code != tc.code || string(report["target"]) != tc.want {
+			t.Errorf("exit=%d output=%s parse=%v", code, out, err)
+		}
 	}
 }

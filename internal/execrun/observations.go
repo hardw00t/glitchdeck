@@ -24,14 +24,14 @@ type tlsFailureEvidence struct {
 }
 
 type trafficHosts struct {
-	mu          sync.Mutex
-	tls, denied []string
+	mu  sync.Mutex
+	tls []string
 }
 
 func (c *trafficHosts) reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.tls, c.denied = nil, nil
+	c.tls = nil
 }
 
 func (c *tlsFailureEvidence) reset() {
@@ -50,40 +50,28 @@ func (c *trafficHosts) observe(e telemetry.Event) {
 	if json.Unmarshal(e.Data, &data) != nil {
 		return
 	}
-	c.add(&c.tls, proxy.DiagnosticHostname(data.Host), 5)
-}
-
-func (c *trafficHosts) addDenied(host string) {
-	c.add(&c.denied, host, 10)
-}
-
-func (c *trafficHosts) add(list *[]string, host string, limit int) {
+	host := proxy.DiagnosticHostname(data.Host)
+	const limit = 5
 	if host == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	i := sort.SearchStrings(*list, host)
-	if i == limit || i < len(*list) && (*list)[i] == host {
+	i := sort.SearchStrings(c.tls, host)
+	if i == limit || i < len(c.tls) && c.tls[i] == host {
 		return
 	}
-	if len(*list) < limit {
-		*list = append(*list, "")
+	if len(c.tls) < limit {
+		c.tls = append(c.tls, "")
 	}
-	copy((*list)[i+1:], (*list)[i:])
-	(*list)[i] = host
+	copy(c.tls[i+1:], c.tls[i:])
+	c.tls[i] = host
 }
 
 func (c *trafficHosts) tlsList() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return strings.Join(c.tls, ", ")
-}
-
-func (c *trafficHosts) deniedSnapshot() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return append([]string(nil), c.denied...)
 }
 
 func (c *tlsFailureEvidence) observe(e telemetry.Event) {
@@ -108,12 +96,12 @@ type assertionEvidence struct {
 	mu       sync.Mutex
 	limits   map[evidenceKey]int
 	explicit map[uint64]bool
-	selected map[uint64]bool
+	selected map[uint64]evidenceKey
 	events   map[uint64]map[string]telemetry.Event
 }
 
 func newAssertionEvidence(t tape.Tape) *assertionEvidence {
-	c := &assertionEvidence{limits: make(map[evidenceKey]int), explicit: make(map[uint64]bool), selected: make(map[uint64]bool), events: make(map[uint64]map[string]telemetry.Event)}
+	c := &assertionEvidence{limits: make(map[evidenceKey]int), explicit: make(map[uint64]bool), selected: make(map[uint64]evidenceKey), events: make(map[uint64]map[string]telemetry.Event)}
 	wanted := make(map[string]bool)
 	for _, a := range t.Assertions {
 		wanted[a.StreamStep] = a.StreamStep != ""
@@ -158,10 +146,10 @@ func (c *assertionEvidence) admit(seq uint64, method, path, host string) {
 		}
 		if remaining > 0 {
 			c.limits[key]--
-			c.selected[seq] = true
+			c.selected[seq] = evidenceKey{key.method, key.path, host}
 		}
 		if c.explicit[seq] {
-			c.selected[seq] = true
+			c.selected[seq] = evidenceKey{key.method, key.path, host}
 		}
 	}
 }
@@ -175,15 +163,22 @@ func (c *assertionEvidence) observe(e telemetry.Event) {
 		Kind        string `json:"kind"`
 		Method      string `json:"method"`
 		ReplayIndex int    `json:"replay_index"`
+		Error       string `json:"error"`
+		Status      int    `json:"status"`
 	}
 	if json.Unmarshal(e.Data, &v) != nil || e.Type == "sse_event" && v.Kind != "end" ||
-		e.Type == "http_req" && (v.ReplayIndex != 0 || v.Method == "") {
+		e.Type == "http_req" && (v.ReplayIndex != 0 || v.Method == "" && v.Error != "egress_denied") {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.selected[v.Seq] {
+	key, ok := c.selected[v.Seq]
+	if !ok {
 		return
+	}
+	if e.Type == "http_req" && v.Error == "egress_denied" {
+		// Restore the match key only in the private assertion view.
+		e.Data, _ = json.Marshal(map[string]any{"seq": v.Seq, "status": v.Status, "method": key.method, "path": key.path, "host": key.host})
 	}
 	if c.events[v.Seq] == nil {
 		c.events[v.Seq] = make(map[string]telemetry.Event)

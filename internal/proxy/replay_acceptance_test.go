@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
+	"github.com/hardw00t/glitchdeck/internal/telemetry"
 )
 
 func webhookRequest(path, body string) *http.Request {
@@ -286,6 +288,12 @@ func TestReplayDialDoesNotReuseReverseTargetException(t *testing.T) {
 }
 
 func TestTimeoutRetrySurvivesWireHangup(t *testing.T) {
+	t.Run("replayed", func(t *testing.T) { checkTimeoutRetryWireHangup(t, false) })
+	t.Run("denied", func(t *testing.T) { checkTimeoutRetryWireHangup(t, true) })
+}
+
+func checkTimeoutRetryWireHangup(t *testing.T, deny bool) {
+	t.Helper()
 	const delay = 40 * time.Millisecond
 	entered := make(chan struct{}, 1)
 	commit := make(chan struct{})
@@ -305,11 +313,23 @@ func TestTimeoutRetrySurvivesWireHangup(t *testing.T) {
 	}))
 	defer upstream.Close()
 	p := webhookProxy(t, upstream, map[string]any{"mode": "timeout_retry", "count": 2, "delay_ms": 40, "replay_header": true})
-	server := httptest.NewServer(p)
+	bus := telemetry.New()
+	p.bus = bus
+	if deny {
+		p.SetOptions(Options{})
+	}
+	ingressCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		context.AfterFunc(r.Context(), func() { close(ingressCanceled) })
+		if deny {
+			r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 8080}))
+		}
+		p.ServeHTTP(w, r)
+	}))
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL, strings.NewReader("event"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/unreported?fixture=value", strings.NewReader("event"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,12 +350,30 @@ func TestTimeoutRetrySurvivesWireHangup(t *testing.T) {
 	if err := <-clientDone; err == nil {
 		t.Fatal("client did not hang up before the commit")
 	}
+	awaitDialSignal(t, ingressCanceled)
 	close(commit)
 	start := time.Time{}
 	select {
 	case start = <-committed:
 	case <-time.After(time.Second):
 		t.Fatal("receiver did not commit after client hangup")
+	}
+	if deny {
+		settleReplays(t, p)
+		stats := p.Stats()["delivery"].Replays
+		if stats == nil || stats.CommittedStatus != 200 || stats.Outcomes["egress_denied"] != 1 || p.TrafficStats().EgressDenied != 0 {
+			t.Fatalf("unexpected canceled replay accounting: %+v, traffic=%+v", stats, p.TrafficStats())
+		}
+		for _, event := range bus.History(10) {
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(event.Data, &fields) == nil && string(fields["replay_index"]) == "1" {
+				if fields["path"] != nil || string(fields["host"]) != `"127.0.0.1"` {
+					t.Fatalf("unsafe or missing denial evidence: %s", event.Data)
+				}
+				return
+			}
+		}
+		t.Fatal("denied replay event not published")
 	}
 	select {
 	case got := <-retry:

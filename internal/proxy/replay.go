@@ -232,8 +232,13 @@ func (p *Proxy) sequentialReplays(r *http.Request, body []byte, seq, gen uint64,
 		u = p.target
 	}
 	if u == nil || !p.allowed(u.Hostname(), upstreamPort(u.Scheme, u.Port())) {
+		authority := ""
+		if u != nil {
+			authority = u.Host
+		}
+		host := p.noteReplayAdmissionDenial(gen, authority, count)
 		for i := 1; i <= count; i++ {
-			p.replaySkipped(gen, seq, rule, mode, i, "egress_denied", "", 0)
+			p.skipDeniedReplay(gen, seq, rule, mode, i, host)
 		}
 		return false
 	}
@@ -276,7 +281,12 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 	}
 	q := p.upstream(r, body, ctx)
 	if q == nil || !p.allowed(q.URL.Hostname(), upstreamPort(q.URL.Scheme, q.URL.Port())) {
-		p.replaySkipped(gen, seq, rule, mode, index, "egress_denied", originalOutcome, committedStatus)
+		authority := ""
+		if q != nil {
+			authority = q.URL.Host
+		}
+		host := p.noteReplayAdmissionDenial(gen, authority, 1)
+		p.skipDeniedReplay(gen, seq, rule, mode, index, host)
 		return
 	}
 	if fault.Bool(params, "replay_header", false) {
@@ -291,9 +301,8 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 		clock.start()
 	}
 	resp, err := transport.RoundTrip(q)
-	var dialFailure, deniedHost string
 	if origin, _ := r.Context().Value(replayDialOriginKey{}).(*replayDialOrigin); origin != nil && (origin.client.Err() == nil || origin.completed.Load()) {
-		dialFailure, deniedHost = p.noteRoundTripDial(replayCtx, gen, q.URL.Host, origin.reverse, err)
+		p.noteRoundTripDial(replayCtx, gen, q.URL.Host, origin.reverse, err)
 	}
 	if clock != nil {
 		clock.record()
@@ -330,14 +339,11 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 	if ctx.Err() == nil && (outcome == "transport_error" || outcome == "timeout") {
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 	}
-	event := map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "rule_id": rule.ID, "applied": outcome != "egress_denied", "replay_index": index, "replay_mode": mode, "outcome": outcome}
-	if dialFailure == "egress_denied" {
-		delete(event, "path")
-		if deniedHost != "" {
-			event["host"] = deniedHost
-		}
-		event["error"] = dialFailure
+	if outcome == "egress_denied" {
+		p.publishDeniedRequest(gen, seq, status, p.deniedHost(q.URL.Host), index, int64(len(body)), n)
+		return
 	}
+	event := map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "rule_id": rule.ID, "applied": true, "replay_index": index, "replay_mode": mode, "outcome": outcome}
 	if mode == "timeout_retry" {
 		event["original_outcome"] = originalOutcome
 		event["committed_status"] = committedStatus
@@ -345,12 +351,14 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 	p.publish(gen, "http_req", event)
 }
 
+func (p *Proxy) skipDeniedReplay(gen, seq uint64, rule *fault.Rule, mode string, index int, host string) {
+	p.updateReplay(gen, rule.ID, mode, func(s *ReplayStats) { s.Outcomes["egress_denied"]++ })
+	p.publishDeniedRequest(gen, seq, 0, host, index, 0, 0)
+}
+
 func (p *Proxy) replaySkipped(gen, seq uint64, rule *fault.Rule, mode string, index int, outcome, originalOutcome string, committedStatus int) {
 	p.updateReplay(gen, rule.ID, mode, func(s *ReplayStats) { s.Outcomes[outcome]++ })
 	event := map[string]any{"seq": seq, "fault": "dup-webhook", "rule_id": rule.ID, "applied": false, "replay_index": index, "replay_mode": mode, "outcome": outcome}
-	if outcome == "egress_denied" {
-		event["error"] = "webhook replay egress denied"
-	}
 	if mode == "timeout_retry" {
 		event["original_outcome"] = originalOutcome
 		event["committed_status"] = committedStatus

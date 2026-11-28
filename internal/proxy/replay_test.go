@@ -367,6 +367,10 @@ func TestSequentialHostnameDenialAccountsForEveryCopy(t *testing.T) {
 	if len(rows) != 1 || rows[0].Count != 0 || rows[0].Replays.Outcomes["egress_denied"] != 4 || outcomes.Load() != 0 {
 		t.Fatalf("rows=%+v tape outcomes=%d", rows, outcomes.Load())
 	}
+	if stats := p.TrafficStats(); stats.EgressDenied != 4 || stats.DialFailed != 0 ||
+		len(stats.EgressDeniedHosts) != 1 || stats.EgressDeniedHosts[0] != "example.invalid" {
+		t.Errorf("replica denial traffic: %+v", stats)
+	}
 }
 
 func TestCloseCancelsReservedRetriesDuringOriginal(t *testing.T) {

@@ -93,16 +93,13 @@ func assertions(ctx context.Context, t tape.Tape, proxyURL, directURL, password 
 		}
 		resp, err := requestClient.Do(req)
 		if err != nil {
-			if private {
-				r.Failures = append(r.Failures, "assertion request failed")
-				add(r)
-				continue
+			message := "assertion request failed"
+			if !private {
+				if authority := publicTargetAuthority(req.URL, true); authority != "" {
+					message += ": " + authority
+				}
 			}
-			safeURL := *req.URL
-			safeURL.User = nil
-			safeURL.RawQuery = ""
-			safeURL.Fragment = ""
-			r.Failures = append(r.Failures, fmt.Sprintf("assertion request failed: %s", safeURL.String()))
+			r.Failures = append(r.Failures, message)
 			add(r)
 			continue
 		}

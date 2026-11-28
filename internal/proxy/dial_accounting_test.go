@@ -11,11 +11,42 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/hardw00t/glitchdeck/internal/fault"
 	"github.com/hardw00t/glitchdeck/internal/telemetry"
 	"github.com/hardw00t/glitchdeck/internal/testutil"
 )
+
+func TestDeniedHostSnapshotBoundsAndReset(t *testing.T) {
+	p := New(nil, fault.Config{}, nil)
+	defer p.Close()
+	authorities := []string{"z.test:443", "I.TEST.", "h.test", "g.test", "f.test", "e.test", "d.test", "c.test", "B.test",
+		"a.test", "b.test", "user@J.\ntest:443/path?query=value", "oversized.test:" + strings.Repeat("0", 1024) + "80"}
+	for _, authority := range authorities {
+		p.noteEgressDenial(authority, false)
+	}
+	snapshot := p.TrafficStats()
+	p.Reset()
+	if snapshot.EgressDenied != int64(len(authorities)) || strings.Join(snapshot.EgressDeniedHosts, ", ") != "a.test, b.test, c.test, d.test, e.test, f.test, g.test, h.test, i.test, j.test" {
+		t.Fatalf("mixed or unbounded snapshot: %+v", snapshot)
+	}
+	if reset := p.TrafficStats(); reset.EgressDenied != 0 || len(reset.EgressDeniedHosts) != 0 {
+		t.Fatalf("reset retained denial evidence: %+v", reset)
+	}
+}
+
+func TestRetainedDeniedHostDoesNotAliasRequestURI(t *testing.T) {
+	const host = "127.0.0.1"
+	uri := host + "/" + strings.Repeat("a", 65536)
+	p := New(nil, fault.Config{}, nil)
+	defer p.Close()
+	p.noteEgressDenial(uri[:len(host)], false)
+	got := p.TrafficStats().EgressDeniedHosts
+	if len(got) != 1 || got[0] != host || unsafe.StringData(got[0]) == unsafe.StringData(uri) {
+		t.Fatal("retained hostname aliases the request URI")
+	}
+}
 
 func TestDeniedRequestEventUsesPublicHost(t *testing.T) {
 	const token = "fixture-marker"
@@ -28,8 +59,7 @@ func TestDeniedRequestEventUsesPublicHost(t *testing.T) {
 	} {
 		bus := telemetry.New()
 		p := New(nil, fault.Config{}, bus)
-		var hosts []string
-		p.SetOptions(Options{ProxyAuth: token, OnEgressDenied: func(host string) { hosts = append(hosts, host) }})
+		p.SetOptions(Options{ProxyAuth: token})
 		address := tc.authority
 		if tc.method == http.MethodGet {
 			address = "http://" + address + "/unreported?fixture=value"
@@ -40,6 +70,7 @@ func TestDeniedRequestEventUsesPublicHost(t *testing.T) {
 		r.Header.Del("Authorization")
 		w := httptest.NewRecorder()
 		p.ServeHTTP(w, r)
+		hosts := p.TrafficStats().EgressDeniedHosts
 		p.Close()
 		var event map[string]json.RawMessage
 		history := bus.History(1)
@@ -64,8 +95,7 @@ func TestRestrictedConfiguredReverseDialCountsAsDenial(t *testing.T) {
 	target, _ := url.Parse(upstream.URL)
 	for _, upgrade := range []bool{false, true} {
 		p := New(target, fault.Config{}, nil)
-		var hosts []string
-		p.SetOptions(Options{RequireUpstreamAllow: true, OnEgressDenied: func(host string) { hosts = append(hosts, host) }})
+		p.SetOptions(Options{RequireUpstreamAllow: true})
 		r := dialAccountingRequest(http.MethodGet)
 		r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 8080}))
 		if upgrade {
@@ -77,6 +107,7 @@ func TestRestrictedConfiguredReverseDialCountsAsDenial(t *testing.T) {
 		w := httptest.NewRecorder()
 		p.ServeHTTP(w, r)
 		stats := p.TrafficStats()
+		hosts := stats.EgressDeniedHosts
 		p.Close()
 		if w.Code != http.StatusBadGateway || stats.EgressDenied != 1 || stats.DialFailed != 0 || stats.ReverseDialFailed != 0 || !slices.Equal(hosts, []string{"127.0.0.1"}) {
 			t.Errorf("websocket=%v status=%d stats=%+v hosts=%q", upgrade, w.Code, stats, hosts)

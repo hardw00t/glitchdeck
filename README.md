@@ -80,7 +80,7 @@ Proxy authentication is opt-in with `--proxy-auth`. macOS process cleanup covers
 
 `exec` exits `1` for TLS-rejected-only traffic (`tls_rejected_only`), upstream-allowlist-denied-only traffic (`egress_denied_only`), no requests (`zero_traffic`), or enabled fault rules that never apply and do not all explicitly permit zero (`zero_faults`). `--allow-zero-traffic` skips all four checks; explicit fault and child-exit expectations still apply. `exec.traffic` reports CONNECT and inner-request counts, successful interception and tunnel counts, TLS rejections, egress denials, and dial failures. TLS handshake failures appear on stderr and in the wire log; `exec.tls_handshake_failure_count` counts them even if report details are omitted.
 
-A reverse-target dial failure makes `exec` fail even with `--allow-zero-traffic`; it increments `exec.traffic.dial_failed` and names the target's host and port. `exec.traffic.egress_denied_hosts` and stderr list up to 10 denied hostnames, including in runs that also reach allowed hosts.
+`exec.traffic.dial_failed` counts dial failures visible to a request or replay, not background connection attempts abandoned by the transport. A counted reverse-target dial failure makes `exec` fail even with `--allow-zero-traffic` and names the target's host and port. `exec.traffic.egress_denied_hosts` and stderr list up to 10 denied hostnames, including in runs that also reach allowed hosts.
 
 | Exit | Meaning |
 | --- | --- |

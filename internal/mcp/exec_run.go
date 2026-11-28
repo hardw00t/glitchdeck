@@ -130,12 +130,15 @@ func execResult(e execrun.Envelope) map[string]any {
 	x := e.Exec
 	result := map[string]any{
 		"schema_version": e.SchemaVersion, "command": e.Command, "ok": e.OK, "exit_code": e.ExitCode,
-		"tape": e.Tape, "target": e.Target, "duration_ms": e.DurationMS, "summary": e.Summary,
+		"tape": e.Tape, "duration_ms": e.DurationMS, "summary": e.Summary,
 		"faults_triggered": e.FaultsTriggered, "assertions": e.Assertions, "diff": e.Diff, "error": e.Error,
 		"exec": x, "child_exit": x.ExitCode, "timed_out": x.TimedOut, "traffic": x.Traffic,
 		"stdout": x.StdoutTail, "stdout_bytes": x.StdoutBytes, "stdout_truncated": x.StdoutTruncated,
 		"stderr": x.StderrTail, "stderr_bytes": x.StderrBytes, "stderr_truncated": x.StderrTruncated,
 		"leaked_pids": append([]int{}, x.LeakedPIDs...), "warnings": append([]string{}, x.Warnings...),
+	}
+	if e.Target != nil {
+		result["target"] = *e.Target
 	}
 	if len(e.FrameErrors) != 0 {
 		result["frame_errors"] = e.FrameErrors
