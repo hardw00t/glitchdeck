@@ -68,8 +68,13 @@ func TestFix6DeclaredJSONCompressionGuess(t *testing.T) {
 				t.Fatalf("%s: %v", media, err)
 			}
 			input.Cassettes[0].Response.Headers["Content-Encoding"] = "deflate"
-			if _, err := PrepareExport(input, redact); err == nil {
-				t.Fatalf("%s accepted invalid declared compression", media)
+			out, err := PrepareExport(input, redact)
+			if redact {
+				if err != nil || !out.Redacted || out.Cassettes[0].Response.Body != "REDACTED" {
+					t.Fatalf("%s: expected invalid declared compression to be replaced: %v", media, err)
+				}
+			} else if blocked, ok := err.(*ExportBlockedError); !ok || blocked.Kind != "unscannable_encoding" {
+				t.Fatalf("%s: expected invalid declared compression to block: %v", media, err)
 			}
 		}
 	}

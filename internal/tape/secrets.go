@@ -487,8 +487,14 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 					message := messages.Index(j).String()
 					messagePath := fmt.Sprintf("%s[%d]", path, j)
 					clean, c, err := scanBodyBudget(message, false, "", "", "", messagePath, redact, budget)
-					if err != nil && redact {
-						clean, c, err = "REDACTED", true, nil
+					if blocked, ok := err.(*ExportBlockedError); ok && redact {
+						replace := blocked.Kind == "unscannable_xml_entity" || blocked.Kind == "unscannable_encoding"
+						for _, pattern := range secretPatterns {
+							replace = replace || pattern.kind != "private_key" && blocked.Kind == pattern.kind
+						}
+						if replace {
+							clean, c, err = "REDACTED", true, nil
+						}
 					}
 					if err != nil {
 						return reflect.Value{}, false, err
@@ -591,6 +597,9 @@ func scanValue(v reflect.Value, field string, redact bool, budget *int) (reflect
 			}
 			if !replaceBody && v.Type().Name() == "CassetteResponse" && v.FieldByName("Status").Int() == 206 {
 				return reflect.Value{}, false, unsupportedBody(field + ".body")
+			}
+			if replaceBody && v.Type().Name() == "CassetteResponse" && v.FieldByName("Status").Int() == 206 {
+				out.FieldByName("Status").SetInt(200)
 			}
 			headers := out.FieldByName("Headers")
 			iter := headers.MapRange()
@@ -778,10 +787,15 @@ func scanBodyBudgetDepth(body string, encoded bool, encoding, contentType, trans
 		frame = frame[5+int(size):]
 	}
 	knownGRPC := strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "application/grpc") || strings.HasSuffix(field, ".message_b64")
-	if compressedFrame && len(frame) == 0 || knownGRPC && len(raw) >= 5 && raw[0] == 1 {
+	if compressedFrame || knownGRPC && len(raw) >= 5 && raw[0] == 1 {
 		return "", false, &ExportBlockedError{Kind: "unscannable_encoding", Field: field}
 	}
 	if err := checkBodyEncoding(contentType, transfer, field, budget); err != nil {
+		if xmlErr := scanBodyEntities(string(raw), field, false, budget); xmlErr != nil {
+			if blocked, ok := xmlErr.(*ExportBlockedError); ok && blocked.Kind == "unscannable_xml_entity" {
+				return "", false, xmlErr
+			}
+		}
 		return "", false, err
 	}
 	clean, changed, err := scanContentBudget(string(raw), contentType, field, redact, depth, budget)

@@ -242,3 +242,41 @@ func TestExportEmptyEncodedBody(t *testing.T) {
 		t.Fatalf("discarded body not redacted: %v", err)
 	}
 }
+
+func TestExportReviewFailClosed(t *testing.T) {
+	t.Run("websocket incomplete PEM", func(t *testing.T) {
+		input := Tape{Script: []Step{{WS: &WS{Messages: []string{"-----BEGIN PRIVATE KEY-----\nincomplete"}}}}}
+		if _, err := PrepareExport(input, true); err == nil {
+			t.Fatal("incomplete private key accepted")
+		}
+	})
+	t.Run("compressed frame before partial frame", func(t *testing.T) {
+		input := Tape{Script: []Step{{HTTP: &HTTP{Body: "\x01\x00\x00\x00\x03abc\x00"}}}}
+		_, err := PrepareExport(input, false)
+		var blocked *ExportBlockedError
+		if !errors.As(err, &blocked) || blocked.Kind != "unscannable_encoding" {
+			t.Fatalf("expected encoding block, got %v", err)
+		}
+	})
+	t.Run("XML takes precedence over charset", func(t *testing.T) {
+		for _, body := range []string{`<!ENTITY x "value">`, `&lt;!ENTITY x "value"&gt;`} {
+			input := Tape{Script: []Step{{HTTP: &HTTP{Body: body, Headers: map[string]string{"Content-Type": "text/xml; charset=unknown"}}}}}
+			_, err := PrepareExport(input, false)
+			var blocked *ExportBlockedError
+			if !errors.As(err, &blocked) || blocked.Kind != "unscannable_xml_entity" {
+				t.Fatalf("expected XML block, got %v", err)
+			}
+			out, err := PrepareExport(input, true)
+			if err != nil || out.Script[0].HTTP.Body != "REDACTED" {
+				t.Fatalf("XML redaction failed: %v", err)
+			}
+		}
+	})
+	t.Run("partial response replaced completely", func(t *testing.T) {
+		input := Tape{Cassettes: []Cassette{{Response: CassetteResponse{Status: 206, Headers: map[string]string{"Content-Range": "bytes 0-2/3"}, Body: `<!ENTITY x "value">`}}}}
+		out, err := PrepareExport(input, true)
+		if err != nil || out.Cassettes[0].Response.Status != 200 || out.Cassettes[0].Response.Body != "REDACTED" || len(out.Cassettes[0].Response.Headers) != 0 {
+			t.Fatalf("partial response replacement failed: %#v, %v", out, err)
+		}
+	})
+}
