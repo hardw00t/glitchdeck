@@ -44,6 +44,25 @@ func TestReorderedV3StopsReadingAtRawLimit(t *testing.T) {
 	}
 }
 
+func TestReorderedV3JustOverLimitRejectedBeforeParsing(t *testing.T) {
+	input := "name: reordered\nversion: 3\n" + strings.Repeat("x", maxTapeInput)
+	r := &countingReader{r: strings.NewReader(input)}
+	_, err := Decode(r)
+	if err == nil || err.Error() != "tape exceeds input limit" || r.n > maxTapeInput+1 {
+		t.Fatalf("error=%v, bytes read=%d", err, r.n)
+	}
+}
+
+func TestOversizedLegacyWithAmbiguousVersionRejected(t *testing.T) {
+	for _, suffix := range []string{"version: 3\n", "'version': 3\n", "<<: {version: 3}\n"} {
+		input := "version: 1\n" + suffix + "name: " + strings.Repeat("x", maxTapeInput)
+		_, err := Decode(strings.NewReader(input))
+		if err == nil || err.Error() != "tape exceeds input limit" {
+			t.Fatalf("suffix %q: %v", suffix, err)
+		}
+	}
+}
+
 func TestLegacyLargeInputAndV3Limit(t *testing.T) {
 	padding := strings.Repeat("x", maxTapeInput)
 	for _, version := range []int{1, 2, 3} {

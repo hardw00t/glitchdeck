@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/hardw00t/glitchdeck/internal/proxy"
@@ -111,7 +112,75 @@ func NewCassetteResponse(status int, headers map[string]string, body []byte, tru
 	return r
 }
 
+const maxMatchWork int64 = 256 << 20
+
+var matchWork atomic.Int64
+
+type matchReader struct {
+	r        io.Reader
+	reserved int64
+	limited  bool
+}
+
+func (r *matchReader) Read(p []byte) (int, error) {
+	// Account for the input, JSON tree, duplicate-key maps and canonical output.
+	n := int64(len(p)) * 32
+	for {
+		used := matchWork.Load()
+		if n > maxMatchWork-used {
+			r.limited = true
+			return 0, io.ErrShortBuffer
+		}
+		if matchWork.CompareAndSwap(used, used+n) {
+			break
+		}
+	}
+	r.reserved += n
+	return r.r.Read(p)
+}
+
+func matchJSONComplexityOK(body []byte) bool {
+	if !utf8.Valid(body) || !json.Valid(body) {
+		return true
+	}
+	depth, nodes := 0, 0
+	inString, escaped := false, false
+	for _, c := range body {
+		if inString {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+			nodes++
+			if depth > 128 {
+				return false
+			}
+		case '}', ']':
+			depth--
+		case ',', ':':
+			nodes++
+		}
+		if nodes > 32768 {
+			return false
+		}
+	}
+	return true
+}
+
 func BodySHA256(body []byte, ignore []string) string {
+	if !matchJSONComplexityOK(body) {
+		return ""
+	}
 	var value any
 	d := json.NewDecoder(bytes.NewReader(body))
 	d.UseNumber()
@@ -288,15 +357,30 @@ func (t Tape) CassetteUpstream() func(*http.Request) (*http.Response, error) {
 			return miss()
 		}
 		if count > 1 {
-			var body []byte
-			if req.Body != nil {
-				var err error
-				body, err = io.ReadAll(io.LimitReader(req.Body, maxCassetteBody+1))
-				if err != nil || len(body) > maxCassetteBody {
-					return miss()
+			digest, limited, err := func() (string, bool, error) {
+				reader := &matchReader{r: http.NoBody}
+				if req.Body != nil {
+					reader.r = req.Body
 				}
+				defer func() { matchWork.Add(-reader.reserved) }()
+				body, err := io.ReadAll(io.LimitReader(reader, maxCassetteBody+1))
+				if reader.limited {
+					return "", true, nil
+				}
+				if err != nil || len(body) > maxCassetteBody {
+					return "", false, err
+				}
+				if !matchJSONComplexityOK(body) {
+					return "", true, nil
+				}
+				return BodySHA256(body, ignore), false, nil
+			}()
+			if limited {
+				return nil, &proxy.CassetteError{Kind: "cassette_match_limit"}
 			}
-			digest := BodySHA256(body, ignore)
+			if err != nil || digest == "" {
+				return miss()
+			}
 			count = 0
 			for i := range cassettes {
 				c := cassettes[i].cassette

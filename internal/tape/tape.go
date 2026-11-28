@@ -109,41 +109,53 @@ type Result struct {
 	Failures []string `json:"failures"`
 }
 
-func leadingV3(raw []byte) bool {
+func legacyLargeInput(raw []byte) bool {
 	data := bytes.TrimPrefix(raw, []byte("\ufeff"))
-	documentStart := false
-	for {
-		line, rest, ok := bytes.Cut(data, []byte("\n"))
+	documentStart, version := false, false
+	for len(data) != 0 {
+		line, rest, more := bytes.Cut(data, []byte("\n"))
 		line = bytes.TrimSuffix(line, []byte("\r"))
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 || trimmed[0] == '#' {
-			if !ok {
-				return false
-			}
-			data = rest
+		data = rest
+		if len(line) == 0 || line[0] == ' ' || line[0] == '\t' || line[0] == '#' {
 			continue
 		}
-		if bytes.Equal(line, []byte("---")) && !documentStart {
+		if bytes.Equal(line, []byte("---")) && !documentStart && !version {
 			documentStart = true
-			if !ok {
-				return false
-			}
-			data = rest
 			continue
 		}
-		if !bytes.HasPrefix(line, []byte("version:")) {
+		key, value, ok := bytes.Cut(line, []byte(":"))
+		if !ok || len(key) == 0 {
 			return false
 		}
-		value := bytes.TrimSpace(line[len("version:"):])
-		if bytes.Equal(value, []byte("3")) {
-			return ok
+		for _, c := range key {
+			if c < 'a' || c > 'z' {
+				if c != '_' {
+					return false
+				}
+			}
 		}
-		if len(value) < 2 || value[0] != '3' || value[1] != ' ' && value[1] != '\t' {
+		if !version {
+			if !bytes.Equal(key, []byte("version")) || !more {
+				return false
+			}
+			value = bytes.TrimSpace(value)
+			if len(value) == 0 || (value[0] != '1' && value[0] != '2') {
+				return false
+			}
+			value = value[1:]
+			if len(value) != 0 && value[0] != ' ' && value[0] != '\t' {
+				return false
+			}
+			value = bytes.TrimSpace(value)
+			if len(value) != 0 && value[0] != '#' {
+				return false
+			}
+			version = true
+		} else if bytes.Equal(key, []byte("version")) {
 			return false
 		}
-		comment := bytes.TrimSpace(value[1:])
-		return ok && len(comment) != 0 && comment[0] == '#'
 	}
+	return version
 }
 
 func Decode(r io.Reader) (Tape, error) {
@@ -153,7 +165,7 @@ func Decode(r io.Reader) (Tape, error) {
 		return t, err
 	}
 	if len(raw) > maxTapeInput {
-		if leadingV3(raw) {
+		if !legacyLargeInput(raw) {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
 		rest, err := io.ReadAll(io.LimitReader(r, (64<<20)-int64(len(raw))+1))
@@ -162,6 +174,9 @@ func Decode(r io.Reader) (Tape, error) {
 		}
 		raw = append(raw, rest...)
 		if len(raw) > 64<<20 {
+			return t, fmt.Errorf("tape exceeds input limit")
+		}
+		if !legacyLargeInput(raw) {
 			return t, fmt.Errorf("tape exceeds input limit")
 		}
 	}
@@ -882,13 +897,30 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 					if len(via) >= 10 || next.URL.Scheme != "http" || next.URL.Host != listener.Addr().String() || next.URL.User != nil {
 						return http.ErrUseLastResponse
 					}
+					var bodyDigest [sha256.Size]byte
+					preserveBody := next.Response != nil && (next.Response.StatusCode == http.StatusTemporaryRedirect || next.Response.StatusCode == http.StatusPermanentRedirect)
+					if preserveBody {
+						hash := sha256.New()
+						if next.GetBody != nil {
+							body, err := next.GetBody()
+							if err != nil {
+								return http.ErrUseLastResponse
+							}
+							_, err = io.Copy(hash, body)
+							body.Close()
+							if err != nil {
+								return http.ErrUseLastResponse
+							}
+						}
+						copy(bodyDigest[:], hash.Sum(nil))
+					}
 					for _, step := range t.Script[stepIndex+1:] {
-						var method, path, rawURL string
+						var method, path, rawURL, body string
 						switch {
 						case step.HTTP != nil:
-							method, path, rawURL = step.HTTP.Method, step.HTTP.Path, step.HTTP.URL
+							method, path, rawURL, body = step.HTTP.Method, step.HTTP.Path, step.HTTP.URL, step.HTTP.Body
 						case step.Stream != nil:
-							method, path, rawURL = step.Stream.Method, step.Stream.Path, step.Stream.URL
+							method, path, rawURL, body = step.Stream.Method, step.Stream.Path, step.Stream.URL, step.Stream.Body
 						default:
 							continue
 						}
@@ -899,7 +931,9 @@ func run(ctx context.Context, t Tape, targetOverride, caDir string, report *RunR
 						if rawURL != "" {
 							hopURL = strings.ReplaceAll(rawURL, "${DEMO_TLS}", demoTLS)
 						}
-						if method == next.Method && hopURL == next.URL.String() {
+						hop, err := url.Parse(hopURL)
+						if err == nil && method == next.Method && hop.Scheme == next.URL.Scheme && hop.Host == next.URL.Host && hop.RequestURI() == next.URL.RequestURI() &&
+							(!preserveBody || sha256.Sum256([]byte(body)) == bodyDigest) {
 							return http.ErrUseLastResponse
 						}
 					}

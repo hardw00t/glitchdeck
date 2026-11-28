@@ -103,8 +103,11 @@ func (p *Proxy) cassetteResponse(r *http.Request) (*http.Response, error) {
 	}
 	kind := "cassette_miss"
 	var cassetteErr *CassetteError
-	if errors.As(err, &cassetteErr) && cassetteErr.Kind == "cassette_ambiguous" {
-		kind = cassetteErr.Kind
+	if errors.As(err, &cassetteErr) {
+		switch cassetteErr.Kind {
+		case "cassette_ambiguous", "cassette_match_limit":
+			kind = cassetteErr.Kind
+		}
 	}
 	return nil, p.failCassette(kind, r.Method, r.URL.EscapedPath())
 }

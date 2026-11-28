@@ -45,3 +45,25 @@ func TestSyncRedactedCassetteCollision(t *testing.T) {
 		t.Fatal("mutated cassette on failure")
 	}
 }
+
+func TestSyncRedactedCassetteRejectsComplexBody(t *testing.T) {
+	complex := "[" + strings.Repeat("0,", 40000) + "0]"
+	before := Tape{Script: []Step{{HTTP: &HTTP{Method: "POST", Path: "/", Body: "simple"}}}, Cassettes: []Cassette{{Request: CassetteRequest{Method: "POST", Path: "/", BodySHA256: BodySHA256([]byte("simple"), nil)}}}}
+	for _, complexBefore := range []bool{false, true} {
+		after := before
+		after.Script = []Step{{HTTP: &HTTP{Method: "POST", Path: "/", Body: complex}}}
+		after.Cassettes = append([]Cassette(nil), before.Cassettes...)
+		original := before
+		if complexBefore {
+			original.Script, after.Script = after.Script, before.Script
+		}
+		err := syncRedactedCassetteRequests(original, &after)
+		var blocked *ExportBlockedError
+		if !errors.As(err, &blocked) {
+			t.Fatalf("complex before=%v: got %v", complexBefore, err)
+		}
+		if after.Cassettes[0].Request != before.Cassettes[0].Request {
+			t.Fatal("mutated cassette on failure")
+		}
+	}
+}

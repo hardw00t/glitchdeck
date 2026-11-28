@@ -55,6 +55,9 @@ func syncRedactedCassetteRequests(before Tape, after *Tape) error {
 	for i := range before.Script {
 		keys[i].before, keys[i].beforeOK = cassetteStepRequest(before.Script[i], before.IgnoreJSONPaths)
 		keys[i].after, keys[i].afterOK = cassetteStepRequest(after.Script[i], after.IgnoreJSONPaths)
+		if keys[i].beforeOK && keys[i].before.digest == "" || keys[i].afterOK && keys[i].after.digest == "" {
+			return blocked()
+		}
 	}
 	for i, cassette := range before.Cassettes {
 		old := cassetteRequestKey(cassette.Request)

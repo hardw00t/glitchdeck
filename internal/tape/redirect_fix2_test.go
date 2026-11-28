@@ -96,3 +96,57 @@ func TestUnrecordedLocalRedirectStillFollows(t *testing.T) {
 		t.Fatalf("requests=%d err=%v", report.RequestsTotal, err)
 	}
 }
+
+func TestRecordedRedirectFragmentRunsDestinationOnce(t *testing.T) {
+	doc := tape.Tape{Version: 3, Target: "demo",
+		Script: []tape.Step{{HTTP: &tape.HTTP{Path: "/start"}}, {HTTP: &tape.HTTP{Path: "/end#recorded"}}},
+		Cassettes: []tape.Cassette{
+			{Request: tape.CassetteRequest{Method: "GET", Path: "/start"}, Response: tape.CassetteResponse{Status: 302, Headers: map[string]string{"Location": "/end#redirect"}}},
+			{Request: tape.CassetteRequest{Method: "GET", Path: "/end"}, Response: tape.CassetteResponse{Status: 200}},
+		},
+		Rules: []fault.Rule{{ID: "destination", Enabled: true, Match: fault.Match{PathPrefix: "/end"}, Fault: fault.Fault{Type: "latency-wave"}}},
+	}
+	_, report, err := tape.RunReplay(context.Background(), doc, "", "", false)
+	if err != nil || report.RequestsTotal != 2 || len(report.AppliedFaults) != 1 || report.AppliedFaults[0].Count != 1 {
+		t.Fatalf("requests=%d faults=%v err=%v", report.RequestsTotal, report.AppliedFaults, err)
+	}
+}
+
+func TestPreservedRedirectBodyDoesNotMatchDifferentRecordedBody(t *testing.T) {
+	for _, status := range []int{307, 308} {
+		doc := tape.Tape{Version: 3, Target: "demo",
+			Script: []tape.Step{
+				{HTTP: &tape.HTTP{Method: "POST", Path: "/start", Body: "first"}},
+				{HTTP: &tape.HTTP{Method: "POST", Path: "/end", Body: "second"}},
+			},
+			Cassettes: []tape.Cassette{
+				{Request: tape.CassetteRequest{Method: "POST", Path: "/start"}, Response: tape.CassetteResponse{Status: status, Headers: map[string]string{"Location": "/end"}}},
+				{Request: tape.CassetteRequest{Method: "POST", Path: "/end", BodySHA256: tape.BodySHA256([]byte("first"), nil)}, Response: tape.CassetteResponse{Status: 200}},
+				{Request: tape.CassetteRequest{Method: "POST", Path: "/end", BodySHA256: tape.BodySHA256([]byte("second"), nil)}, Response: tape.CassetteResponse{Status: 200}},
+			},
+			Rules: []fault.Rule{{ID: "destination", Enabled: true, Match: fault.Match{PathPrefix: "/end"}, Fault: fault.Fault{Type: "latency-wave"}}},
+		}
+		_, report, err := tape.RunReplay(context.Background(), doc, "", "", false)
+		if err != nil || report.RequestsTotal != 3 || len(report.AppliedFaults) != 1 || report.AppliedFaults[0].Count != 2 {
+			t.Fatalf("status=%d requests=%d faults=%v err=%v", status, report.RequestsTotal, report.AppliedFaults, err)
+		}
+	}
+}
+
+func TestPreservedRedirectBodyMatchesRecordedHop(t *testing.T) {
+	doc := tape.Tape{Version: 3, Target: "demo",
+		Script: []tape.Step{
+			{HTTP: &tape.HTTP{Method: "POST", Path: "/start", Body: "same"}},
+			{HTTP: &tape.HTTP{Method: "POST", Path: "/end", Body: "same"}},
+		},
+		Cassettes: []tape.Cassette{
+			{Request: tape.CassetteRequest{Method: "POST", Path: "/start"}, Response: tape.CassetteResponse{Status: 307, Headers: map[string]string{"Location": "/end"}}},
+			{Request: tape.CassetteRequest{Method: "POST", Path: "/end", BodySHA256: tape.BodySHA256([]byte("same"), nil)}, Response: tape.CassetteResponse{Status: 200}},
+		},
+		Rules: []fault.Rule{{ID: "destination", Enabled: true, Match: fault.Match{PathPrefix: "/end"}, Fault: fault.Fault{Type: "latency-wave"}}},
+	}
+	_, report, err := tape.RunReplay(context.Background(), doc, "", "", false)
+	if err != nil || report.RequestsTotal != 2 || len(report.AppliedFaults) != 1 {
+		t.Fatalf("requests=%d faults=%v err=%v", report.RequestsTotal, report.AppliedFaults, err)
+	}
+}
