@@ -78,10 +78,20 @@ func TestRecordRejectsFilteredRepresentationMetadata(t *testing.T) {
 					}
 					return
 				}
+				if redact {
+					data, err := os.ReadFile(output)
+					if code != 0 || err != nil || !strings.Contains(string(data), "body: REDACTED") {
+						t.Fatalf("unscannable body was not replaced: %s (%v)", report, err)
+					}
+					if status, out := launchOutput(t, "validate", output); status != 0 {
+						t.Fatalf("redacted tape did not validate: %s", out)
+					}
+					return
+				}
 				if code == 0 {
 					t.Fatalf("export unexpectedly succeeded: %s", report)
 				}
-				if !strings.Contains(report, "EXPORT_BLOCKED") {
+				if !strings.Contains(report, "EXPORT_BLOCKED") || !strings.Contains(report, "secret_kind=unscannable_encoding") {
 					t.Fatalf("wrong failure: %s", report)
 				}
 				if _, err := os.Stat(output); !os.IsNotExist(err) {

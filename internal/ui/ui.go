@@ -387,12 +387,8 @@ func (c *control) reset(w http.ResponseWriter, r *http.Request) {
 
 func (c *control) export(w http.ResponseWriter, r *http.Request) {
 	c.cfgMu.Lock()
-	doc, err := c.rec.export(c.p.Config())
+	doc := c.rec.tape(c.p.Config())
 	c.cfgMu.Unlock()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
 	doc.Name, doc.Target = "glitchdeck-recording", c.Target
 	if doc.Version < 3 {
 		doc.Version = 2
@@ -403,7 +399,7 @@ func (c *control) export(w http.ResponseWriter, r *http.Request) {
 			doc.Assertions = []tape.Assertion{{Name: "demo invariants", HTTPGet: "/api/state", Direct: true, ExpectStatus: 200, JSONEq: map[string]any{"duplicate_charges": 0, "ws_broken": false}}}
 		}
 	}
-	doc, err = tape.PrepareExport(doc, r.URL.Query().Get("redact_secrets") == "true")
+	doc, err := tape.PrepareExport(doc, r.URL.Query().Get("redact_secrets") == "true")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

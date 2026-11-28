@@ -202,9 +202,14 @@ func TestFilteredBodyBlocksExportButCountsRecordedStep(t *testing.T) {
 		t.Fatal(err)
 	}
 	exportTestRequest(t, req)
-	got, _ := s.call("tape_export", []byte(`{"name":"capture","redact_secrets":true}`))
+	got, _ := s.call("tape_export", []byte(`{"name":"capture"}`))
 	if e, ok := got["error"].(map[string]string); !ok || e["code"] != "EXPORT_BLOCKED" {
 		t.Fatalf("export was not blocked: %v", got)
+	}
+	clean, _ := s.call("tape_export", []byte(`{"name":"capture","redact_secrets":true}`))
+	data, ok := clean["yaml"].(string)
+	if !ok || !strings.Contains(data, "body: REDACTED") || strings.Contains(data, "captured") {
+		t.Fatalf("export did not replace the unscannable response: %v", clean)
 	}
 	stopped, _ := s.call("proxy_stop", []byte("{}"))
 	if stopped["recorded_steps"] != 1 {
