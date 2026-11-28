@@ -72,13 +72,29 @@ func (p *Proxy) retainDeniedHost(host string) {
 	p.deniedHosts[i] = strings.Clone(host)
 }
 
-func (p *Proxy) publishDeniedRequest(gen, seq uint64, status int, host string, replayIndex int, in, out int64) {
+type deniedReplay struct {
+	index, committedStatus int
+	mode, originalOutcome  string
+}
+
+func (p *Proxy) publishDeniedRequest(gen, seq uint64, status int, host string, replay *deniedReplay, in, out int64) {
 	event := map[string]any{"seq": seq, "status": status, "error": "egress_denied", "req_bytes": in, "resp_bytes": out}
 	if host != "" {
 		event["host"] = host
 	}
-	if replayIndex != 0 {
-		event["replay_index"], event["outcome"] = replayIndex, "egress_denied"
+	if replay != nil {
+		event["replay_index"], event["outcome"] = replay.index, "egress_denied"
+		switch replay.mode {
+		case "sequential", "concurrent", "timeout_retry":
+			event["replay_mode"] = replay.mode
+		}
+		if replay.mode == "timeout_retry" {
+			event["committed_status"] = replay.committedStatus
+			switch replay.originalOutcome {
+			case "", "timeout", "transport_error":
+				event["original_outcome"] = replay.originalOutcome
+			}
+		}
 	}
 	p.publish(gen, "http_req", event)
 }

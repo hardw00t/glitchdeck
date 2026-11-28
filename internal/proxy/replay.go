@@ -238,7 +238,7 @@ func (p *Proxy) sequentialReplays(r *http.Request, body []byte, seq, gen uint64,
 		}
 		host := p.noteReplayAdmissionDenial(gen, authority, count)
 		for i := 1; i <= count; i++ {
-			p.skipDeniedReplay(gen, seq, rule, mode, i, host)
+			p.skipDeniedReplay(gen, seq, rule, host, deniedReplay{index: i, mode: mode})
 		}
 		return false
 	}
@@ -286,7 +286,7 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 			authority = q.URL.Host
 		}
 		host := p.noteReplayAdmissionDenial(gen, authority, 1)
-		p.skipDeniedReplay(gen, seq, rule, mode, index, host)
+		p.skipDeniedReplay(gen, seq, rule, host, deniedReplay{index: index, mode: mode, originalOutcome: originalOutcome, committedStatus: committedStatus})
 		return
 	}
 	if fault.Bool(params, "replay_header", false) {
@@ -340,7 +340,9 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 	}
 	if outcome == "egress_denied" {
-		p.publishDeniedRequest(gen, seq, status, p.deniedHost(q.URL.Host), index, int64(len(body)), n)
+		p.publishDeniedRequest(gen, seq, status, p.deniedHost(q.URL.Host), &deniedReplay{
+			index: index, mode: mode, originalOutcome: originalOutcome, committedStatus: committedStatus,
+		}, int64(len(body)), n)
 		return
 	}
 	event := map[string]any{"seq": seq, "ts_ms": start.UnixMilli(), "method": q.Method, "path": q.URL.RequestURI(), "status": status, "latency_ms": time.Since(start).Milliseconds(), "req_bytes": len(body), "resp_bytes": n, "fault": "dup-webhook", "rule_id": rule.ID, "applied": true, "replay_index": index, "replay_mode": mode, "outcome": outcome}
@@ -351,9 +353,9 @@ func (p *Proxy) sendReplay(ctx context.Context, r *http.Request, body []byte, se
 	p.publish(gen, "http_req", event)
 }
 
-func (p *Proxy) skipDeniedReplay(gen, seq uint64, rule *fault.Rule, mode string, index int, host string) {
-	p.updateReplay(gen, rule.ID, mode, func(s *ReplayStats) { s.Outcomes["egress_denied"]++ })
-	p.publishDeniedRequest(gen, seq, 0, host, index, 0, 0)
+func (p *Proxy) skipDeniedReplay(gen, seq uint64, rule *fault.Rule, host string, replay deniedReplay) {
+	p.updateReplay(gen, rule.ID, replay.mode, func(s *ReplayStats) { s.Outcomes["egress_denied"]++ })
+	p.publishDeniedRequest(gen, seq, 0, host, &replay, 0, 0)
 }
 
 func (p *Proxy) replaySkipped(gen, seq uint64, rule *fault.Rule, mode string, index int, outcome, originalOutcome string, committedStatus int) {

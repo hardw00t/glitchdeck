@@ -367,7 +367,9 @@ func checkTimeoutRetryWireHangup(t *testing.T, deny bool) {
 		for _, event := range bus.History(10) {
 			var fields map[string]json.RawMessage
 			if json.Unmarshal(event.Data, &fields) == nil && string(fields["replay_index"]) == "1" {
-				if fields["path"] != nil || string(fields["host"]) != `"127.0.0.1"` {
+				if fields["path"] != nil || string(fields["host"]) != `"127.0.0.1"` ||
+					string(fields["replay_mode"]) != `"timeout_retry"` || string(fields["committed_status"]) != "200" ||
+					string(fields["original_outcome"]) != `""` {
 					t.Fatalf("unsafe or missing denial evidence: %s", event.Data)
 				}
 				return
@@ -387,6 +389,24 @@ func checkTimeoutRetryWireHangup(t *testing.T, deny bool) {
 	stats := p.Stats()["delivery"].Replays
 	if stats == nil || stats.CommittedStatus != 200 || stats.Sent != 1 || len(retry) != 0 {
 		t.Fatalf("replays=%+v extra retries=%d", stats, len(retry))
+	}
+}
+
+func TestAdmissionDeniedRetryRetainsFailedOriginal(t *testing.T) {
+	bus := telemetry.New()
+	p := New(nil, fault.Config{}, bus)
+	defer p.Close()
+	r := httptest.NewRequest(http.MethodPost, "http://example.invalid/unreported?fixture=value", nil)
+	r.Header.Set("Content-Type", "fixture-header")
+	rule := &fault.Rule{ID: "delivery"}
+	p.sendReplay(t.Context(), r, []byte("fixture-body"), 1, 0, rule, map[string]any{"mode": "timeout_retry"}, 1, nil, "transport_error", 0)
+	history := bus.History(1)
+	var fields map[string]json.RawMessage
+	if len(history) != 1 || json.Unmarshal(history[0].Data, &fields) != nil ||
+		string(fields["replay_mode"]) != `"timeout_retry"` || string(fields["committed_status"]) != "0" ||
+		string(fields["original_outcome"]) != `"transport_error"` || strings.Contains(string(history[0].Data), "fixture") ||
+		fields["path"] != nil || fields["request_headers"] != nil || fields["body_snippet"] != nil {
+		t.Fatalf("unsafe or incomplete admission denial: %v", fields)
 	}
 }
 

@@ -318,6 +318,7 @@ func Run(ctx context.Context, t tape.Tape, o Options) Envelope {
 	opts.BeforeRequest = applyChanges
 	opts.OnAdmission = evidence.admit
 	opts.OnReset = func() {
+		evidence.reset()
 		tlsFailures.reset()
 		hosts.reset()
 		frameErrors.Reset()

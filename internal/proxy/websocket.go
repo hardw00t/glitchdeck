@@ -91,7 +91,7 @@ func (p *Proxy) serveWS(w http.ResponseWriter, r *http.Request, gen uint64, matc
 	if err != nil {
 		p.noteDialResult(ctx, gen, q.URL.Host, reverse, false, err)
 		if errors.Is(err, errEgressDenied) {
-			p.publishDeniedRequest(gen, seq, 502, p.deniedHost(q.URL.Host), 0, 0, 0)
+			p.publishDeniedRequest(gen, seq, 502, p.deniedHost(q.URL.Host), nil, 0, 0)
 		}
 		p.outcome(gen, Outcome{Seq: seq, Err: err})
 		w.Header().Set(TransportErrorHeader, "1")

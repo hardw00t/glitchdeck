@@ -68,7 +68,7 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		deniedHost := p.noteEgressDenial(r.Host, true)
 		http.Error(w, "egress denied", http.StatusForbidden)
 		if seq != 0 {
-			p.publishDeniedRequest(gen, seq, 403, deniedHost, 0, 0, 0)
+			p.publishDeniedRequest(gen, seq, 403, deniedHost, nil, 0, 0)
 		}
 		return
 	}
@@ -95,7 +95,7 @@ func (p *Proxy) connect(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, "upstream unavailable", http.StatusBadGateway)
 			if errors.Is(err, errEgressDenied) {
-				p.publishDeniedRequest(gen, seq, 502, p.deniedHost(r.Host), 0, 0, 0)
+				p.publishDeniedRequest(gen, seq, 502, p.deniedHost(r.Host), nil, 0, 0)
 			} else {
 				p.tunnelEvent(r, start, seq, gen, 502, tunnel, pattern, failure, 0, 0)
 			}

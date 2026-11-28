@@ -365,6 +365,97 @@ func TestDeniedGRPCAssertionUsesPrivateAdmissionKey(t *testing.T) {
 	}
 }
 
+func TestDeniedAssertionRetainsOnlyTapeHost(t *testing.T) {
+	tp := tape.Tape{
+		Script: []tape.Step{
+			{Name: "wildcard", GRPC: &tape.GRPC{Path: "/call"}},
+			{Name: "exact", GRPC: &tape.GRPC{URL: "http://example.test/call"}},
+		},
+		Assertions: []tape.Assertion{{GRPCStep: "wildcard"}, {GRPCStep: "exact"}},
+	}
+	for _, tc := range []struct{ authority, want string }{
+		{"127.0.0.1:" + strings.Repeat("0", 65536) + "80", ""},
+		{"EXAMPLE.TEST", "example.test"},
+	} {
+		evidence := newAssertionEvidence(tp)
+		bus := telemetry.New()
+		bus.SetObserver(evidence.observe)
+		evidence.admit(1, "POST", "/call", tc.authority)
+		bus.Publish("http_req", map[string]any{"seq": 1, "error": "egress_denied", "status": 200})
+		events := evidence.history()
+		var match struct{ Host string }
+		if len(events) != 1 || json.Unmarshal(events[0].Data, &match) != nil || match.Host != tc.want {
+			t.Errorf("private host length=%d, want host %q", len(match.Host), tc.want)
+		}
+	}
+}
+
+func TestExecResetDiscardsAssertionEvidenceBeforeSequenceReuse(t *testing.T) {
+	if os.Getenv("GD_ASSERTION_RESET_HELPER") == "1" {
+		proxyURL, err := url.Parse(os.Getenv("GLITCHDECK_PROXY_URL"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxyURL.Host = net.JoinHostPort("127.0.0.1", proxyURL.Port())
+		client := &http.Client{Transport: &http.Transport{Protocols: proxy.H2CProtocols()}, Timeout: 3 * time.Second}
+		defer client.CloseIdleConnections()
+		call := func(paths ...string) {
+			for _, path := range paths {
+				req, err := http.NewRequest(http.MethodPost, proxyURL.String()+path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Content-Type", "application/grpc")
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if err != nil || resp.ProtoMajor != 2 || resp.StatusCode != http.StatusOK {
+					t.Fatalf("gRPC %s: %s %d (%v)", path, resp.Proto, resp.StatusCode, err)
+				}
+			}
+		}
+		call("/first", "/quota", "/quota")
+		resp, err := (&http.Client{Timeout: 3 * time.Second}).Post(os.Getenv("GLITCHDECK_UI_URL")+"/api/reset", "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("reset returned HTTP %d", resp.StatusCode)
+		}
+		call("/other", "/other", "/other", "/quota")
+		return
+	}
+	t.Setenv("GD_ASSERTION_RESET_HELPER", "1")
+	want := 14
+	tp := tape.Tape{
+		Version: 2, Target: "http://127.0.0.1:1",
+		Script: []tape.Step{
+			{Name: "first", Seq: 1, GRPC: &tape.GRPC{Path: "/first"}},
+			{Name: "quota", GRPC: &tape.GRPC{Path: "/quota"}},
+		},
+		Assertions: []tape.Assertion{
+			{Name: "first", GRPCStep: "first", ExpectGRPCStatus: &want},
+			{Name: "quota", GRPCStep: "quota", ExpectGRPCStatus: &want},
+		},
+		Rules: []fault.Rule{
+			{ID: "first-before-reset", Enabled: true, Match: fault.Match{PathPrefix: "/first"}, Fault: fault.Fault{Type: "grpc-glitch", Params: map[string]any{"code": 4}}},
+			{ID: "quota-before-reset", Enabled: true, Match: fault.Match{PathPrefix: "/quota", Seq: []uint64{2, 3}}, Fault: fault.Fault{Type: "grpc-glitch", Params: map[string]any{"code": 8}}},
+		},
+	}
+	r := Run(context.Background(), tp, Options{
+		Command: []string{os.Args[0], "-test.run=^TestExecResetDiscardsAssertionEvidenceBeforeSequenceReuse$"},
+		Listen:  "0.0.0.0:0", UI: "127.0.0.1:0", AllowRemote: true, RequireUpstreamAllow: true, AllowZeroTraffic: true,
+	})
+	if r.Exec.ExitCode != 0 || len(r.Assertions) != 2 || r.Assertions[0].Passed || !r.Assertions[1].Passed ||
+		!strings.Contains(strings.Join(r.Assertions[0].Failures, " "), "no matching observed request") {
+		t.Fatalf("child exit=%d stderr=%q assertions=%+v error=%v", r.Exec.ExitCode, r.Exec.StderrTail, r.Assertions, r.Error)
+	}
+}
+
 func TestAssertionEvidenceSurvivesHistoryEviction(t *testing.T) {
 	want := 14
 	tp := tape.Tape{Script: []tape.Step{{Name: "call", GRPC: &tape.GRPC{Path: "/call"}}}, Assertions: []tape.Assertion{{GRPCStep: "call", ExpectGRPCStatus: &want}}}

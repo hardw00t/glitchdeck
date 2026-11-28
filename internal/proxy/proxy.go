@@ -540,7 +540,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			deniedHost := p.noteEgressDenial(r.URL.Host, false)
 			http.Error(w, "egress denied", http.StatusForbidden)
 			if seq, gen := p.tunnelSequence(); seq != 0 {
-				p.publishDeniedRequest(gen, seq, 403, deniedHost, 0, 0, 0)
+				p.publishDeniedRequest(gen, seq, 403, deniedHost, nil, 0, 0)
 			}
 			return
 		}
@@ -690,7 +690,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if isGRPC {
 					p.publishDeniedGRPC(gen, seq, status, grpcStatus, deniedHost, grpcIn.Count(), grpcOut.Count())
 				}
-				p.publishDeniedRequest(gen, seq, status, deniedHost, 0, streamedBytes.Load(), n)
+				p.publishDeniedRequest(gen, seq, status, deniedHost, nil, streamedBytes.Load(), n)
 				return
 			}
 			previewMu.Lock()

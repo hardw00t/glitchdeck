@@ -94,6 +94,7 @@ func (c *tlsFailureEvidence) snapshot() (uint64, []json.RawMessage) {
 
 type assertionEvidence struct {
 	mu       sync.Mutex
+	quota    int
 	limits   map[evidenceKey]int
 	explicit map[uint64]bool
 	selected map[uint64]evidenceKey
@@ -101,7 +102,7 @@ type assertionEvidence struct {
 }
 
 func newAssertionEvidence(t tape.Tape) *assertionEvidence {
-	c := &assertionEvidence{limits: make(map[evidenceKey]int), explicit: make(map[uint64]bool), selected: make(map[uint64]evidenceKey), events: make(map[uint64]map[string]telemetry.Event)}
+	c := &assertionEvidence{quota: len(t.Script), limits: make(map[evidenceKey]int), explicit: make(map[uint64]bool), selected: make(map[uint64]evidenceKey), events: make(map[uint64]map[string]telemetry.Event)}
 	wanted := make(map[string]bool)
 	for _, a := range t.Assertions {
 		wanted[a.StreamStep] = a.StreamStep != ""
@@ -129,7 +130,7 @@ func newAssertionEvidence(t tape.Tape) *assertionEvidence {
 			}
 		}
 		key.method = strings.ToUpper(key.method)
-		c.limits[key] = len(t.Script)
+		c.limits[key] = c.quota
 		if s.Seq != 0 {
 			c.explicit[s.Seq] = true
 		}
@@ -137,19 +138,31 @@ func newAssertionEvidence(t tape.Tape) *assertionEvidence {
 	return c
 }
 
+func (c *assertionEvidence) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clear(c.selected)
+	clear(c.events)
+	for key := range c.limits {
+		c.limits[key] = c.quota
+	}
+}
+
 func (c *assertionEvidence) admit(seq uint64, method, path, host string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	method = strings.ToUpper(method)
 	for key, remaining := range c.limits {
-		if key.method != strings.ToUpper(method) || key.path != path || key.host != "" && !strings.EqualFold(key.host, host) {
+		if key.method != method || key.path != path || key.host != "" && !strings.EqualFold(key.host, host) {
 			continue
 		}
 		if remaining > 0 {
 			c.limits[key]--
-			c.selected[seq] = evidenceKey{key.method, key.path, host}
+		} else if !c.explicit[seq] {
+			continue
 		}
-		if c.explicit[seq] {
-			c.selected[seq] = evidenceKey{key.method, key.path, host}
+		if match, ok := c.selected[seq]; !ok || match.host == "" && key.host != "" {
+			c.selected[seq] = key
 		}
 	}
 }
