@@ -161,25 +161,34 @@ func testTape(args []string) int {
 		}
 		return 2
 	}
-	if err := f.Parse(flags); err != nil {
-		return fail("USAGE", err)
+	usageErr := f.Parse(flags)
+	if usageErr == nil && (filename == "" || *timeout <= 0) {
+		usageErr = errors.New(testUsage)
 	}
-	if filename == "" || *timeout <= 0 {
-		return fail("USAGE", errors.New(testUsage))
+	if usageErr == nil && *mode != "passthrough" && *mode != "replay" {
+		usageErr = errors.New("test mode must be passthrough or replay")
 	}
-	if *mode != "passthrough" && *mode != "replay" {
-		return fail("USAGE", errors.New("test mode must be passthrough or replay"))
+	if usageErr != nil && *mode != "passthrough" {
+		return fail("USAGE", usageErr)
 	}
-	file, inputErr := os.Open(filename)
-	if file != nil {
-		defer file.Close()
+	var file *os.File
+	var inputErr error
+	if usageErr == nil {
+		file, inputErr = os.Open(filename)
+		if file != nil {
+			defer file.Close()
+		}
 	}
 	if *report != "" {
-		input, openErr := execrun.OpenDestination(filename)
-		if openErr != nil {
-			return fail("TAPE_IO", openErr)
+		var inputs []*execrun.Destination
+		for _, name := range files {
+			input, openErr := execrun.OpenDestination(name)
+			if openErr != nil {
+				return fail("TAPE_IO", openErr)
+			}
+			defer input.Close()
+			inputs = append(inputs, input)
 		}
-		defer input.Close()
 		output, openErr := execrun.OpenDestination(*report)
 		if openErr != nil {
 			return fail("TAPE_IO", openErr)
@@ -194,9 +203,11 @@ func testTape(args []string) int {
 			}
 		}
 		reportSafe = func() error {
-			same, err := output.Same(input, inputInfo)
-			if err != nil || same {
-				return errors.New("report destination must differ from the input tape")
+			for _, input := range inputs {
+				same, err := output.Same(input, inputInfo)
+				if err != nil || same {
+					return errors.New("report destination must differ from the input tape")
+				}
 			}
 			return nil
 		}
@@ -204,6 +215,9 @@ func testTape(args []string) int {
 			return fail("USAGE", err)
 		}
 		reportDestination = output
+	}
+	if usageErr != nil {
+		return fail("USAGE", usageErr)
 	}
 	if inputErr != nil {
 		return fail("TAPE_IO", inputErr)

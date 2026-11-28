@@ -178,18 +178,23 @@ func execCommand(args []string) int {
 	if sep < 0 {
 		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
 	}
-	if err := f.Parse(args[:sep]); err != nil {
-		return fail("USAGE_ERROR", err)
+	usageErr := f.Parse(args[:sep])
+	if usageErr == nil && (*path == "" || f.NArg() != 0 || sep+1 == len(args) || o.Timeout <= 0 || o.Grace <= 0) {
+		usageErr = errors.New("expected --tape, positive timeout and grace, and -- <command>")
 	}
-	if *path == "" || f.NArg() != 0 || sep+1 == len(args) || o.Timeout <= 0 || o.Grace <= 0 {
-		return fail("USAGE_ERROR", errors.New("expected --tape, positive timeout and grace, and -- <command>"))
+	if usageErr == nil {
+		usageErr = o.ValidateMode()
 	}
-	if err := o.ValidateMode(); err != nil {
-		return fail("USAGE_ERROR", err)
+	if usageErr != nil && (recordRequested || o.Mode != "passthrough" || o.TapeOut != "") {
+		return fail("USAGE_ERROR", usageErr)
 	}
-	file, inputErr := os.Open(*path)
-	if file != nil {
-		defer file.Close()
+	var file *os.File
+	var inputErr error
+	if usageErr == nil {
+		file, inputErr = os.Open(*path)
+		if file != nil {
+			defer file.Close()
+		}
 	}
 	if o.TapeOut != "" {
 		var err error
@@ -200,11 +205,15 @@ func execCommand(args []string) int {
 		defer o.TapeDestination.Close()
 	}
 	if *report != "" {
-		inputDestination, err := execrun.OpenDestination(*path)
-		if err != nil {
-			return fail("TAPE_IO", err)
+		var inputDestination *execrun.Destination
+		if *path != "" {
+			var err error
+			inputDestination, err = execrun.OpenDestination(*path)
+			if err != nil {
+				return fail("TAPE_IO", err)
+			}
+			defer inputDestination.Close()
 		}
-		defer inputDestination.Close()
 		destination, err := execrun.OpenDestination(*report)
 		if err != nil {
 			return fail("OUTPUT_IO", err)
@@ -218,7 +227,11 @@ func execCommand(args []string) int {
 			}
 		}
 		reportSafe = func() error {
-			alias, err := destination.Same(inputDestination, inputInfo)
+			var alias bool
+			var err error
+			if inputDestination != nil {
+				alias, err = destination.Same(inputDestination, inputInfo)
+			}
 			if err == nil && !alias && o.TapeDestination != nil {
 				alias, err = destination.Same(o.TapeDestination)
 			}
@@ -231,6 +244,9 @@ func execCommand(args []string) int {
 			return fail("USAGE_ERROR", err)
 		}
 		reportDestination = destination
+	}
+	if usageErr != nil {
+		return fail("USAGE_ERROR", usageErr)
 	}
 	if inputErr != nil {
 		return fail("TAPE_IO", inputErr)
